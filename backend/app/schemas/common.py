@@ -71,6 +71,7 @@ class UnitInput(BaseModel):
     code: str = Field(min_length=2, max_length=50)
     unit_type: str | None = None
     industry_type_id: str
+    other_industry_name: str | None = Field(default=None, max_length=150)
     state_id: str
     city: str | None = None
     pincode: str | None = None
@@ -93,6 +94,7 @@ class ContractorInput(BaseModel):
     unit_id: str | None = None
     contractor_type: str | None = None
     industry_type_id: str | None = None
+    other_industry_name: str | None = Field(default=None, max_length=150)
     state_id: str | None = None
     contact_email: EmailStr | None = None
     contact_phone: str | None = None
@@ -118,6 +120,7 @@ class ContractorSiteInput(BaseModel):
     code: str = Field(min_length=2, max_length=50)
     unit_type: str | None = None
     industry_type_id: str
+    other_industry_name: str | None = Field(default=None, max_length=150)
     state_id: str
     city: str | None = None
     pincode: str | None = None

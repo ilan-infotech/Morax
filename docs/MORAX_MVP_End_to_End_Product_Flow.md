@@ -35,7 +35,7 @@ Pydantic
 Uvicorn
 Frontend:
 React.js
-JavaScript
+Typescript
 Tailwind CSS
 shadcn/ui
 React Router

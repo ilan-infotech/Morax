@@ -22,7 +22,7 @@ from app.schemas import (
     LoginRequest, OrganizationInput, PlatformOrganizationInput, OrganizationStatusInput, PasswordChangeRequest, RoleScopeInput, RuleInput, UnitInput, UserInput,
     WorkflowDecision, UserUpdateInput, EvidenceVerificationInput, NotApplicableInput,
 )
-from app.services.access import CHECKER_ROLES, MAKER_ROLES, MANAGER_ROLES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, current_user, is_org_admin, require_org_admin, roles_for, scopes_for, user_summary
+from app.services.access import CHECKER_ROLES, MAKER_ROLES, MANAGER_ROLES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, current_user, is_org_admin, require_org_admin, require_org_admin_for_entity_management, roles_for, scopes_for, user_summary
 from app.services.audit import audit
 from app.services.compliance import SUBJECTS, assert_assignment_or_admin, generate_for_subject, submit, transition
 from app.services.serialization import entity_dict, instance_dict, model_dict
@@ -77,6 +77,45 @@ def apply_platform_organization(organization: Organization, payload: PlatformOrg
 def require_manager(db: Session, user: User, organization_id: str) -> None:
     if not is_org_admin(db, user, organization_id) and not (roles_for(db, user.id) & MANAGER_ROLES):
         raise HTTPException(403, "Administrative permission is required")
+
+
+def require_deletable_entity(db: Session, subject_type: str, subject_id: str) -> None:
+    """Never sever historical compliance records from the entity they describe."""
+    foreign_key = {
+        "UNIT": ComplianceInstance.unit_id,
+        "CONTRACTOR": ComplianceInstance.contractor_id,
+        "CONTRACTOR_SITE": ComplianceInstance.contractor_site_id,
+    }.get(subject_type)
+    if foreign_key is None:
+        raise HTTPException(422, "Unsupported entity type")
+    history = db.scalar(select(ComplianceInstance.id).where(
+        (foreign_key == subject_id)
+        | ((ComplianceInstance.subject_type == subject_type) & (ComplianceInstance.subject_id == subject_id))
+    ).limit(1))
+    if history:
+        label = {"UNIT": "Unit", "CONTRACTOR": "Contractor", "CONTRACTOR_SITE": "Contractor site"}[subject_type]
+        raise HTTPException(409, f"Cannot delete {label} because it has compliance history. Set its status to INACTIVE instead.")
+
+
+def validate_industry_selection(db: Session, industry_type_id: str | None, other_industry_name: str | None) -> str | None:
+    """Validate the controlled industry category and its optional custom label.
+
+    A free-text label is permitted only under the seeded OTHER category. This
+    keeps rule applicability governed by Compliance Master rather than allowing
+    arbitrary industries to silently change compliance behaviour.
+    """
+    custom_name = other_industry_name.strip() if other_industry_name else None
+    if custom_name == "":
+        custom_name = None
+    industry = db.get(IndustryType, industry_type_id) if industry_type_id else None
+    if industry_type_id and not industry:
+        raise HTTPException(422, "Industry type must be a configured master value")
+    is_other = bool(industry and industry.code.upper() == "OTHER")
+    if is_other and not custom_name:
+        raise HTTPException(422, "Enter the industry name when Other industry is selected")
+    if not is_other and custom_name:
+        raise HTTPException(422, "A custom industry name is allowed only for Other industry")
+    return custom_name
 
 
 def list_page(items: list, page: int, page_size: int) -> dict:
@@ -381,22 +420,30 @@ def update_organization(payload: OrganizationInput, user: User = Depends(current
 @router.get("/units")
 def list_units(page: int = 1, page_size: int = 50, q: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
     organization_id = org_for(user)
+    require_org_admin_for_entity_management(db, user, organization_id)
     query = select(Unit).where(Unit.organization_id == organization_id)
-    if not is_org_admin(db, user, organization_id):
-        allowed = {scope.scope_id for scope in scopes_for(db, user.id) if scope.scope_type == "UNIT"}
-        query = query.where(Unit.id.in_(allowed or {"__none__"}))
     if q:
         query = query.where(or_(Unit.name.ilike(f"%{q}%"), Unit.code.ilike(f"%{q}%")))
     rows = [entity_dict(db, row, "UNIT") for row in db.scalars(query.order_by(Unit.name))]
     return list_page(rows, page, min(page_size, 100))
 
 
+@router.get("/units/{unit_id}")
+def get_unit(unit_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    unit = db.get(Unit, unit_id)
+    if not unit or unit.organization_id != org_for(user):
+        raise HTTPException(404, "Unit not found")
+    require_org_admin_for_entity_management(db, user, unit.organization_id)
+    return entity_dict(db, unit, "UNIT")
+
+
 @router.post("/units")
 def create_unit(payload: UnitInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     organization_id = org_for(user)
-    require_manager(db, user, organization_id)
+    require_org_admin_for_entity_management(db, user, organization_id)
     if not db.get(State, payload.state_id) or not db.get(IndustryType, payload.industry_type_id):
         raise HTTPException(422, "State and industry type must be configured master values")
+    payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
     unit = Unit(organization_id=organization_id, **payload.model_dump())
     db.add(unit)
     db.flush()
@@ -411,27 +458,59 @@ def update_unit(unit_id: str, payload: UnitInput, user: User = Depends(current_u
     unit = db.get(Unit, unit_id)
     if not unit or unit.organization_id != org_for(user):
         raise HTTPException(404, "Unit not found")
-    require_manager(db, user, unit.organization_id)
-    old = {"industry_type_id": unit.industry_type_id, "state_id": unit.state_id, "status": unit.status}
+    require_org_admin_for_entity_management(db, user, unit.organization_id)
+    if not db.get(State, payload.state_id):
+        raise HTTPException(422, "State must be a configured master value")
+    payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
+    old = {"industry_type_id": unit.industry_type_id, "other_industry_name": unit.other_industry_name, "state_id": unit.state_id, "status": unit.status}
     for key, value in payload.model_dump().items(): setattr(unit, key, value)
     generate_for_subject(db, unit.organization_id, "UNIT", unit.id, date.today(), user.id)
-    audit(db, organization_id=unit.organization_id, actor_id=user.id, action="UPDATE_UNIT", module="ENTITIES", entity_type="Unit", entity_id=unit.id, old=old, new={"industry_type_id": unit.industry_type_id, "state_id": unit.state_id, "status": unit.status})
+    audit(db, organization_id=unit.organization_id, actor_id=user.id, action="UPDATE_UNIT", module="ENTITIES", entity_type="Unit", entity_id=unit.id, old=old, new={"industry_type_id": unit.industry_type_id, "other_industry_name": unit.other_industry_name, "state_id": unit.state_id, "status": unit.status})
     db.commit()
     return entity_dict(db, unit, "UNIT")
+
+
+@router.delete("/units/{unit_id}")
+def delete_unit(unit_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    unit = db.get(Unit, unit_id)
+    if not unit or unit.organization_id != org_for(user):
+        raise HTTPException(404, "Unit not found")
+    require_org_admin_for_entity_management(db, user, unit.organization_id)
+    require_deletable_entity(db, "UNIT", unit.id)
+    for contractor in db.scalars(select(Contractor).where(Contractor.unit_id == unit.id)):
+        contractor.unit_id = None
+    for site in db.scalars(select(ContractorSite).where(ContractorSite.unit_id == unit.id)):
+        site.unit_id = None
+    audit(db, organization_id=unit.organization_id, actor_id=user.id, action="DELETE_UNIT", module="ENTITIES", entity_type="Unit", entity_id=unit.id, old={"name": unit.name, "code": unit.code})
+    db.delete(unit)
+    db.commit()
+    return {"ok": True}
 
 
 @router.get("/contractors")
 def list_contractors(user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
-    rows = [entity_dict(db, row, "CONTRACTOR") for row in db.scalars(select(Contractor).where(Contractor.organization_id == org).order_by(Contractor.name)) if can_access_subject(db, user, org, "CONTRACTOR", row.id)]
-    return rows
+    require_org_admin_for_entity_management(db, user, org)
+    return [entity_dict(db, row, "CONTRACTOR") for row in db.scalars(select(Contractor).where(Contractor.organization_id == org).order_by(Contractor.name))]
+
+
+@router.get("/contractors/{contractor_id}")
+def get_contractor(contractor_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    contractor = db.get(Contractor, contractor_id)
+    if not contractor or contractor.organization_id != org_for(user):
+        raise HTTPException(404, "Contractor not found")
+    require_org_admin_for_entity_management(db, user, contractor.organization_id)
+    return entity_dict(db, contractor, "CONTRACTOR")
 
 
 @router.post("/contractors")
 def create_contractor(payload: ContractorInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    org = org_for(user); require_manager(db, user, org)
+    org = org_for(user); require_org_admin_for_entity_management(db, user, org)
     if payload.unit_id and (not db.get(Unit, payload.unit_id) or db.get(Unit, payload.unit_id).organization_id != org):
         raise HTTPException(422, "Parent Unit must belong to your organization")
+    if payload.state_id and not db.get(State, payload.state_id):
+        raise HTTPException(422, "State must be a configured master value")
+    payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
     contractor = Contractor(organization_id=org, **payload.model_dump())
     db.add(contractor); db.flush()
     generate_for_subject(db, org, "CONTRACTOR", contractor.id, date.today(), user.id)
@@ -444,29 +523,63 @@ def update_contractor(contractor_id: str, payload: ContractorInput, user: User =
     contractor = db.get(Contractor, contractor_id)
     if not contractor or contractor.organization_id != org_for(user):
         raise HTTPException(404, "Contractor not found")
-    require_manager(db, user, contractor.organization_id)
+    require_org_admin_for_entity_management(db, user, contractor.organization_id)
     if payload.unit_id and (not db.get(Unit, payload.unit_id) or db.get(Unit, payload.unit_id).organization_id != contractor.organization_id):
         raise HTTPException(422, "Parent Unit must belong to your organization")
+    if payload.state_id and not db.get(State, payload.state_id):
+        raise HTTPException(422, "State must be a configured master value")
+    payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
     for key, value in payload.model_dump().items(): setattr(contractor, key, value)
     generate_for_subject(db, contractor.organization_id, "CONTRACTOR", contractor.id, date.today(), user.id)
     audit(db, organization_id=contractor.organization_id, actor_id=user.id, action="UPDATE_CONTRACTOR", module="ENTITIES", entity_type="Contractor", entity_id=contractor.id, new={"name": contractor.name, "status": contractor.status})
     db.commit(); return entity_dict(db, contractor, "CONTRACTOR")
 
 
+@router.delete("/contractors/{contractor_id}")
+def delete_contractor(contractor_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    contractor = db.get(Contractor, contractor_id)
+    if not contractor or contractor.organization_id != org_for(user):
+        raise HTTPException(404, "Contractor not found")
+    require_org_admin_for_entity_management(db, user, contractor.organization_id)
+    require_deletable_entity(db, "CONTRACTOR", contractor.id)
+    sites = list(db.scalars(select(ContractorSite).where(ContractorSite.contractor_id == contractor.id)))
+    for site in sites:
+        require_deletable_entity(db, "CONTRACTOR_SITE", site.id)
+    for site in sites:
+        db.delete(site)
+    audit(db, organization_id=contractor.organization_id, actor_id=user.id, action="DELETE_CONTRACTOR", module="ENTITIES", entity_type="Contractor", entity_id=contractor.id, old={"name": contractor.name, "code": contractor.code})
+    db.delete(contractor)
+    db.commit()
+    return {"ok": True}
+
+
 @router.get("/contractor-sites")
 def list_sites(user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
-    return [entity_dict(db, row, "CONTRACTOR_SITE") for row in db.scalars(select(ContractorSite).where(ContractorSite.organization_id == org).order_by(ContractorSite.name)) if can_access_subject(db, user, org, "CONTRACTOR_SITE", row.id)]
+    require_org_admin_for_entity_management(db, user, org)
+    return [entity_dict(db, row, "CONTRACTOR_SITE") for row in db.scalars(select(ContractorSite).where(ContractorSite.organization_id == org).order_by(ContractorSite.name))]
+
+
+@router.get("/contractor-sites/{site_id}")
+def get_site(site_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    site = db.get(ContractorSite, site_id)
+    if not site or site.organization_id != org_for(user):
+        raise HTTPException(404, "Contractor Site not found")
+    require_org_admin_for_entity_management(db, user, site.organization_id)
+    return entity_dict(db, site, "CONTRACTOR_SITE")
 
 
 @router.post("/contractor-sites")
 def create_site(payload: ContractorSiteInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    org = org_for(user); require_manager(db, user, org)
+    org = org_for(user); require_org_admin_for_entity_management(db, user, org)
     contractor = db.get(Contractor, payload.contractor_id)
     if not contractor or contractor.organization_id != org:
         raise HTTPException(422, "Contractor must belong to your organization")
     if payload.unit_id and (not db.get(Unit, payload.unit_id) or db.get(Unit, payload.unit_id).organization_id != org):
         raise HTTPException(422, "Linked Unit must belong to your organization")
+    if not db.get(State, payload.state_id):
+        raise HTTPException(422, "State must be a configured master value")
+    payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
     site = ContractorSite(organization_id=org, **payload.model_dump())
     db.add(site); db.flush(); generate_for_subject(db, org, "CONTRACTOR_SITE", site.id, date.today(), user.id)
     audit(db, organization_id=org, actor_id=user.id, action="CREATE_CONTRACTOR_SITE", module="ENTITIES", entity_type="ContractorSite", entity_id=site.id, new={"name": site.name})
@@ -478,14 +591,30 @@ def update_site(site_id: str, payload: ContractorSiteInput, user: User = Depends
     site = db.get(ContractorSite, site_id)
     if not site or site.organization_id != org_for(user):
         raise HTTPException(404, "Contractor Site not found")
-    require_manager(db, user, site.organization_id)
+    require_org_admin_for_entity_management(db, user, site.organization_id)
     contractor = db.get(Contractor, payload.contractor_id)
     if not contractor or contractor.organization_id != site.organization_id:
         raise HTTPException(422, "Contractor must belong to your organization")
+    if not db.get(State, payload.state_id):
+        raise HTTPException(422, "State must be a configured master value")
+    payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
     for key, value in payload.model_dump().items(): setattr(site, key, value)
     generate_for_subject(db, site.organization_id, "CONTRACTOR_SITE", site.id, date.today(), user.id)
     audit(db, organization_id=site.organization_id, actor_id=user.id, action="UPDATE_CONTRACTOR_SITE", module="ENTITIES", entity_type="ContractorSite", entity_id=site.id, new={"name": site.name, "status": site.status})
     db.commit(); return entity_dict(db, site, "CONTRACTOR_SITE")
+
+
+@router.delete("/contractor-sites/{site_id}")
+def delete_site(site_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    site = db.get(ContractorSite, site_id)
+    if not site or site.organization_id != org_for(user):
+        raise HTTPException(404, "Contractor Site not found")
+    require_org_admin_for_entity_management(db, user, site.organization_id)
+    require_deletable_entity(db, "CONTRACTOR_SITE", site.id)
+    audit(db, organization_id=site.organization_id, actor_id=user.id, action="DELETE_CONTRACTOR_SITE", module="ENTITIES", entity_type="ContractorSite", entity_id=site.id, old={"name": site.name, "code": site.code})
+    db.delete(site)
+    db.commit()
+    return {"ok": True}
 
 
 @router.get("/users")
@@ -935,6 +1064,305 @@ def dashboard_status(user: User = Depends(current_user), db: Session = Depends(g
             label = instance_dict(db, instance)["display_status"]
             counts[label] = counts.get(label, 0) + 1
     return counts
+
+
+def dashboard_display_status(instance: ComplianceInstance, today_value: date) -> str:
+    if instance.status in {"PENDING", "IN_PROGRESS", "CORRECTION_REQUIRED"}:
+        return "OVERDUE" if instance.due_date < today_value else "DUE"
+    if instance.status in {"SUBMITTED", "UNDER_REVIEW"}:
+        return "PENDING_FOR_APPROVAL"
+    if instance.status == "APPROVED":
+        return "COMPLETED_LATE" if instance.completion_late else "COMPLETED"
+    if instance.status == "NOT_APPLICABLE":
+        return "NOT_APPLICABLE"
+    return "REJECTED_BY_CHECKER"
+
+
+@router.get("/dashboard/overview")
+def dashboard_overview(
+    unit_id: str | None = None,
+    entity_id: str | None = None,
+    contractor_id: str | None = None,
+    period_key: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Return one tenant-scoped, filter-aware dashboard projection.
+
+    The API resolves hierarchy server-side instead of trusting client supplied
+    identifiers. Entity is MORAX's existing compliance subject: Unit,
+    Contractor, or Contractor Site.
+    """
+    organization_id = org_for(user)
+    today_value = date.today()
+    units = {
+        item.id: item
+        for item in db.scalars(
+            select(Unit).where(Unit.organization_id == organization_id)
+        )
+        if can_access_subject(db, user, organization_id, "UNIT", item.id)
+    }
+    contractors = {
+        item.id: item
+        for item in db.scalars(
+            select(Contractor).where(Contractor.organization_id == organization_id)
+        )
+        if can_access_subject(db, user, organization_id, "CONTRACTOR", item.id)
+    }
+    sites = {
+        item.id: item
+        for item in db.scalars(
+            select(ContractorSite).where(
+                ContractorSite.organization_id == organization_id
+            )
+        )
+        if can_access_subject(db, user, organization_id, "CONTRACTOR_SITE", item.id)
+    }
+
+    def site_unit_id(site: ContractorSite) -> str | None:
+        return site.unit_id or (
+            contractors[site.contractor_id].unit_id
+            if site.contractor_id in contractors
+            else None
+        )
+
+    entity_options = [
+        {
+            "id": item.id,
+            "name": item.name,
+            "entity_type": "UNIT",
+            "unit_id": item.id,
+            "contractor_id": None,
+        }
+        for item in units.values()
+    ] + [
+        {
+            "id": item.id,
+            "name": item.name,
+            "entity_type": "CONTRACTOR",
+            "unit_id": item.unit_id,
+            "contractor_id": item.id,
+        }
+        for item in contractors.values()
+    ] + [
+        {
+            "id": item.id,
+            "name": item.name,
+            "entity_type": "CONTRACTOR_SITE",
+            "unit_id": site_unit_id(item),
+            "contractor_id": item.contractor_id,
+        }
+        for item in sites.values()
+    ]
+
+    def matches_context(
+        subject_type: str,
+        subject_id: str,
+        resolved_unit_id: str | None,
+        resolved_contractor_id: str | None,
+    ) -> bool:
+        if unit_id and resolved_unit_id != unit_id:
+            return False
+        if contractor_id and resolved_contractor_id != contractor_id:
+            return False
+        if entity_id and subject_id != entity_id:
+            return False
+        return True
+
+    context_entities = [
+        item
+        for item in entity_options
+        if matches_context(
+            item["entity_type"],
+            item["id"],
+            item["unit_id"],
+            item["contractor_id"],
+        )
+    ]
+    context_contractors = [
+        item
+        for item in contractors.values()
+        if (not unit_id or item.unit_id == unit_id)
+        and (
+            not entity_id
+            or any(
+                entity["id"] == entity_id
+                and (
+                    entity["entity_type"] == "UNIT"
+                    or entity["contractor_id"] == item.id
+                )
+                for entity in entity_options
+            )
+        )
+    ]
+
+    rows: list[dict] = []
+    for instance in db.scalars(
+        select(ComplianceInstance)
+        .where(ComplianceInstance.organization_id == organization_id)
+        .order_by(ComplianceInstance.due_date)
+    ):
+        if not can_access_subject(
+            db, user, organization_id, instance.subject_type, instance.subject_id
+        ):
+            continue
+        subject = (
+            units.get(instance.subject_id)
+            if instance.subject_type == "UNIT"
+            else contractors.get(instance.subject_id)
+            if instance.subject_type == "CONTRACTOR"
+            else sites.get(instance.subject_id)
+        )
+        if not subject:
+            continue
+        resolved_unit_id = (
+            instance.subject_id
+            if instance.subject_type == "UNIT"
+            else subject.unit_id
+            if instance.subject_type == "CONTRACTOR"
+            else site_unit_id(subject)
+        )
+        resolved_contractor_id = (
+            instance.subject_id
+            if instance.subject_type == "CONTRACTOR"
+            else subject.contractor_id
+            if instance.subject_type == "CONTRACTOR_SITE"
+            else None
+        )
+        if not matches_context(
+            instance.subject_type,
+            instance.subject_id,
+            resolved_unit_id,
+            resolved_contractor_id,
+        ):
+            continue
+        if period_key and instance.period_key != period_key:
+            continue
+        snapshot = json.loads(instance.rule_snapshot_json)
+        display_status = dashboard_display_status(instance, today_value)
+        rows.append(
+            {
+                "id": instance.id,
+                "compliance_id": snapshot.get("compliance_id"),
+                "compliance_name": snapshot.get("name"),
+                "frequency": snapshot.get("frequency"),
+                "risk_level": snapshot.get("risk_level"),
+                "subject_name": subject.name,
+                "subject_type": instance.subject_type,
+                "subject_id": instance.subject_id,
+                "unit_id": resolved_unit_id,
+                "contractor_id": resolved_contractor_id,
+                "period_key": instance.period_key,
+                "due_date": instance.due_date.isoformat(),
+                "status": instance.status,
+                "display_status": display_status,
+                "is_overdue": display_status == "OVERDUE",
+                "days_overdue": max(0, (today_value - instance.due_date).days)
+                if display_status == "OVERDUE"
+                else 0,
+                "required_document": snapshot.get("required_document"),
+            }
+        )
+
+    total = len(rows)
+    completed = sum(item["status"] == "APPROVED" for item in rows)
+    overdue = sum(item["display_status"] == "OVERDUE" for item in rows)
+    due_soon = sum(
+        item["status"] not in {"APPROVED", "NOT_APPLICABLE"}
+        and today_value <= date.fromisoformat(item["due_date"]) <= today_value + timedelta(days=7)
+        for item in rows
+    )
+    pending = sum(
+        item["status"] in {"PENDING", "IN_PROGRESS", "CORRECTION_REQUIRED"}
+        for item in rows
+    )
+    statuses: dict[str, int] = {}
+    frequencies: dict[str, int] = {}
+    entity_health: dict[str, dict] = {}
+    contractor_health: dict[str, dict] = {}
+    for item in rows:
+        status = item["display_status"]
+        statuses[status] = statuses.get(status, 0) + 1
+        frequency = item["frequency"] or "UNCONFIGURED"
+        frequencies[frequency] = frequencies.get(frequency, 0) + 1
+        entity = entity_health.setdefault(
+            item["subject_id"],
+            {
+                "id": item["subject_id"],
+                "name": item["subject_name"],
+                "entity_type": item["subject_type"],
+                "total": 0,
+                "completed": 0,
+                "overdue": 0,
+            },
+        )
+        entity["total"] += 1
+        entity["completed"] += item["status"] == "APPROVED"
+        entity["overdue"] += item["display_status"] == "OVERDUE"
+        if item["contractor_id"]:
+            contractor = contractors.get(item["contractor_id"])
+            if contractor:
+                contractor_data = contractor_health.setdefault(
+                    contractor.id,
+                    {
+                        "id": contractor.id,
+                        "name": contractor.name,
+                        "total": 0,
+                        "completed": 0,
+                        "overdue": 0,
+                    },
+                )
+                contractor_data["total"] += 1
+                contractor_data["completed"] += item["status"] == "APPROVED"
+                contractor_data["overdue"] += item["display_status"] == "OVERDUE"
+
+    def health_rows(values: dict[str, dict]) -> list[dict]:
+        output = []
+        for item in values.values():
+            rate = round(item["completed"] / item["total"] * 100, 1) if item["total"] else 0
+            output.append({**item, "rate": rate})
+        return sorted(output, key=lambda item: (item["rate"], -item["overdue"], item["name"]))
+
+    periods = sorted({item["period_key"] for item in rows}, reverse=True)
+    upcoming = [
+        item
+        for item in rows
+        if item["status"] not in {"APPROVED", "NOT_APPLICABLE"}
+        and today_value <= date.fromisoformat(item["due_date"]) <= today_value + timedelta(days=14)
+    ][:8]
+    return {
+        "filters": {
+            "units": [
+                {"id": item.id, "name": item.name}
+                for item in sorted(units.values(), key=lambda row: row.name)
+            ],
+            "entities": sorted(context_entities, key=lambda row: (row["name"], row["entity_type"])),
+            "contractors": [
+                {"id": item.id, "name": item.name, "unit_id": item.unit_id}
+                for item in sorted(context_contractors, key=lambda row: row.name)
+            ],
+            "periods": periods,
+        },
+        "summary": {
+            "total": total,
+            "completed": completed,
+            "pending": pending,
+            "overdue": overdue,
+            "due_soon": due_soon,
+            "completion_rate": round(completed / total * 100, 1) if total else 0,
+        },
+        "status_distribution": [
+            {"name": name, "value": value}
+            for name, value in sorted(statuses.items())
+        ],
+        "frequency_distribution": [
+            {"name": name, "value": value}
+            for name, value in sorted(frequencies.items())
+        ],
+        "entity_health": health_rows(entity_health),
+        "contractor_health": health_rows(contractor_health),
+        "upcoming": upcoming,
+    }
 
 
 @router.get("/dashboard/frequency")

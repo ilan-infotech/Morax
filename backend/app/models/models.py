@@ -65,6 +65,10 @@ class Unit(Timestamped, Base):
     entity_type: Mapped[str] = mapped_column(String(30), default="UNIT", nullable=False)
     unit_type: Mapped[str | None] = mapped_column(String(50))
     industry_type_id: Mapped[str] = mapped_column(ForeignKey("industry_types.id"), nullable=False)
+    # Retains a descriptive industry name when the configured "Other industry"
+    # master category is selected. Compliance applicability still uses the
+    # controlled industry_type_id, so it remains driven by Compliance Master.
+    other_industry_name: Mapped[str | None] = mapped_column(String(150))
     state_id: Mapped[str] = mapped_column(ForeignKey("states.id"), nullable=False)
     city: Mapped[str | None] = mapped_column(String(100))
     pincode: Mapped[str | None] = mapped_column(String(20))
@@ -95,6 +99,7 @@ class Contractor(Timestamped, Base):
     code: Mapped[str] = mapped_column(String(50), nullable=False)
     contractor_type: Mapped[str | None] = mapped_column(String(100))
     industry_type_id: Mapped[str | None] = mapped_column(ForeignKey("industry_types.id"))
+    other_industry_name: Mapped[str | None] = mapped_column(String(150))
     state_id: Mapped[str | None] = mapped_column(ForeignKey("states.id"))
     contact_email: Mapped[str | None] = mapped_column(String(255))
     contact_phone: Mapped[str | None] = mapped_column(String(50))
@@ -127,6 +132,7 @@ class ContractorSite(Timestamped, Base):
     code: Mapped[str] = mapped_column(String(50), nullable=False)
     unit_type: Mapped[str | None] = mapped_column(String(50))
     industry_type_id: Mapped[str] = mapped_column(ForeignKey("industry_types.id"), nullable=False)
+    other_industry_name: Mapped[str | None] = mapped_column(String(150))
     state_id: Mapped[str] = mapped_column(ForeignKey("states.id"), nullable=False)
     city: Mapped[str | None] = mapped_column(String(100))
     pincode: Mapped[str | None] = mapped_column(String(20))

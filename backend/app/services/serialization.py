@@ -30,7 +30,8 @@ def entity_dict(db: Session, entity: Any, kind: str) -> dict[str, Any]:
         result["state_name"] = state.name if state else None
     if getattr(entity, "industry_type_id", None):
         industry = db.get(IndustryType, entity.industry_type_id)
-        result["industry_name"] = industry.name if industry else None
+        result["industry_master_name"] = industry.name if industry else None
+        result["industry_name"] = getattr(entity, "other_industry_name", None) or (industry.name if industry else None)
     return result
 
 

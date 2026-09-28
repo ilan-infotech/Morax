@@ -83,6 +83,10 @@ def require_org_admin(db: Session, user: User, organization_id: str) -> None:
         raise HTTPException(status_code=403, detail="Organization administrator permission is required")
 
 
+def require_org_admin_for_entity_management(db: Session, user: User, organization_id: str) -> None:
+    require_org_admin(db, user, organization_id)
+
+
 def can_read_audit(db: Session, user: User, organization_id: str) -> bool:
     """Audit visibility is limited to tenant administrators and org-scoped auditors."""
     if is_org_admin(db, user, organization_id):

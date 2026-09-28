@@ -11,6 +11,17 @@ export type Workflow = { id: string; action: string; from_status?: string; to_st
 export type Comment = { id: string; body: string; author_id: string; created_at: string }
 export type Instance = { id: string; compliance_id: string; compliance_name: string; frequency: string; risk_level: string; subject_name: string; subject_type: string; subject_id: string; due_date: string; status: string; display_status?: string; row_version: number; is_overdue: boolean; days_overdue: number; required_document?: string; activity_reference?: string; completed_on?: string; amount?: number; remarks?: string; evidence?: Evidence[]; assignments?: Assignment[]; history?: Workflow[]; comments?: Comment[]; applicability?: { matched: Record<string, boolean> }; rule_snapshot?: Record<string, unknown> }
 export type Page<T> = { items: T[]; total: number; page: number; page_size: number }
+export type DashboardEntityFilter = { id: string; name: string; entity_type: string; unit_id?: string | null; contractor_id?: string | null }
+export type DashboardHealth = { id: string; name: string; entity_type?: string; total: number; completed: number; overdue: number; rate: number }
+export type DashboardOverview = {
+  filters: { units: { id: string; name: string }[]; entities: DashboardEntityFilter[]; contractors: { id: string; name: string; unit_id?: string | null }[]; periods: string[] }
+  summary: { total: number; completed: number; pending: number; overdue: number; due_soon: number; completion_rate: number }
+  status_distribution: { name: string; value: number }[]
+  frequency_distribution: { name: string; value: number }[]
+  entity_health: DashboardHealth[]
+  contractor_health: DashboardHealth[]
+  upcoming: Instance[]
+}
 
 const query = (values: Record<string, string | undefined>) => { const params = new URLSearchParams(Object.entries(values).filter(([, value]) => value) as [string, string][]); return params.size ? `?${params}` : '' }
 
@@ -26,11 +37,11 @@ export const morax = {
   updatePlatformOrganization: (id: string, body: unknown) => api<Record<string, unknown>>(`/platform/organizations/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   setPlatformOrganizationStatus: (id: string, status: 'ACTIVE' | 'INACTIVE') => api<Record<string, unknown>>(`/platform/organizations/${id}/status`, { method: 'POST', body: JSON.stringify({ status }) }),
   enterPlatformOrganization: (id: string) => api<{ organization: Record<string, unknown>; user: User }>(`/platform/organizations/${id}/enter`, { method: 'POST' }),
-  dashboard: () => api<{ total: number; statuses: Record<string, number>; overdue: number; completed_late: number }>('/dashboard/summary'), states: () => api<Master[]>('/master-data/states'), industries: () => api<Master[]>('/master-data/industry-types'),
+  dashboard: () => api<{ total: number; statuses: Record<string, number>; overdue: number; completed_late: number }>('/dashboard/summary'), dashboardOverview: (filters: Record<string, string> = {}) => api<DashboardOverview>(`/dashboard/overview${query(filters)}`), states: () => api<Master[]>('/master-data/states'), industries: () => api<Master[]>('/master-data/industry-types'),
   organization: () => api<Record<string, unknown>>('/organizations'), updateOrganization: (body: unknown) => api('/organizations', { method: 'PATCH', body: JSON.stringify(body) }),
-  units: () => api<Page<Record<string, unknown>>>('/units'), createUnit: (body: unknown) => api('/units', { method: 'POST', body: JSON.stringify(body) }), updateUnit: (id: string, body: unknown) => api(`/units/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
-  contractors: () => api<Record<string, unknown>[]>('/contractors'), createContractor: (body: unknown) => api('/contractors', { method: 'POST', body: JSON.stringify(body) }), updateContractor: (id: string, body: unknown) => api(`/contractors/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
-  sites: () => api<Record<string, unknown>[]>('/contractor-sites'), createSite: (body: unknown) => api('/contractor-sites', { method: 'POST', body: JSON.stringify(body) }), updateSite: (id: string, body: unknown) => api(`/contractor-sites/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  units: () => api<Page<Record<string, unknown>>>('/units'), createUnit: (body: unknown) => api('/units', { method: 'POST', body: JSON.stringify(body) }), updateUnit: (id: string, body: unknown) => api(`/units/${id}`, { method: 'PATCH', body: JSON.stringify(body) }), deleteUnit: (id: string) => api(`/units/${id}`, { method: 'DELETE' }),
+  contractors: () => api<Record<string, unknown>[]>('/contractors'), createContractor: (body: unknown) => api('/contractors', { method: 'POST', body: JSON.stringify(body) }), updateContractor: (id: string, body: unknown) => api(`/contractors/${id}`, { method: 'PATCH', body: JSON.stringify(body) }), deleteContractor: (id: string) => api(`/contractors/${id}`, { method: 'DELETE' }),
+  sites: () => api<Record<string, unknown>[]>('/contractor-sites'), createSite: (body: unknown) => api('/contractor-sites', { method: 'POST', body: JSON.stringify(body) }), updateSite: (id: string, body: unknown) => api(`/contractor-sites/${id}`, { method: 'PATCH', body: JSON.stringify(body) }), deleteSite: (id: string) => api(`/contractor-sites/${id}`, { method: 'DELETE' }),
   users: () => api<User[]>('/users'), createUser: (body: unknown) => api<User>('/users', { method: 'POST', body: JSON.stringify(body) }), updateUser: (id: string, body: unknown) => api<User>(`/users/${id}`, { method: 'PATCH', body: JSON.stringify(body) }), replaceScopes: (id: string, scopes: RoleScope[]) => api<User>(`/users/${id}/role-scopes`, { method: 'PUT', body: JSON.stringify(scopes) }),
   rules: () => api<Record<string, unknown>[]>('/compliance-rules'), createRule: (body: unknown) => api('/compliance-rules', { method: 'POST', body: JSON.stringify(body) }), downloadRuleTemplate: () => download('/compliance-master/template', 'morax-compliance-master-template.xlsx'),
   validateImport: (file: File) => upload<{ id: string; total_rows: number; valid_rows: number; error_rows: number }>('/compliance-imports/validate', file), previewImport: (id: string) => api<{ import: Record<string, unknown>; rows: { row_number: number; valid: boolean; data: Record<string, string>; errors: { field: string; message: string }[] }[] }>(`/compliance-imports/${id}/preview`), confirmImport: (id: string) => api(`/compliance-imports/${id}/confirm`, { method: 'POST' }), imports: () => api<Record<string, unknown>[]>('/compliance-imports'),
