@@ -1,0 +1,55 @@
+import { api, download, upload } from './client'
+
+export type RoleScope = { role: string; scope_type: string; scope_id: string }
+export type Impersonation = { active: boolean; impersonator_id?: string | null; impersonator_name?: string | null }
+export type User = { id: string; name: string; email: string; organization_id: string; home_organization_id?: string | null; platform_role?: string | null; must_change_password: boolean; roles: string[]; scopes: RoleScope[]; impersonation?: Impersonation; active?: boolean; mobile?: string | null }
+export type AuthResult = { access_token: string; token_type: string; user: User }
+export type Master = { id: string; name: string; code: string }
+export type Evidence = { id: string; category: string; original_filename: string; version: number; created_at: string; verification_state?: string; verification_reason?: string | null; size_bytes?: number; checksum_sha256?: string; verified_at?: string | null }
+export type Assignment = { id: string; user_id: string; assignment_type: 'MAKER' | 'CHECKER'; active: boolean; assigned_by_id?: string; created_at?: string }
+export type Workflow = { id: string; action: string; from_status?: string; to_status?: string; comment?: string; created_at: string }
+export type Comment = { id: string; body: string; author_id: string; created_at: string }
+export type Instance = { id: string; compliance_id: string; compliance_name: string; frequency: string; risk_level: string; subject_name: string; subject_type: string; subject_id: string; due_date: string; status: string; display_status?: string; row_version: number; is_overdue: boolean; days_overdue: number; required_document?: string; activity_reference?: string; completed_on?: string; amount?: number; remarks?: string; evidence?: Evidence[]; assignments?: Assignment[]; history?: Workflow[]; comments?: Comment[]; applicability?: { matched: Record<string, boolean> }; rule_snapshot?: Record<string, unknown> }
+export type Page<T> = { items: T[]; total: number; page: number; page_size: number }
+export type DashboardEntityFilter = { id: string; name: string; entity_type: string; unit_id?: string | null; contractor_id?: string | null }
+export type DashboardHealth = { id: string; name: string; entity_type?: string; total: number; completed: number; overdue: number; rate: number }
+export type DashboardOverview = {
+  filters: { units: { id: string; name: string }[]; entities: DashboardEntityFilter[]; contractors: { id: string; name: string; unit_id?: string | null }[]; periods: string[] }
+  summary: { total: number; completed: number; pending: number; overdue: number; due_soon: number; completion_rate: number }
+  status_distribution: { name: string; value: number }[]
+  frequency_distribution: { name: string; value: number }[]
+  entity_health: DashboardHealth[]
+  contractor_health: DashboardHealth[]
+  upcoming: Instance[]
+}
+
+const query = (values: Record<string, string | undefined>) => { const params = new URLSearchParams(Object.entries(values).filter(([, value]) => value) as [string, string][]); return params.size ? `?${params}` : '' }
+
+export const morax = {
+  login: (email: string, password: string) => api<AuthResult>('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
+  impersonate: (userId: string) => api<AuthResult>('/auth/impersonate/' + userId, { method: 'POST' }),
+  endImpersonation: () => api<AuthResult>('/auth/end-impersonation', { method: 'POST' }),
+  logout: () => api('/auth/logout', { method: 'POST' }), me: () => api<User>('/auth/me'),
+  changePassword: (body: { current_password: string; new_password: string }) => api('/auth/change-password', { method: 'POST', body: JSON.stringify(body) }),
+  platformOrganizations: (filters: Record<string, string> = {}) => api<Record<string, unknown>[]>(`/platform/organizations${query(filters)}`),
+  platformOrganization: (id: string) => api<Record<string, unknown>>(`/platform/organizations/${id}`),
+  createPlatformOrganization: (body: unknown) => api<Record<string, unknown>>('/platform/organizations', { method: 'POST', body: JSON.stringify(body) }),
+  updatePlatformOrganization: (id: string, body: unknown) => api<Record<string, unknown>>(`/platform/organizations/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  setPlatformOrganizationStatus: (id: string, status: 'ACTIVE' | 'INACTIVE') => api<Record<string, unknown>>(`/platform/organizations/${id}/status`, { method: 'POST', body: JSON.stringify({ status }) }),
+  enterPlatformOrganization: (id: string) => api<{ organization: Record<string, unknown>; user: User }>(`/platform/organizations/${id}/enter`, { method: 'POST' }),
+  dashboard: () => api<{ total: number; statuses: Record<string, number>; overdue: number; completed_late: number }>('/dashboard/summary'), dashboardOverview: (filters: Record<string, string> = {}) => api<DashboardOverview>(`/dashboard/overview${query(filters)}`), states: () => api<Master[]>('/master-data/states'), industries: () => api<Master[]>('/master-data/industry-types'),
+  organization: () => api<Record<string, unknown>>('/organizations'), updateOrganization: (body: unknown) => api('/organizations', { method: 'PATCH', body: JSON.stringify(body) }),
+  units: () => api<Page<Record<string, unknown>>>('/units'), createUnit: (body: unknown) => api('/units', { method: 'POST', body: JSON.stringify(body) }), updateUnit: (id: string, body: unknown) => api(`/units/${id}`, { method: 'PATCH', body: JSON.stringify(body) }), deleteUnit: (id: string) => api(`/units/${id}`, { method: 'DELETE' }),
+  contractors: () => api<Record<string, unknown>[]>('/contractors'), createContractor: (body: unknown) => api('/contractors', { method: 'POST', body: JSON.stringify(body) }), updateContractor: (id: string, body: unknown) => api(`/contractors/${id}`, { method: 'PATCH', body: JSON.stringify(body) }), deleteContractor: (id: string) => api(`/contractors/${id}`, { method: 'DELETE' }),
+  sites: () => api<Record<string, unknown>[]>('/contractor-sites'), createSite: (body: unknown) => api('/contractor-sites', { method: 'POST', body: JSON.stringify(body) }), updateSite: (id: string, body: unknown) => api(`/contractor-sites/${id}`, { method: 'PATCH', body: JSON.stringify(body) }), deleteSite: (id: string) => api(`/contractor-sites/${id}`, { method: 'DELETE' }),
+  users: () => api<User[]>('/users'), createUser: (body: unknown) => api<User>('/users', { method: 'POST', body: JSON.stringify(body) }), updateUser: (id: string, body: unknown) => api<User>(`/users/${id}`, { method: 'PATCH', body: JSON.stringify(body) }), replaceScopes: (id: string, scopes: RoleScope[]) => api<User>(`/users/${id}/role-scopes`, { method: 'PUT', body: JSON.stringify(scopes) }),
+  rules: () => api<Record<string, unknown>[]>('/compliance-rules'), createRule: (body: unknown) => api('/compliance-rules', { method: 'POST', body: JSON.stringify(body) }), downloadRuleTemplate: () => download('/compliance-master/template', 'morax-compliance-master-template.xlsx'),
+  validateImport: (file: File) => upload<{ id: string; total_rows: number; valid_rows: number; error_rows: number }>('/compliance-imports/validate', file), previewImport: (id: string) => api<{ import: Record<string, unknown>; rows: { row_number: number; valid: boolean; data: Record<string, string>; errors: { field: string; message: string }[] }[] }>(`/compliance-imports/${id}/preview`), confirmImport: (id: string) => api(`/compliance-imports/${id}/confirm`, { method: 'POST' }), imports: () => api<Record<string, unknown>[]>('/compliance-imports'),
+  generate: (body: { subject_type?: string; subject_id?: string; as_of_date?: string } = {}) => api<{ created: number }>('/compliance-generation/run', { method: 'POST', body: JSON.stringify(body) }),
+  instances: (filters: Record<string, string> = {}) => api<Page<Instance>>(`/compliance-instances${query(filters)}`), instance: (id: string) => api<Instance>(`/compliance-instances/${id}`), activity: (id: string, body: unknown) => api<Instance>(`/compliance-instances/${id}/activity`, { method: 'PATCH', body: JSON.stringify(body) }),
+  assign: (id: string, body: { user_id: string; assignment_type: 'MAKER' | 'CHECKER' }) => api(`/compliance-instances/${id}/assignments`, { method: 'POST', body: JSON.stringify(body) }), evidence: (id: string, file: File, category = 'SUPPORTING_DOCUMENT') => upload(`/compliance-instances/${id}/evidence?category=${encodeURIComponent(category)}`, file), submit: (id: string) => api<Instance>(`/compliance-instances/${id}/submit`, { method: 'POST' }),
+  review: (id: string, body: unknown) => api<Instance>(`/compliance-instances/${id}/begin-review`, { method: 'POST', body: JSON.stringify(body) }), approve: (id: string, body: unknown) => api<Instance>(`/compliance-instances/${id}/approve`, { method: 'POST', body: JSON.stringify(body) }), reject: (id: string, body: unknown) => api<Instance>(`/compliance-instances/${id}/reject`, { method: 'POST', body: JSON.stringify(body) }), correction: (id: string, body: unknown) => api<Instance>(`/compliance-instances/${id}/request-correction`, { method: 'POST', body: JSON.stringify(body) }), notApplicable: (id: string, reason: string) => api<Instance>(`/compliance-instances/${id}/not-applicable`, { method: 'POST', body: JSON.stringify({ reason }) }), comment: (id: string, body: string) => api(`/compliance-instances/${id}/comments`, { method: 'POST', body: JSON.stringify({ body }) }),
+  audit: () => api<Page<Record<string, string>>>('/audit-logs'), documents: (filters: Record<string, string> = {}) => api<Record<string, unknown>[]>(`/documents${query(filters)}`), deleteDocument: (id: string) => api(`/documents/${id}`, { method: 'DELETE' }), downloadDocument: (id: string, filename: string) => download(`/evidence/${id}/download`, filename), verifyDocument: (id: string, verification_state: 'VERIFIED' | 'REJECTED', reason?: string) => api(`/evidence/${id}/verify`, { method: 'POST', body: JSON.stringify({ verification_state, reason }) }),
+  notifications: (unreadOnly = false) => api<Record<string, unknown>[]>(`/notifications${unreadOnly ? '?unread_only=true' : ''}`), readNotification: (id: string) => api(`/notifications/${id}/read`, { method: 'POST' }),
+  statusChart: () => api<Record<string, number>>('/dashboard/status'), frequencyChart: () => api<Record<string, number>>('/dashboard/frequency'), entityChart: () => api<{ entity: string; due: number; overdue: number; done: number; rate: number }[]>('/dashboard/entities'), downloadStatusReport: () => download('/reports/compliance-status.csv', 'morax-compliance-status.csv'), downloadOverdueReport: () => download('/reports/overdue-compliance.csv', 'morax-overdue-compliance.csv'), downloadCompletionReport: () => download('/reports/completion.csv', 'morax-completion.csv'), downloadEntityReport: () => download('/reports/entity-compliance.csv', 'morax-entity-compliance.csv'),
+}
