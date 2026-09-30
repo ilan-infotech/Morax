@@ -1,6 +1,6 @@
 # MORAX Labour Compliance MVP
 
-## Run locally
+## Run locally.
 
 1. Create/activate a Python 3.12 virtual environment and install `backend/requirements.txt`.
 2. From `backend`, copy `.env.example` to `.env`, set a strong `JWT_SECRET_KEY`, then run:
