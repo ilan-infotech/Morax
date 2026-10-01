@@ -167,6 +167,7 @@ def seed_dashboard_demo_data(db, organization: Organization) -> None:
                 version=1,
                 name=name,
                 description="Seeded non-production data for dashboard visual testing.",
+                document_type="PROCEDURAL",
                 frequency=frequency,
                 due_date_rule="MANUAL",
                 required_document="Demo supporting evidence",
@@ -320,14 +321,7 @@ def seed_baseline() -> None:
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
-    allow_origin_regex=settings.cors_origin_regex,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.include_router(router, prefix=settings.api_v1_prefix)
 
 

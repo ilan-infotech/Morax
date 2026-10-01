@@ -1,7 +1,7 @@
 import csv
 import io
 import json
-from datetime import timezone, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -21,7 +21,7 @@ from app.models import (
 from app.schemas import (
     ActivityInput, AssignmentInput, CommentInput, ContractorInput, ContractorSiteInput, GenerationRequest,
     LoginRequest, OrganizationInput, PlatformOrganizationInput, OrganizationStatusInput, PasswordChangeRequest, RoleScopeInput, RuleInput, UnitInput, UserInput,
-    WorkflowDecision, UserUpdateInput, EvidenceVerificationInput, NotApplicableInput, RuleStatusInput,
+    WorkflowDecision, UserUpdateInput, EvidenceVerificationInput, NotApplicableInput, RuleStatusInput, DOCUMENT_TYPES,
 )
 from app.services.access import CHECKER_ROLES, MAKER_ROLES, MANAGER_ROLES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, current_user, is_org_admin, require_org_admin, require_org_admin_for_entity_management, roles_for, scopes_for, user_summary
 from app.services.audit import audit
@@ -252,7 +252,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     organization = db.get(Organization, user.organization_id) if user.organization_id else None
     if user.platform_role != PLATFORM_ADMIN_ROLE and (not organization or organization.status == "INACTIVE"):
         raise HTTPException(403, "Your organization is inactive")
-    session = AuthSession(user_id=user.id, active_organization_id=user.organization_id, expires_at=datetime.now(timezone.utc) + timedelta(minutes=480))
+    session = AuthSession(user_id=user.id, active_organization_id=user.organization_id, expires_at=datetime.now(UTC) + timedelta(minutes=480))
     db.add(session)
     audit(db, organization_id=user.organization_id, actor_id=user.id, action="LOGIN", module="AUTH", entity_type="User", entity_id=user.id)
     db.commit()
@@ -285,7 +285,7 @@ def start_impersonation(user_id: str, user: User = Depends(current_user), db: Se
         active_organization_id=organization_id,
         impersonated_by_session_id=originating_session.id,
         impersonated_by_id=user.id,
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
     )
     db.add(session)
     audit(
@@ -328,7 +328,7 @@ def end_impersonation(user: User = Depends(current_user), db: Session = Depends(
     ):
         raise HTTPException(401, "The originating administrator session is no longer available")
 
-    impersonated_session.revoked_at = datetime.now(timezone.utc)
+    impersonated_session.revoked_at = datetime.now(UTC)
     audit(
         db,
         organization_id=org_for(user),
@@ -353,7 +353,7 @@ def end_impersonation(user: User = Depends(current_user), db: Session = Depends(
 def logout(user: User = Depends(current_user), db: Session = Depends(get_db)):
     # Tokens are session-backed; revoke all current user sessions on explicit logout for predictable security.
     for session in db.scalars(select(AuthSession).where(AuthSession.user_id == user.id, AuthSession.revoked_at.is_(None))):
-        session.revoked_at = datetime.now(timezone.utc)
+        session.revoked_at = datetime.now(UTC)
     audit(db, organization_id=user.organization_id, actor_id=user.id, action="LOGOUT", module="AUTH", entity_type="User", entity_id=user.id)
     db.commit()
     return {"ok": True}
@@ -953,7 +953,7 @@ def confirm_import(import_id: str, user: User = Depends(current_user), db: Sessi
             skipped += 1
             continue
         create_rule_version(db, org, user, payload); imported += 1
-    record.status = "CONFIRMED"; record.confirmed_at = datetime.now(timezone.utc)
+    record.status = "CONFIRMED"; record.confirmed_at = datetime.now(UTC)
     audit(db, organization_id=org, actor_id=user.id, action="CONFIRM_IMPORT", module="COMPLIANCE_MASTER", entity_type="ComplianceImport", entity_id=record.id, new={"imported": imported, "skipped": skipped})
     db.commit(); return {"id": record.id, "imported": imported, "skipped": skipped, "error_rows": record.error_rows}
 
@@ -977,9 +977,28 @@ def run_generation(payload: GenerationRequest, user: User = Depends(current_user
     db.commit(); return {"created": len(created), "instance_ids": [item.id for item in created]}
 
 
-@router.get("/compliance-instances")
-def list_instances(frequency: str | None = None, status: str | None = None, risk_level: str | None = None, entity_type: str | None = None, date_from: date | None = None, date_to: date | None = None, q: str | None = None, page: int = 1, page_size: int = 50, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    org = org_for(user); instances = list(db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org).order_by(ComplianceInstance.due_date)))
+def filtered_instance_rows(
+    db: Session,
+    user: User,
+    *,
+    frequency: str | None = None,
+    status: str | None = None,
+    risk_level: str | None = None,
+    entity_type: str | None = None,
+    document_type: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    q: str | None = None,
+) -> list[dict]:
+    """Apply a single, access-controlled filter path for compliance worklists."""
+    org = org_for(user)
+    instances = list(
+        db.scalars(
+            select(ComplianceInstance)
+            .where(ComplianceInstance.organization_id == org)
+            .order_by(ComplianceInstance.due_date)
+        )
+    )
     results = []
     for instance in instances:
         if not can_access_subject(db, user, org, instance.subject_type, instance.subject_id): continue
@@ -988,11 +1007,91 @@ def list_instances(frequency: str | None = None, status: str | None = None, risk
         if status and status not in {instance.status, row["display_status"]}: continue
         if risk_level and row["risk_level"] != risk_level: continue
         if entity_type and instance.subject_type != entity_type: continue
+        if document_type and row["document_type"] != document_type: continue
         if date_from and instance.due_date < date_from: continue
         if date_to and instance.due_date > date_to: continue
-        if q and q.lower() not in " ".join(str(row.get(key) or "") for key in ("compliance_id", "compliance_name", "subject_name")).lower(): continue
+        if q and q.lower() not in " ".join(str(row.get(key) or "") for key in ("compliance_id", "compliance_name", "rule_name", "act", "rule_reference", "subject_name")).lower(): continue
         results.append(row)
+    return results
+
+
+@router.get("/compliance-instances")
+def list_instances(frequency: str | None = None, status: str | None = None, risk_level: str | None = None, entity_type: str | None = None, document_type: str | None = None, date_from: date | None = None, date_to: date | None = None, q: str | None = None, page: int = 1, page_size: int = 50, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if document_type and document_type not in DOCUMENT_TYPES:
+        raise HTTPException(422, "Unsupported document type")
+    results = filtered_instance_rows(db, user, frequency=frequency, status=status, risk_level=risk_level, entity_type=entity_type, document_type=document_type, date_from=date_from, date_to=date_to, q=q)
     return list_page(results, page, min(page_size, 100))
+
+
+@router.get("/compliance-instances/grouped")
+def list_grouped_instances(
+    frequency: str | None = None,
+    status: str | None = None,
+    risk_level: str | None = None,
+    entity_type: str | None = None,
+    document_type: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    q: str | None = None,
+    page: int = 1,
+    page_size: int = 25,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Return recurring obligations grouped by their configured rule/Act.
+
+    Counts are calculated after every non-document filter and before the active
+    document-type tab is applied.  This makes every tab a live count while
+    keeping authorization entirely on the server.
+    """
+    if document_type and document_type not in DOCUMENT_TYPES:
+        raise HTTPException(422, "Unsupported document type")
+    if frequency == "ONE_TIME":
+        raise HTTPException(422, "The grouped recurring worklist does not support ONE_TIME frequency")
+
+    base_rows = [
+        row for row in filtered_instance_rows(
+            db, user, frequency=frequency, status=status, risk_level=risk_level,
+            entity_type=entity_type, date_from=date_from, date_to=date_to, q=q,
+        )
+        if row["frequency"] != "ONE_TIME"
+    ]
+    type_counts = [
+        {"document_type": item, "count": sum(row["document_type"] == item for row in base_rows)}
+        for item in DOCUMENT_TYPES
+    ]
+    rows = [row for row in base_rows if not document_type or row["document_type"] == document_type]
+    grouped: dict[str, dict] = {}
+    for row in rows:
+        # The Compliance Master rule is the stable grouping identity.  Its
+        # configured name is displayed; an Act may be shared by several rules
+        # and therefore must not merge distinct operational obligations.
+        group_key = row["rule_id"]
+        group_name = row["rule_name"] or row["compliance_name"]
+        group = grouped.setdefault(group_key, {"id": group_key, "name": group_name, "records": []})
+        group["records"].append(row)
+
+    groups = []
+    for group in grouped.values():
+        records = sorted(group["records"], key=lambda row: (row["due_date"], row["subject_name"].lower()))
+        groups.append({
+            **group,
+            "records": records,
+            "compliance_count": len(records),
+            "due_count": sum(row["status"] not in {"APPROVED", "NOT_APPLICABLE"} for row in records),
+        })
+    groups.sort(key=lambda group: group["name"].lower())
+    safe_page = max(1, page)
+    safe_page_size = min(max(1, page_size), 50)
+    start = (safe_page - 1) * safe_page_size
+    return {
+        "groups": groups[start : start + safe_page_size],
+        "total_compliances": len(rows),
+        "total_rules": len(groups),
+        "document_type_counts": type_counts,
+        "page": safe_page,
+        "page_size": safe_page_size,
+    }
 
 
 def get_instance_or_404(db: Session, user: User, instance_id: str) -> ComplianceInstance:
@@ -1029,7 +1128,7 @@ def assign(instance_id: str, payload: AssignmentInput, user: User = Depends(curr
     if payload.assignment_type not in {"MAKER", "CHECKER"}: raise HTTPException(422, "Assignment type must be MAKER or CHECKER")
     assignee = db.get(User, payload.user_id)
     if not assignee or assignee.organization_id != instance.organization_id or not assignee.active: raise HTTPException(422, "Assignee must be an active user in the organization")
-    for prior in db.query(ComplianceAssignment).filter_by(instance_id=instance.id, assignment_type=payload.assignment_type, active=True): prior.active = False; prior.ended_at = datetime.now(timezone.utc)
+    for prior in db.query(ComplianceAssignment).filter_by(instance_id=instance.id, assignment_type=payload.assignment_type, active=True): prior.active = False; prior.ended_at = datetime.now(UTC)
     assignment = ComplianceAssignment(instance_id=instance.id, user_id=assignee.id, assignment_type=payload.assignment_type, assigned_by_id=user.id); db.add(assignment)
     db.add(ComplianceWorkflowHistory(instance_id=instance.id, actor_id=user.id, action="ASSIGN", from_status=instance.status, to_status=instance.status, comment=f"{payload.assignment_type}: {assignee.name}"))
     audit(db, organization_id=instance.organization_id, actor_id=user.id, action="ASSIGN_COMPLIANCE", module="COMPLIANCE", entity_type="ComplianceInstance", entity_id=instance.id, new={"assignment_type": payload.assignment_type, "user_id": assignee.id})
@@ -1074,7 +1173,7 @@ def verify_evidence(evidence_id: str, payload: EvidenceVerificationInput, user: 
     state = payload.verification_state.upper()
     if state not in {"VERIFIED", "REJECTED"}: raise HTTPException(422, "Verification state must be VERIFIED or REJECTED")
     if state == "REJECTED" and not payload.reason: raise HTTPException(422, "A rejection reason is required")
-    evidence.verification_state = state; evidence.verification_reason = payload.reason; evidence.verified_by_id = user.id; evidence.verified_at = datetime.now(timezone.utc)
+    evidence.verification_state = state; evidence.verification_reason = payload.reason; evidence.verified_by_id = user.id; evidence.verified_at = datetime.now(UTC)
     audit(db, organization_id=instance.organization_id, actor_id=user.id, action=f"{state}_EVIDENCE", module="EVIDENCE", entity_type="ComplianceEvidence", entity_id=evidence.id, new={"state": state}, reason=payload.reason)
     db.commit(); return model_dict(evidence, [field.name for field in evidence.__table__.columns])
 
@@ -1127,7 +1226,7 @@ def reviewer_action(instance_id: str, payload: WorkflowDecision, target: str, ac
         for assignment in db.query(ComplianceAssignment).filter_by(instance_id=instance.id, assignment_type="MAKER", active=True):
             db.add(InAppNotification(organization_id=instance.organization_id, recipient_id=assignment.user_id, notification_type=target, title="Compliance requires your attention", body=payload.comment, reference_type="ComplianceInstance", reference_id=instance.id))
     if target == "APPROVED":
-        instance.approved_at = datetime.now(timezone.utc); instance.approved_by_id = user.id; instance.completion_late = instance.approved_at.date() > instance.due_date
+        instance.approved_at = datetime.now(UTC); instance.approved_by_id = user.id; instance.completion_late = instance.approved_at.date() > instance.due_date
     db.commit(); return instance_dict(db, instance, detail=True)
 
 
@@ -1193,7 +1292,7 @@ def list_notifications(unread_only: bool = False, user: User = Depends(current_u
 def read_notification(notification_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     notification = db.get(InAppNotification, notification_id)
     if not notification or notification.recipient_id != user.id: raise HTTPException(404, "Notification not found")
-    notification.read_at = datetime.now(timezone.utc)
+    notification.read_at = datetime.now(UTC)
     db.commit(); return {"ok": True}
 
 
