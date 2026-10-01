@@ -23,7 +23,7 @@ from app.schemas import (
     LoginRequest, OrganizationInput, PlatformOrganizationInput, OrganizationStatusInput, PasswordChangeRequest, RoleScopeInput, RuleInput, UnitInput, UserInput,
     WorkflowDecision, UserUpdateInput, EvidenceVerificationInput, NotApplicableInput, RuleStatusInput, DOCUMENT_TYPES,
 )
-from app.services.access import CHECKER_ROLES, MAKER_ROLES, MANAGER_ROLES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, current_user, is_org_admin, require_org_admin, require_org_admin_for_entity_management, roles_for, scopes_for, user_summary
+from app.services.access import CHECKER_ROLES, MAKER_ROLES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, current_user, has_permission, is_org_admin, require_org_admin, roles_for, user_summary
 from app.services.audit import audit
 from app.services.compliance import SUBJECTS, assert_assignment_or_admin, generate_for_subject, submit, transition
 from app.services.serialization import entity_dict, instance_dict, model_dict
@@ -76,8 +76,13 @@ def apply_platform_organization(organization: Organization, payload: PlatformOrg
 
 
 def require_manager(db: Session, user: User, organization_id: str) -> None:
-    if not is_org_admin(db, user, organization_id) and not (roles_for(db, user.id) & MANAGER_ROLES):
+    if not has_permission(db, user, "compliance.manage"):
         raise HTTPException(403, "Administrative permission is required")
+
+
+def require_permission(db: Session, user: User, permission: str) -> None:
+    if not has_permission(db, user, permission):
+        raise HTTPException(403, "You do not have permission to access this product area")
 
 
 def require_deletable_entity(db: Session, subject_type: str, subject_id: str) -> None:
@@ -155,6 +160,7 @@ def list_page(items: list, page: int, page_size: int) -> dict:
 
 def entity_page(
     db: Session,
+    user: User,
     model,
     entity_type: str,
     organization_id: str,
@@ -182,14 +188,17 @@ def entity_page(
     ordering = column.desc() if sort_dir.lower() == "desc" else column.asc()
     safe_page = max(page, 1)
     safe_size = min(max(page_size, 1), 100)
-    total = db.scalar(select(func.count()).select_from(model).where(*filters)) or 0
-    rows = db.scalars(
-        select(model)
-        .where(*filters)
-        .order_by(ordering, model.id)
-        .offset((safe_page - 1) * safe_size)
-        .limit(safe_size)
-    ).all()
+    rows = [
+        row
+        for row in db.scalars(
+            select(model)
+            .where(*filters)
+            .order_by(ordering, model.id)
+        )
+        if can_access_subject(db, user, organization_id, entity_type, row.id)
+    ]
+    total = len(rows)
+    rows = rows[(safe_page - 1) * safe_size : (safe_page - 1) * safe_size + safe_size]
     return {
         "items": [entity_dict(db, row, entity_type) for row in rows],
         "total": total,
@@ -494,8 +503,8 @@ def update_organization(payload: OrganizationInput, user: User = Depends(current
 @router.get("/units")
 def list_units(page: int = 1, page_size: int = 50, q: str | None = None, status: str | None = None, sort_by: str = "name", sort_dir: str = "asc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     organization_id = org_for(user)
-    require_org_admin_for_entity_management(db, user, organization_id)
-    return entity_page(db, Unit, "UNIT", organization_id, page, page_size, q, status, sort_by, sort_dir)
+    require_permission(db, user, "entities.read")
+    return entity_page(db, user, Unit, "UNIT", organization_id, page, page_size, q, status, sort_by, sort_dir)
 
 
 @router.get("/units/{unit_id}")
@@ -503,14 +512,16 @@ def get_unit(unit_id: str, user: User = Depends(current_user), db: Session = Dep
     unit = db.get(Unit, unit_id)
     if not unit or unit.organization_id != org_for(user):
         raise HTTPException(404, "Unit not found")
-    require_org_admin_for_entity_management(db, user, unit.organization_id)
+    require_permission(db, user, "entities.read")
+    if not can_access_subject(db, user, unit.organization_id, "UNIT", unit.id):
+        raise HTTPException(404, "Unit not found")
     return entity_dict(db, unit, "UNIT")
 
 
 @router.post("/units")
 def create_unit(payload: UnitInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     organization_id = org_for(user)
-    require_org_admin_for_entity_management(db, user, organization_id)
+    require_permission(db, user, "entities.manage")
     if db.scalar(select(Unit).where(Unit.organization_id == organization_id, Unit.code == payload.code)):
         raise HTTPException(409, "A unit with this code already exists in the organization")
     if not db.get(State, payload.state_id) or not db.get(IndustryType, payload.industry_type_id):
@@ -530,7 +541,7 @@ def update_unit(unit_id: str, payload: UnitInput, user: User = Depends(current_u
     unit = db.get(Unit, unit_id)
     if not unit or unit.organization_id != org_for(user):
         raise HTTPException(404, "Unit not found")
-    require_org_admin_for_entity_management(db, user, unit.organization_id)
+    require_permission(db, user, "entities.manage")
     if db.scalar(select(Unit).where(Unit.organization_id == unit.organization_id, Unit.code == payload.code, Unit.id != unit.id)):
         raise HTTPException(409, "A unit with this code already exists in the organization")
     if not db.get(State, payload.state_id):
@@ -549,7 +560,7 @@ def delete_unit(unit_id: str, user: User = Depends(current_user), db: Session = 
     unit = db.get(Unit, unit_id)
     if not unit or unit.organization_id != org_for(user):
         raise HTTPException(404, "Unit not found")
-    require_org_admin_for_entity_management(db, user, unit.organization_id)
+    require_permission(db, user, "entities.manage")
     require_deletable_entity(db, "UNIT", unit.id)
     for contractor in db.scalars(select(Contractor).where(Contractor.unit_id == unit.id)):
         contractor.unit_id = None
@@ -564,10 +575,10 @@ def delete_unit(unit_id: str, user: User = Depends(current_user), db: Session = 
 @router.get("/contractors")
 def list_contractors(paginated: bool = False, page: int = 1, page_size: int = 50, q: str | None = None, status: str | None = None, sort_by: str = "name", sort_dir: str = "asc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
-    require_org_admin_for_entity_management(db, user, org)
+    require_permission(db, user, "entities.read")
     if paginated:
-        return entity_page(db, Contractor, "CONTRACTOR", org, page, page_size, q, status, sort_by, sort_dir)
-    return [entity_dict(db, row, "CONTRACTOR") for row in db.scalars(select(Contractor).where(Contractor.organization_id == org).order_by(Contractor.name))]
+        return entity_page(db, user, Contractor, "CONTRACTOR", org, page, page_size, q, status, sort_by, sort_dir)
+    return [entity_dict(db, row, "CONTRACTOR") for row in db.scalars(select(Contractor).where(Contractor.organization_id == org).order_by(Contractor.name)) if can_access_subject(db, user, org, "CONTRACTOR", row.id)]
 
 
 @router.get("/contractors/{contractor_id}")
@@ -575,13 +586,15 @@ def get_contractor(contractor_id: str, user: User = Depends(current_user), db: S
     contractor = db.get(Contractor, contractor_id)
     if not contractor or contractor.organization_id != org_for(user):
         raise HTTPException(404, "Contractor not found")
-    require_org_admin_for_entity_management(db, user, contractor.organization_id)
+    require_permission(db, user, "entities.read")
+    if not can_access_subject(db, user, contractor.organization_id, "CONTRACTOR", contractor.id):
+        raise HTTPException(404, "Contractor not found")
     return entity_dict(db, contractor, "CONTRACTOR")
 
 
 @router.post("/contractors")
 def create_contractor(payload: ContractorInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    org = org_for(user); require_org_admin_for_entity_management(db, user, org)
+    org = org_for(user); require_permission(db, user, "entities.manage")
     if db.scalar(select(Contractor).where(Contractor.organization_id == org, Contractor.code == payload.code)):
         raise HTTPException(409, "A contractor with this code already exists in the organization")
     if payload.unit_id and (not db.get(Unit, payload.unit_id) or db.get(Unit, payload.unit_id).organization_id != org):
@@ -601,7 +614,7 @@ def update_contractor(contractor_id: str, payload: ContractorInput, user: User =
     contractor = db.get(Contractor, contractor_id)
     if not contractor or contractor.organization_id != org_for(user):
         raise HTTPException(404, "Contractor not found")
-    require_org_admin_for_entity_management(db, user, contractor.organization_id)
+    require_permission(db, user, "entities.manage")
     if db.scalar(select(Contractor).where(Contractor.organization_id == contractor.organization_id, Contractor.code == payload.code, Contractor.id != contractor.id)):
         raise HTTPException(409, "A contractor with this code already exists in the organization")
     if payload.unit_id and (not db.get(Unit, payload.unit_id) or db.get(Unit, payload.unit_id).organization_id != contractor.organization_id):
@@ -620,7 +633,7 @@ def delete_contractor(contractor_id: str, user: User = Depends(current_user), db
     contractor = db.get(Contractor, contractor_id)
     if not contractor or contractor.organization_id != org_for(user):
         raise HTTPException(404, "Contractor not found")
-    require_org_admin_for_entity_management(db, user, contractor.organization_id)
+    require_permission(db, user, "entities.manage")
     require_deletable_entity(db, "CONTRACTOR", contractor.id)
     sites = list(db.scalars(select(ContractorSite).where(ContractorSite.contractor_id == contractor.id)))
     for site in sites:
@@ -636,10 +649,10 @@ def delete_contractor(contractor_id: str, user: User = Depends(current_user), db
 @router.get("/contractor-sites")
 def list_sites(paginated: bool = False, page: int = 1, page_size: int = 50, q: str | None = None, status: str | None = None, sort_by: str = "name", sort_dir: str = "asc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
-    require_org_admin_for_entity_management(db, user, org)
+    require_permission(db, user, "entities.read")
     if paginated:
-        return entity_page(db, ContractorSite, "CONTRACTOR_SITE", org, page, page_size, q, status, sort_by, sort_dir)
-    return [entity_dict(db, row, "CONTRACTOR_SITE") for row in db.scalars(select(ContractorSite).where(ContractorSite.organization_id == org).order_by(ContractorSite.name))]
+        return entity_page(db, user, ContractorSite, "CONTRACTOR_SITE", org, page, page_size, q, status, sort_by, sort_dir)
+    return [entity_dict(db, row, "CONTRACTOR_SITE") for row in db.scalars(select(ContractorSite).where(ContractorSite.organization_id == org).order_by(ContractorSite.name)) if can_access_subject(db, user, org, "CONTRACTOR_SITE", row.id)]
 
 
 @router.get("/contractor-sites/{site_id}")
@@ -647,13 +660,15 @@ def get_site(site_id: str, user: User = Depends(current_user), db: Session = Dep
     site = db.get(ContractorSite, site_id)
     if not site or site.organization_id != org_for(user):
         raise HTTPException(404, "Contractor Site not found")
-    require_org_admin_for_entity_management(db, user, site.organization_id)
+    require_permission(db, user, "entities.read")
+    if not can_access_subject(db, user, site.organization_id, "CONTRACTOR_SITE", site.id):
+        raise HTTPException(404, "Contractor Site not found")
     return entity_dict(db, site, "CONTRACTOR_SITE")
 
 
 @router.post("/contractor-sites")
 def create_site(payload: ContractorSiteInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    org = org_for(user); require_org_admin_for_entity_management(db, user, org)
+    org = org_for(user); require_permission(db, user, "entities.manage")
     contractor = db.get(Contractor, payload.contractor_id)
     if not contractor or contractor.organization_id != org:
         raise HTTPException(422, "Contractor must belong to your organization")
@@ -675,7 +690,7 @@ def update_site(site_id: str, payload: ContractorSiteInput, user: User = Depends
     site = db.get(ContractorSite, site_id)
     if not site or site.organization_id != org_for(user):
         raise HTTPException(404, "Contractor Site not found")
-    require_org_admin_for_entity_management(db, user, site.organization_id)
+    require_permission(db, user, "entities.manage")
     contractor = db.get(Contractor, payload.contractor_id)
     if not contractor or contractor.organization_id != site.organization_id:
         raise HTTPException(422, "Contractor must belong to your organization")
@@ -695,7 +710,7 @@ def delete_site(site_id: str, user: User = Depends(current_user), db: Session = 
     site = db.get(ContractorSite, site_id)
     if not site or site.organization_id != org_for(user):
         raise HTTPException(404, "Contractor Site not found")
-    require_org_admin_for_entity_management(db, user, site.organization_id)
+    require_permission(db, user, "entities.manage")
     require_deletable_entity(db, "CONTRACTOR_SITE", site.id)
     audit(db, organization_id=site.organization_id, actor_id=user.id, action="DELETE_CONTRACTOR_SITE", module="ENTITIES", entity_type="ContractorSite", entity_id=site.id, old={"name": site.name, "code": site.code})
     db.delete(site)
@@ -985,6 +1000,7 @@ def filtered_instance_rows(
     status: str | None = None,
     risk_level: str | None = None,
     entity_type: str | None = None,
+    subject_id: str | None = None,
     document_type: str | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
@@ -992,6 +1008,7 @@ def filtered_instance_rows(
 ) -> list[dict]:
     """Apply a single, access-controlled filter path for compliance worklists."""
     org = org_for(user)
+    require_permission(db, user, "compliance.read")
     instances = list(
         db.scalars(
             select(ComplianceInstance)
@@ -1007,19 +1024,20 @@ def filtered_instance_rows(
         if status and status not in {instance.status, row["display_status"]}: continue
         if risk_level and row["risk_level"] != risk_level: continue
         if entity_type and instance.subject_type != entity_type: continue
+        if subject_id and instance.subject_id != subject_id: continue
         if document_type and row["document_type"] != document_type: continue
         if date_from and instance.due_date < date_from: continue
         if date_to and instance.due_date > date_to: continue
-        if q and q.lower() not in " ".join(str(row.get(key) or "") for key in ("compliance_id", "compliance_name", "rule_name", "act", "rule_reference", "subject_name")).lower(): continue
+        if q and q.lower() not in " ".join(str(row.get(key) or "") for key in ("compliance_id", "compliance_name", "rule_name", "act", "rule_reference", "form_number", "subject_name")).lower(): continue
         results.append(row)
     return results
 
 
 @router.get("/compliance-instances")
-def list_instances(frequency: str | None = None, status: str | None = None, risk_level: str | None = None, entity_type: str | None = None, document_type: str | None = None, date_from: date | None = None, date_to: date | None = None, q: str | None = None, page: int = 1, page_size: int = 50, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def list_instances(frequency: str | None = None, status: str | None = None, risk_level: str | None = None, entity_type: str | None = None, subject_id: str | None = None, document_type: str | None = None, date_from: date | None = None, date_to: date | None = None, q: str | None = None, page: int = 1, page_size: int = 50, user: User = Depends(current_user), db: Session = Depends(get_db)):
     if document_type and document_type not in DOCUMENT_TYPES:
         raise HTTPException(422, "Unsupported document type")
-    results = filtered_instance_rows(db, user, frequency=frequency, status=status, risk_level=risk_level, entity_type=entity_type, document_type=document_type, date_from=date_from, date_to=date_to, q=q)
+    results = filtered_instance_rows(db, user, frequency=frequency, status=status, risk_level=risk_level, entity_type=entity_type, subject_id=subject_id, document_type=document_type, date_from=date_from, date_to=date_to, q=q)
     return list_page(results, page, min(page_size, 100))
 
 
@@ -1029,6 +1047,7 @@ def list_grouped_instances(
     status: str | None = None,
     risk_level: str | None = None,
     entity_type: str | None = None,
+    subject_id: str | None = None,
     document_type: str | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
@@ -1052,7 +1071,7 @@ def list_grouped_instances(
     base_rows = [
         row for row in filtered_instance_rows(
             db, user, frequency=frequency, status=status, risk_level=risk_level,
-            entity_type=entity_type, date_from=date_from, date_to=date_to, q=q,
+            entity_type=entity_type, subject_id=subject_id, date_from=date_from, date_to=date_to, q=q,
         )
         if row["frequency"] != "ONE_TIME"
     ]
@@ -1078,9 +1097,15 @@ def list_grouped_instances(
             **group,
             "records": records,
             "compliance_count": len(records),
-            "due_count": sum(row["status"] not in {"APPROVED", "NOT_APPLICABLE"} for row in records),
+            "due_count": sum(row["display_status"] == "DUE" for row in records),
+            "overdue_count": sum(row["display_status"] == "OVERDUE" for row in records),
+            "awaiting_approval_count": sum(row["display_status"] == "PENDING_FOR_APPROVAL" for row in records),
+            "rejected_count": sum(row["display_status"] == "REJECTED_BY_CHECKER" for row in records),
         })
     groups.sort(key=lambda group: group["name"].lower())
+    completed = sum(row["display_status"] == "COMPLETED" for row in rows)
+    completed_late = sum(row["display_status"] == "COMPLETED_LATE" for row in rows)
+    total_actionable = sum(row["status"] != "NOT_APPLICABLE" for row in rows)
     safe_page = max(1, page)
     safe_page_size = min(max(1, page_size), 50)
     start = (safe_page - 1) * safe_page_size
@@ -1089,6 +1114,16 @@ def list_grouped_instances(
         "total_compliances": len(rows),
         "total_rules": len(groups),
         "document_type_counts": type_counts,
+        "status_counts": {
+            "total": len(rows),
+            "due": sum(row["display_status"] == "DUE" for row in rows),
+            "overdue": sum(row["display_status"] == "OVERDUE" for row in rows),
+            "completed": completed,
+            "completed_late": completed_late,
+            "rejected": sum(row["display_status"] == "REJECTED_BY_CHECKER" for row in rows),
+            "pending_approval": sum(row["display_status"] == "PENDING_FOR_APPROVAL" for row in rows),
+            "compliance_rate": round(((completed + completed_late) / total_actionable) * 100) if total_actionable else 0,
+        },
         "page": safe_page,
         "page_size": safe_page_size,
     }
@@ -1102,6 +1137,7 @@ def get_instance_or_404(db: Session, user: User, instance_id: str) -> Compliance
 
 @router.get("/compliance-instances/{instance_id}")
 def get_instance(instance_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_permission(db, user, "compliance.read")
     instance = get_instance_or_404(db, user, instance_id); result = instance_dict(db, instance, detail=True)
     result["history"] = [model_dict(item, [field.name for field in item.__table__.columns]) for item in db.scalars(select(ComplianceWorkflowHistory).where(ComplianceWorkflowHistory.instance_id == instance.id).order_by(ComplianceWorkflowHistory.created_at))]
     result["comments"] = [model_dict(item, [field.name for field in item.__table__.columns]) for item in db.scalars(select(ComplianceComment).where(ComplianceComment.instance_id == instance.id).order_by(ComplianceComment.created_at))]
@@ -1128,6 +1164,12 @@ def assign(instance_id: str, payload: AssignmentInput, user: User = Depends(curr
     if payload.assignment_type not in {"MAKER", "CHECKER"}: raise HTTPException(422, "Assignment type must be MAKER or CHECKER")
     assignee = db.get(User, payload.user_id)
     if not assignee or assignee.organization_id != instance.organization_id or not assignee.active: raise HTTPException(422, "Assignee must be an active user in the organization")
+    assignee_roles = roles_for(db, assignee.id)
+    required_roles = MAKER_ROLES if payload.assignment_type == "MAKER" else CHECKER_ROLES
+    if not assignee_roles & required_roles:
+        raise HTTPException(422, f"Assignee must have an active {payload.assignment_type.lower()} role")
+    if not can_access_subject(db, assignee, instance.organization_id, instance.subject_type, instance.subject_id):
+        raise HTTPException(422, "Assignee scope does not cover this compliance")
     for prior in db.query(ComplianceAssignment).filter_by(instance_id=instance.id, assignment_type=payload.assignment_type, active=True): prior.active = False; prior.ended_at = datetime.now(UTC)
     assignment = ComplianceAssignment(instance_id=instance.id, user_id=assignee.id, assignment_type=payload.assignment_type, assigned_by_id=user.id); db.add(assignment)
     db.add(ComplianceWorkflowHistory(instance_id=instance.id, actor_id=user.id, action="ASSIGN", from_status=instance.status, to_status=instance.status, comment=f"{payload.assignment_type}: {assignee.name}"))
@@ -1254,6 +1296,7 @@ def add_comment(instance_id: str, payload: CommentInput, user: User = Depends(cu
 @router.get("/documents")
 def list_documents(q: str | None = None, entity_type: str | None = None, verification_state: str | None = None, paginated: bool = False, page: int = 1, page_size: int = 50, sort_by: str = "created_at", sort_dir: str = "desc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
+    require_permission(db, user, "documents.read")
     documents = []
     for evidence, instance in db.query(ComplianceEvidence, ComplianceInstance).join(ComplianceInstance, ComplianceInstance.id == ComplianceEvidence.instance_id).filter(ComplianceInstance.organization_id == org).order_by(ComplianceEvidence.created_at.desc()):
         if entity_type and instance.subject_type != entity_type:
@@ -1302,7 +1345,7 @@ def delete_document(evidence_id: str, user: User = Depends(current_user), db: Se
     if not evidence:
         raise HTTPException(404, "Document not found")
     instance = get_instance_or_404(db, user, evidence.instance_id)
-    require_manager(db, user, instance.organization_id)
+    require_permission(db, user, "documents.manage")
     stored_filename = evidence.stored_filename
     audit(db, organization_id=instance.organization_id, actor_id=user.id, action="DELETE_DOCUMENT", module="EVIDENCE", entity_type="ComplianceEvidence", entity_id=evidence.id, old={"filename": evidence.original_filename})
     db.delete(evidence)
@@ -1314,6 +1357,7 @@ def delete_document(evidence_id: str, user: User = Depends(current_user), db: Se
 @router.get("/reports/compliance-status.csv")
 def compliance_status_report(status: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
+    require_permission(db, user, "reports.read")
     rows = []
     for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org).order_by(ComplianceInstance.due_date)):
         if not can_access_subject(db, user, org, instance.subject_type, instance.subject_id):
@@ -1347,6 +1391,7 @@ def entity_compliance_report(user: User = Depends(current_user), db: Session = D
 @router.get("/dashboard/status")
 def dashboard_status(user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
+    require_permission(db, user, "dashboard.read")
     counts: dict[str, int] = {}
     for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)):
         if can_access_subject(db, user, org, instance.subject_type, instance.subject_id):
@@ -1383,6 +1428,7 @@ def dashboard_overview(
     Contractor, or Contractor Site.
     """
     organization_id = org_for(user)
+    require_permission(db, user, "dashboard.read")
     today_value = date.today()
     units = {
         item.id: item
@@ -1658,6 +1704,7 @@ def dashboard_overview(
 @router.get("/dashboard/frequency")
 def dashboard_frequency(user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
+    require_permission(db, user, "dashboard.read")
     counts: dict[str, int] = {}
     for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)):
         if can_access_subject(db, user, org, instance.subject_type, instance.subject_id):
@@ -1669,6 +1716,7 @@ def dashboard_frequency(user: User = Depends(current_user), db: Session = Depend
 @router.get("/dashboard/entities")
 def dashboard_entities(user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
+    require_permission(db, user, "dashboard.read")
     summary: dict[str, dict[str, int]] = {}
     for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)):
         if not can_access_subject(db, user, org, instance.subject_type, instance.subject_id):
@@ -1684,7 +1732,7 @@ def dashboard_entities(user: User = Depends(current_user), db: Session = Depends
 
 @router.get("/dashboard/summary")
 def dashboard(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    org = org_for(user); rows = [item for item in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)) if can_access_subject(db, user, org, item.subject_type, item.subject_id)]
+    org = org_for(user); require_permission(db, user, "dashboard.read"); rows = [item for item in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)) if can_access_subject(db, user, org, item.subject_type, item.subject_id)]
     statuses = {key: 0 for key in ["PENDING", "IN_PROGRESS", "SUBMITTED", "UNDER_REVIEW", "CORRECTION_REQUIRED", "REJECTED", "APPROVED"]}
     for row in rows: statuses[row.status] = statuses.get(row.status, 0) + 1
     overdue = sum(1 for row in rows if row.status != "APPROVED" and row.due_date < date.today())

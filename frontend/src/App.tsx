@@ -159,20 +159,62 @@ function Login({ done }: { done: (user: User) => void }) {
   );
 }
 
-const links = [
-  ["Dashboard", "dashboard"],
-  ["Recurring", "compliances/recurring"],
-  ["One-time", "compliances/one-time"],
-  ["Units", "entities/units"],
-  ["Contractors", "entities/contractors"],
-  ["Sites", "entities/sites"],
-  ["Users & access", "users"],
-  ["Compliance Master", "compliance-master"],
-  ["Document library", "documents"],
-  ["Notifications", "notifications"],
-  ["Reports", "reports"],
-  ["Audit trail", "audit"],
-  ["Organization settings", "settings"],
+type WorkspaceFeature =
+  | "dashboard"
+  | "compliances.recurring"
+  | "compliances.one_time"
+  | "entities.units"
+  | "entities.contractors"
+  | "entities.sites"
+  | "users"
+  | "compliance_master"
+  | "documents"
+  | "notifications"
+  | "reports"
+  | "audit"
+  | "settings"
+  | "platform.organizations";
+
+type WorkspaceLink = {
+  label: string;
+  path: string;
+  feature: WorkspaceFeature;
+};
+
+const links: WorkspaceLink[] = [
+  { label: "Dashboard", path: "dashboard", feature: "dashboard" },
+  {
+    label: "Recurring",
+    path: "compliances/recurring",
+    feature: "compliances.recurring",
+  },
+  {
+    label: "One-time",
+    path: "compliances/one-time",
+    feature: "compliances.one_time",
+  },
+  { label: "Units", path: "entities/units", feature: "entities.units" },
+  {
+    label: "Contractors",
+    path: "entities/contractors",
+    feature: "entities.contractors",
+  },
+  { label: "Sites", path: "entities/sites", feature: "entities.sites" },
+  { label: "Users & access", path: "users", feature: "users" },
+  {
+    label: "Compliance Master",
+    path: "compliance-master",
+    feature: "compliance_master",
+  },
+  { label: "Document library", path: "documents", feature: "documents" },
+  { label: "Notifications", path: "notifications", feature: "notifications" },
+  { label: "Reports", path: "reports", feature: "reports" },
+  { label: "Audit trail", path: "audit", feature: "audit" },
+  {
+    label: "Organization settings",
+    path: "settings",
+    feature: "settings",
+  },
 ];
 
 const navIcons: Record<string, LucideIcon> = {
@@ -205,32 +247,89 @@ function WorkspaceNavLink({ label, to }: { label: string; to: string }) {
   );
 }
 
-function workspaceLinks(user: User) {
+function fallbackFeatures(user: User): WorkspaceFeature[] {
   if (
     user.platform_role === "MORAX_ADMIN" ||
     user.roles.includes("ORGANIZATION_ADMIN")
   )
-    return links;
-  const common = [
-    "Dashboard",
-    "Recurring",
-    "One-time",
-    "Document library",
-    "Notifications",
-    "Reports",
-    "Organization settings",
+    return links.map((link) => link.feature);
+  const base: WorkspaceFeature[] = [
+    "dashboard",
+    "compliances.recurring",
+    "compliances.one_time",
+    "documents",
+    "notifications",
+    "settings",
   ];
-  const organizationAuditor = user.scopes.some(
-    (scope) =>
-      scope.role === "AUDITOR" &&
-      scope.scope_type === "ORGANIZATION" &&
-      scope.scope_id === user.organization_id,
+  if (
+    user.roles.some((role) => ["UNIT_ADMIN", "CONTRACTOR_ADMIN"].includes(role))
+  )
+    base.push("reports");
+  if (user.roles.includes("AUDITOR")) base.push("reports", "audit");
+  return base;
+}
+
+function featureSet(user: User) {
+  return new Set<WorkspaceFeature>(
+    ((user.features?.length ? user.features : fallbackFeatures(user)) as WorkspaceFeature[]),
   );
-  if (organizationAuditor)
-    return links.filter(([label]) =>
-      [...common, "Audit trail"].includes(label),
-    );
-  return links.filter(([label]) => common.includes(label));
+}
+
+function hasFeature(user: User, feature: WorkspaceFeature) {
+  return featureSet(user).has(feature);
+}
+
+function workspaceLinks(user: User) {
+  const features = featureSet(user);
+  return links.filter((link) => features.has(link.feature));
+}
+
+function defaultWorkspacePath(user: User) {
+  return workspaceLinks(user)[0]?.path ?? "settings";
+}
+
+function FeatureGate({
+  user,
+  feature,
+  children,
+}: {
+  user: User;
+  feature: WorkspaceFeature;
+  children: ReactNode;
+}) {
+  if (hasFeature(user, feature)) return <>{children}</>;
+  return (
+    <Panel>
+      This company login does not have access to this product area.
+    </Panel>
+  );
+}
+
+function ComplianceRoute({ user }: { user: User }) {
+  const { kind } = useParams();
+  return (
+    <FeatureGate
+      user={user}
+      feature={kind === "one-time" ? "compliances.one_time" : "compliances.recurring"}
+    >
+      <ModernWorklist />
+    </FeatureGate>
+  );
+}
+
+function EntityRoute({ user }: { user: User }) {
+  const { kind } = useParams();
+  const feature =
+    kind === "contractors"
+      ? "entities.contractors"
+      : kind === "sites"
+        ? "entities.sites"
+        : "entities.units";
+  return (
+    <FeatureGate user={user} feature={feature}>
+      <ModernEntities user={user} />
+    </FeatureGate>
+  );
 }
 
 function ImpersonationBanner({
@@ -341,10 +440,10 @@ function Layout({
           )}
         </p>
         <nav aria-label="Workspace navigation">
-          {user.platform_role === "MORAX_ADMIN" && (
+          {hasFeature(user, "platform.organizations") && (
             <WorkspaceNavLink label="Organizations" to="/app/organizations" />
           )}
-          {workspaceLinks(user).map(([label, path]) => (
+          {workspaceLinks(user).map(({ label, path }) => (
             <WorkspaceNavLink
               key={path}
               label={label}
@@ -388,29 +487,80 @@ function Layout({
         </header>
         <ImpersonationBanner user={user} endImpersonation={endImpersonation} />
         <Routes>
-          <Route path="dashboard" element={<MainDashboard />} />
-          <Route path="compliances/:kind" element={<ModernWorklist />} />
+          <Route
+            path="dashboard"
+            element={
+              <FeatureGate user={user} feature="dashboard">
+                <MainDashboard />
+              </FeatureGate>
+            }
+          />
+          <Route path="compliances/:kind" element={<ComplianceRoute user={user} />} />
           <Route
             path="compliances/detail/:id"
             element={<Detail user={user} />}
           />
           <Route
             path="entities/:kind"
-            element={<ModernEntities user={user} />}
+            element={<EntityRoute user={user} />}
           />
           <Route
             path="users"
             element={
-              <UserAccessManager user={user} onImpersonate={onImpersonate} />
+              <FeatureGate user={user} feature="users">
+                <UserAccessManager user={user} onImpersonate={onImpersonate} />
+              </FeatureGate>
             }
           />
-          <Route path="compliance-master" element={<ComplianceMasterManager />} />
-          <Route path="documents" element={<DocumentLibrary user={user} />} />
-          <Route path="notifications" element={<Notifications />} />
-          <Route path="reports" element={<Reports />} />
-          <Route path="audit" element={<Audit />} />
-          <Route path="settings" element={<Settings user={user} />} />
-          <Route path="*" element={<Navigate to="dashboard" replace />} />
+          <Route
+            path="compliance-master"
+            element={
+              <FeatureGate user={user} feature="compliance_master">
+                <ComplianceMasterManager />
+              </FeatureGate>
+            }
+          />
+          <Route
+            path="documents"
+            element={
+              <FeatureGate user={user} feature="documents">
+                <DocumentLibrary user={user} />
+              </FeatureGate>
+            }
+          />
+          <Route
+            path="notifications"
+            element={
+              <FeatureGate user={user} feature="notifications">
+                <Notifications />
+              </FeatureGate>
+            }
+          />
+          <Route
+            path="reports"
+            element={
+              <FeatureGate user={user} feature="reports">
+                <Reports />
+              </FeatureGate>
+            }
+          />
+          <Route
+            path="audit"
+            element={
+              <FeatureGate user={user} feature="audit">
+                <Audit />
+              </FeatureGate>
+            }
+          />
+          <Route
+            path="settings"
+            element={
+              <FeatureGate user={user} feature="settings">
+                <Settings user={user} />
+              </FeatureGate>
+            }
+          />
+          <Route path="*" element={<Navigate to={defaultWorkspacePath(user)} replace />} />
         </Routes>
       </main>
     </div>
@@ -772,10 +922,10 @@ function PlatformShell({
           )}
         </p>
         <nav aria-label="Workspace navigation">
-          {user.platform_role === "MORAX_ADMIN" && (
+          {hasFeature(user, "platform.organizations") && (
             <WorkspaceNavLink label="Organizations" to="/app/organizations" />
           )}
-          {workspaceLinks(user).map(([label, path]) => (
+          {workspaceLinks(user).map(({ label, path }) => (
             <WorkspaceNavLink
               key={path}
               label={label}
@@ -3906,7 +4056,7 @@ function AppRoutes() {
   const home =
     user.platform_role === "MORAX_ADMIN"
       ? "/app/organizations"
-      : "/app/dashboard";
+      : "/app/" + defaultWorkspacePath(user);
   return (
     <Routes>
       <Route

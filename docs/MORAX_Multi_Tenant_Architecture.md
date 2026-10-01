@@ -2,7 +2,7 @@
 
 ## A. Current architecture conflicts
 
-The original MVP already stored organization ownership on the important operational records, but it treated User.organization_id as a fixed single-organization context. MORAX_ADMIN was also stored as an organization role. This made the Organization table a data owner, not a true platform tenant boundary.
+The Product already stored organization ownership on the important operational records, but it treated User.organization_id as a fixed single-organization context. MORAX_ADMIN was also stored as an organization role. This made the Organization table a data owner, not a true platform tenant boundary.
 
 MORAX Platform Owner
   = MORAX_ADMIN

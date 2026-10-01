@@ -35,13 +35,17 @@ export function ComplianceStatusBadge({ status }: { status: string }) {
     ? "critical"
     : normalized.includes("approved") || normalized.includes("completed")
       ? "success"
-      : normalized.includes("review") || normalized.includes("submitted")
+      : normalized.includes("review") || normalized.includes("submitted") || normalized.includes("approval")
         ? "warning"
         : normalized.includes("correction")
           ? "critical"
           : "neutral";
 
-  return <span className={`status-badge ${tone}`}>{humanize(status)}</span>;
+  const label = normalized.includes("pending_for_approval")
+    ? "Awaiting Approval"
+    : humanize(status);
+
+  return <span className={`status-badge ${tone}`}>{label}</span>;
 }
 
 export function WorkspacePageHeader({

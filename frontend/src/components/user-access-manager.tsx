@@ -22,6 +22,7 @@ import {
   ChevronLeft,
   ChevronRight,
   KeyRound,
+  Pencil,
   Plus,
   Search,
   ShieldCheck,
@@ -79,6 +80,17 @@ function roleLabel(role: string) {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+function formatDate(value?: string | null) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  }).format(date);
+}
+
 function isOrgAdmin(user: User) {
   return (
     user.platform_role === "MORAX_ADMIN" ||
@@ -100,6 +112,7 @@ export function UserAccessManager({
   const deferredSearch = useDeferredValue(search);
   const [active, setActive] = useState("");
   const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
   const [sorting, setSorting] = useState<SortingState>([]);
   const [createOpen, setCreateOpen] = useState(false);
   const [scopeUser, setScopeUser] = useState<User | null>(null);
@@ -109,15 +122,15 @@ export function UserAccessManager({
   const filters = useMemo(
     () => ({
       page: String(page),
-      page_size: "10",
+      page_size: String(pageSize),
       q: deferredSearch.trim() || undefined,
       active: active || undefined,
       sort_by: sort?.id || "name",
       sort_dir: sort?.desc ? "desc" : "asc",
     }),
-    [active, deferredSearch, page, sort?.desc, sort?.id],
+    [active, deferredSearch, page, pageSize, sort?.desc, sort?.id],
   );
-  useEffect(() => setPage(1), [active, deferredSearch, sort?.desc, sort?.id]);
+  useEffect(() => setPage(1), [active, deferredSearch, pageSize, sort?.desc, sort?.id]);
 
   const usersQuery = useQuery({
     queryKey: ["users-page", filters],
@@ -193,6 +206,15 @@ export function UserAccessManager({
         error instanceof Error ? error.message : "Could not save role scopes.",
       ),
   });
+  const statusMutation = useMutation({
+    mutationFn: (target: User) =>
+      morax.updateUser(target.id, { active: target.active === false }),
+    onSuccess: refreshUsers,
+    onError: (error) =>
+      setNotice(
+        error instanceof Error ? error.message : "Could not update user status.",
+      ),
+  });
 
   const candidates = (scopeType: string) => {
     if (scopeType === "ORGANIZATION")
@@ -242,54 +264,128 @@ export function UserAccessManager({
     },
     [navigate, onImpersonate],
   );
+  const scopeNameByKey = useMemo(() => {
+    const map = new Map<string, string>();
+    map.set(`ORGANIZATION:${user.organization_id}`, "Entire organization");
+    const add = (type: string, items: Record<string, unknown>[] = []) => {
+      items.forEach((item) => map.set(`${type}:${String(item.id)}`, String(item.name ?? "Unnamed scope")));
+    };
+    add("UNIT", scopeOptions.data?.units);
+    add("CONTRACTOR", scopeOptions.data?.contractors);
+    add("CONTRACTOR_SITE", scopeOptions.data?.sites);
+    return map;
+  }, [scopeOptions.data, user.organization_id]);
+  const scopeLabel = useCallback(
+    (scope: User["scopes"][number]) =>
+      scopeNameByKey.get(`${scope.scope_type}:${scope.scope_id}`) ?? roleLabel(scope.scope_type),
+    [scopeNameByKey],
+  );
 
   const columns = useMemo<ColumnDef<typeof userTableFeatures, User, unknown>[]>(
     () => [
       {
-        accessorKey: "name",
-        header: "User",
+        id: "short_id",
+        header: "ID",
+        enableSorting: false,
         cell: ({ row }) => (
-          <div className="entity-name-cell">
+          <span className="user-id-cell">
+            {(page - 1) * pageSize + row.index + 1}
+          </span>
+        ),
+      },
+      {
+        accessorKey: "name",
+        header: "Name",
+        cell: ({ row }) => (
+          <div className="user-name-cell">
             <b>{row.original.name}</b>
-            <span>{row.original.email}</span>
           </div>
         ),
       },
       {
-        id: "roles",
-        header: "Roles",
+        accessorKey: "email",
+        header: "Email",
+        cell: ({ row }) => <span className="user-email-cell">{row.original.email}</span>,
+      },
+      {
+        accessorKey: "mobile",
+        header: "Mobile",
         enableSorting: false,
-        cell: ({ row }) => (
-          <span className="user-roles">
-            {row.original.roles.length
-              ? row.original.roles.map(roleLabel).join(", ")
-              : "No access assigned"}
-          </span>
-        ),
+        cell: ({ row }) => row.original.mobile || "-",
+      },
+      {
+        id: "roles",
+        header: "Role",
+        enableSorting: false,
+        cell: ({ row }) => {
+          const roles = row.original.roles.length ? row.original.roles : row.original.scopes.map((scope) => scope.role);
+          return roles.length ? (
+            <div className="user-chip-list">
+              {roles.slice(0, 2).map((role) => (
+                <span className={`user-role-chip ${role.toLowerCase()}`} key={role}>{roleLabel(role)}</span>
+              ))}
+              {roles.length > 2 && <span className="user-more-chip">+{roles.length - 2} more</span>}
+            </div>
+          ) : (
+            <span className="muted">No role</span>
+          );
+        },
+      },
+      {
+        id: "entities",
+        header: "Entities",
+        enableSorting: false,
+        cell: ({ row }) => {
+          const scopes = row.original.scopes;
+          if (!scopes.length) return <span className="muted">No entities</span>;
+          return (
+            <div className="user-chip-list entity-scope-list">
+              {scopes.slice(0, 2).map((scope, index) => (
+                <span className="user-entity-chip" title={`${roleLabel(scope.role)} - ${scopeLabel(scope)}`} key={`${scope.scope_type}-${scope.scope_id}-${index}`}>
+                  {scopeLabel(scope)}
+                </span>
+              ))}
+              {scopes.length > 2 && <span className="user-more-chip">+{scopes.length - 2} more</span>}
+            </div>
+          );
+        },
       },
       {
         accessorKey: "active",
         header: "Status",
         cell: ({ row }) => (
-          <span
-            className={`badge ${row.original.active === false ? "inactive" : "active"}`}
+          <button
+            type="button"
+            className={`status-toggle ${row.original.active === false ? "" : "on"}`}
+            aria-label={`${row.original.active === false ? "Activate" : "Deactivate"} ${row.original.name}`}
+            title={row.original.active === false ? "Inactive" : "Active"}
+            disabled={statusMutation.isPending || row.original.id === user.id}
+            onClick={() => statusMutation.mutate(row.original)}
           >
-            {row.original.active === false ? "Inactive" : "Active"}
-          </span>
+            <span />
+          </button>
         ),
       },
       {
+        accessorKey: "created_at",
+        header: "Created",
+        enableSorting: false,
+        cell: ({ row }) => formatDate(row.original.created_at),
+      },
+      {
         id: "actions",
-        header: "",
+        header: "Actions",
         enableSorting: false,
         cell: ({ row }) => (
           <div className="user-table-actions">
             <button
               type="button"
-              className="secondary compact-action"
+              className="icon-action"
+              title="Edit roles and scopes"
+              aria-label={`Edit roles and scopes for ${row.original.name}`}
               onClick={() => startScopes(row.original)}
             >
-              <ShieldCheck size={15} /> Roles & scopes
+              <Pencil size={16} />
             </button>
             <button
               type="button"
@@ -309,7 +405,7 @@ export function UserAccessManager({
         ),
       },
     ],
-    [loginAs, startScopes, user.id],
+    [loginAs, page, pageSize, scopeLabel, startScopes, statusMutation, user.id],
   );
   const table = useTable({
     features: userTableFeatures,
@@ -320,8 +416,8 @@ export function UserAccessManager({
     manualSorting: true,
   });
   const total = usersQuery.data?.total ?? 0;
-  const pageSize = usersQuery.data?.page_size ?? 10;
-  const lastPage = Math.max(1, Math.ceil(total / pageSize));
+  const currentPageSize = usersQuery.data?.page_size ?? pageSize;
+  const lastPage = Math.max(1, Math.ceil(total / currentPageSize));
 
   if (!canManage) {
     return (
@@ -360,9 +456,21 @@ export function UserAccessManager({
         </p>
       )}
 
-      <section className="panel entity-list-panel">
-        <div className="crud-toolbar">
-          <label className="table-search">
+      <section className="panel entity-list-panel user-access-table-panel">
+        <div className="user-table-heading">
+          <h2><UserRoundCog size={18} /> Company Users</h2>
+          <span>{total} Users</span>
+        </div>
+        <div className="user-table-controls">
+          <label className="show-entries-control">
+            Show
+            <select value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}>
+              {[10, 25, 50].map((value) => <option value={value} key={value}>{value}</option>)}
+            </select>
+            entries
+          </label>
+          <label className="table-search user-search-control">
+            <span>Search:</span>
             <Search size={17} aria-hidden="true" />
             <input
               aria-label="Search users"
@@ -371,7 +479,7 @@ export function UserAccessManager({
               placeholder="Search name or email…"
             />
           </label>
-          <label className="compact-filter">
+          <label className="compact-filter user-status-filter">
             <span>Status</span>
             <select
               value={active}

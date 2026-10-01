@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.security import decode_access_token
 from app.db.session import get_db
-from app.models import AuthSession, ContractorSite, Unit, User, UserRoleScope
+from app.models import AuthSession, Contractor, ContractorSite, Unit, User, UserRoleScope
 
 bearer = HTTPBearer(auto_error=False)
 PLATFORM_ADMIN_ROLE = "MORAX_ADMIN"
@@ -15,6 +15,144 @@ ADMIN_ROLES = {"ORGANIZATION_ADMIN"}
 MANAGER_ROLES = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "CONTRACTOR_ADMIN"}
 MAKER_ROLES = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "CONTRACTOR_ADMIN", "UNIT_MAKER", "CONTRACTOR_MAKER"}
 CHECKER_ROLES = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "CONTRACTOR_ADMIN", "UNIT_CHECKER", "CONTRACTOR_CHECKER"}
+
+ROLE_PERMISSIONS = {
+    "MORAX_ADMIN": {
+        "platform.organizations",
+        "dashboard.read",
+        "compliance.read",
+        "compliance.manage",
+        "documents.read",
+        "documents.manage",
+        "reports.read",
+        "audit.read",
+        "entities.read",
+        "entities.manage",
+        "users.manage",
+        "compliance_master.manage",
+        "settings.read",
+        "settings.manage",
+    },
+    "ORGANIZATION_ADMIN": {
+        "dashboard.read",
+        "compliance.read",
+        "compliance.manage",
+        "documents.read",
+        "documents.manage",
+        "reports.read",
+        "audit.read",
+        "entities.read",
+        "entities.manage",
+        "users.manage",
+        "compliance_master.manage",
+        "settings.read",
+        "settings.manage",
+    },
+    "UNIT_ADMIN": {
+        "dashboard.read",
+        "compliance.read",
+        "compliance.manage",
+        "documents.read",
+        "documents.manage",
+        "reports.read",
+        "entities.read",
+        "settings.read",
+    },
+    "CONTRACTOR_ADMIN": {
+        "dashboard.read",
+        "compliance.read",
+        "compliance.manage",
+        "documents.read",
+        "documents.manage",
+        "reports.read",
+        "entities.read",
+        "settings.read",
+    },
+    "UNIT_MAKER": {
+        "dashboard.read",
+        "compliance.read",
+        "compliance.make",
+        "documents.read",
+        "documents.upload",
+        "settings.read",
+    },
+    "CONTRACTOR_MAKER": {
+        "dashboard.read",
+        "compliance.read",
+        "compliance.make",
+        "documents.read",
+        "documents.upload",
+        "settings.read",
+    },
+    "UNIT_CHECKER": {
+        "dashboard.read",
+        "compliance.read",
+        "compliance.check",
+        "documents.read",
+        "documents.verify",
+        "settings.read",
+    },
+    "CONTRACTOR_CHECKER": {
+        "dashboard.read",
+        "compliance.read",
+        "compliance.check",
+        "documents.read",
+        "documents.verify",
+        "settings.read",
+    },
+    "VIEWER": {
+        "dashboard.read",
+        "compliance.read",
+        "documents.read",
+        "settings.read",
+    },
+    "AUDITOR": {
+        "dashboard.read",
+        "compliance.read",
+        "documents.read",
+        "reports.read",
+        "audit.read",
+        "settings.read",
+    },
+}
+
+FEATURE_PERMISSIONS = {
+    "platform.organizations": "platform.organizations",
+    "dashboard": "dashboard.read",
+    "compliances.recurring": "compliance.read",
+    "compliances.one_time": "compliance.read",
+    "entities.units": "entities.read",
+    "entities.contractors": "entities.read",
+    "entities.sites": "entities.read",
+    "users": "users.manage",
+    "compliance_master": "compliance_master.manage",
+    "documents": "documents.read",
+    "notifications": "settings.read",
+    "reports": "reports.read",
+    "audit": "audit.read",
+    "settings": "settings.read",
+}
+
+BASE_FEATURES = {
+    "dashboard",
+    "compliances.recurring",
+    "compliances.one_time",
+    "documents",
+    "notifications",
+    "settings",
+}
+ADMIN_FEATURES = BASE_FEATURES | {
+    "entities.units",
+    "entities.contractors",
+    "entities.sites",
+    "users",
+    "compliance_master",
+    "reports",
+    "audit",
+}
+MANAGER_FEATURES = BASE_FEATURES | {"reports"}
+AUDITOR_FEATURES = BASE_FEATURES | {"reports", "audit"}
+PLATFORM_FEATURES = ADMIN_FEATURES | {"platform.organizations"}
 
 
 def unauthorized(detail: str = "Authentication required") -> HTTPException:
@@ -55,6 +193,30 @@ def roles_for(db: Session, user_id: str) -> set[str]:
     return {scope.role for scope in scopes_for(db, user_id)}
 
 
+def permissions_for(user: User, scopes: list[UserRoleScope]) -> set[str]:
+    permissions: set[str] = set()
+    if user.platform_role == PLATFORM_ADMIN_ROLE:
+        permissions.update(ROLE_PERMISSIONS["MORAX_ADMIN"])
+    for scope in scopes:
+        permissions.update(ROLE_PERMISSIONS.get(scope.role, set()))
+    return permissions
+
+
+def features_for(user: User, scopes: list[UserRoleScope]) -> list[str]:
+    """Return product areas visible for the user's trusted organization context."""
+    permissions = permissions_for(user, scopes)
+    features = {
+        feature
+        for feature, permission in FEATURE_PERMISSIONS.items()
+        if permission in permissions
+    }
+    return sorted(features)
+
+
+def has_permission(db: Session, user: User, permission: str) -> bool:
+    return permission in permissions_for(user, scopes_for(db, user.id))
+
+
 def is_org_admin(db: Session, user: User, organization_id: str) -> bool:
     if user.platform_role == PLATFORM_ADMIN_ROLE:
         return True
@@ -65,19 +227,25 @@ def can_access_subject(db: Session, user: User, organization_id: str, subject_ty
     if is_org_admin(db, user, organization_id):
         return True
     scopes = scopes_for(db, user.id)
-    # An organization-scoped role is intentionally broader than an entity
-    # assignment, but must still name the active organization. This supports
-    # read-only organization viewers without exposing another tenant.
     if any(
-        scope.scope_type == "ORGANIZATION" and scope.scope_id == organization_id
+        scope.scope_type == "ORGANIZATION"
+        and scope.scope_id == organization_id
+        and scope.role in {"VIEWER", "AUDITOR"}
         for scope in scopes
     ):
         return True
     if any(scope.scope_type == subject_type and scope.scope_id == subject_id for scope in scopes):
         return True
+    if subject_type == "CONTRACTOR":
+        contractor = db.get(Contractor, subject_id)
+        if contractor and contractor.organization_id == organization_id:
+            return any(
+                scope.scope_type == "UNIT" and scope.scope_id == contractor.unit_id
+                for scope in scopes
+            )
     if subject_type == "CONTRACTOR_SITE":
         site = db.get(ContractorSite, subject_id)
-        if site:
+        if site and site.organization_id == organization_id:
             return any(
                 (scope.scope_type == "CONTRACTOR" and scope.scope_id == site.contractor_id)
                 or (scope.scope_type == "UNIT" and scope.scope_id == site.unit_id)
@@ -110,11 +278,24 @@ def accessible_subject_ids(db: Session, user: User, organization_id: str, subjec
         return None
     scopes = scopes_for(db, user.id)
     if any(
-        scope.scope_type == "ORGANIZATION" and scope.scope_id == organization_id
+        scope.scope_type == "ORGANIZATION"
+        and scope.scope_id == organization_id
+        and scope.role in {"VIEWER", "AUDITOR"}
         for scope in scopes
     ):
         return None
     ids = {scope.scope_id for scope in scopes if scope.scope_type == subject_type}
+    if subject_type == "CONTRACTOR":
+        unit_ids = {scope.scope_id for scope in scopes if scope.scope_type == "UNIT"}
+        if unit_ids:
+            ids.update(
+                db.scalars(
+                    select(Contractor.id).where(
+                        Contractor.organization_id == organization_id,
+                        Contractor.unit_id.in_(unit_ids),
+                    )
+                )
+            )
     if subject_type == "CONTRACTOR_SITE":
         contractor_ids = {scope.scope_id for scope in scopes if scope.scope_type == "CONTRACTOR"}
         unit_ids = {scope.scope_id for scope in scopes if scope.scope_type == "UNIT"}
@@ -141,9 +322,14 @@ def user_summary(db: Session, user: User) -> dict:
         "organization_id": getattr(user, "_morax_active_organization_id", user.organization_id),
         "home_organization_id": user.organization_id,
         "platform_role": user.platform_role,
+        "mobile": user.mobile,
+        "active": user.active,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
         "must_change_password": user.must_change_password,
         "roles": sorted({scope.role for scope in scopes}),
         "scopes": [{"role": scope.role, "scope_type": scope.scope_type, "scope_id": scope.scope_id} for scope in scopes],
+        "features": features_for(user, scopes),
+        "permissions": sorted(permissions_for(user, scopes)),
         "impersonation": {
             "active": bool(impersonator_id),
             "impersonator_id": impersonator_id,

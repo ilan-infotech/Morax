@@ -79,4 +79,16 @@ def instance_dict(db: Session, instance: ComplianceInstance, detail: bool = Fals
         result["evidence"] = [model_dict(item, [field.name for field in item.__table__.columns]) for item in evidence]
         result["rule_snapshot"] = json.loads(instance.rule_snapshot_json)
         result["applicability"] = json.loads(instance.applicability_snapshot_json)
+        if version:
+            result.update({
+                "description": version.description,
+                "section": version.section,
+                "legal_description": version.legal_description,
+                "consequence_or_penalty": version.consequence_or_penalty,
+                "version": version.version,
+                "due_date_rule": version.due_date_rule,
+                "due_date_offset": version.due_date_offset,
+                "due_date_anchor": version.due_date_anchor,
+                "grace_days": version.grace_days,
+            })
     return result
