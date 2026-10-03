@@ -67,6 +67,8 @@ function healthTone(rate: number, overdue: number) {
   return "attention";
 }
 
+import { motion } from "framer-motion";
+
 function HealthRankings({
   rows,
   kind,
@@ -91,21 +93,37 @@ function HealthRankings({
     );
   }
   return (
-    <div className="health-ranking">
+    <motion.div 
+      className="health-ranking"
+      initial="hidden"
+      animate="visible"
+      variants={{
+        hidden: { opacity: 0 },
+        visible: { opacity: 1, transition: { staggerChildren: 0.08 } }
+      }}
+    >
       {rows.slice(0, 8).map((row, index) => {
         const tone = healthTone(row.rate, row.overdue);
         return (
-          <div className="health-row" key={row.id}>
-            <span className="health-rank">{index + 1}</span>
-            <div className="health-name">
-              <b>{row.name}</b>
-              <small>
+          <motion.div 
+            className="health-row flex flex-wrap sm:flex-nowrap items-center min-w-0 gap-2 sm:gap-4 w-full" 
+            key={row.id}
+            variants={{
+              hidden: { opacity: 0, y: 15 },
+              visible: { opacity: 1, y: 0, transition: { duration: 0.4 } }
+            }}
+            whileHover={{ scale: 1.01 }}
+          >
+            <span className="health-rank shrink-0">{index + 1}</span>
+            <div className="health-name min-w-0 flex-1 truncate">
+              <b className="block truncate">{row.name}</b>
+              <small className="block truncate text-ellipsis">
                 {row.entity_type ? humanize(row.entity_type) : "Contractor"} ·{" "}
                 {row.completed}/{row.total} completed
               </small>
             </div>
             <div
-              className="health-progress"
+              className="health-progress hidden sm:block shrink-0 w-24 md:w-32"
               aria-label={row.rate + "% compliant"}
             >
               <span
@@ -113,18 +131,18 @@ function HealthRankings({
                 style={{ width: row.rate + "%" }}
               />
             </div>
-            <b className={"health-rate " + tone}>{row.rate}%</b>
+            <b className={`health-rate shrink-0 ${tone}`}>{row.rate}%</b>
             <span
-              className={
+              className={`shrink-0 ml-auto sm:ml-0 whitespace-nowrap ${
                 row.overdue ? "health-overdue has-overdue" : "health-overdue"
-              }
+              }`}
             >
               {row.overdue} overdue
             </span>
-          </div>
+          </motion.div>
         );
       })}
-    </div>
+    </motion.div>
   );
 }
 

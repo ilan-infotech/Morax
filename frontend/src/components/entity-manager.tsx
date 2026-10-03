@@ -5,6 +5,7 @@ import {
   useMemo,
   useState,
 } from "react";
+import { motion } from "framer-motion";
 import type { ReactNode } from "react";
 import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -535,17 +536,31 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                   </tr>
                 ))}
               </thead>
-              <tbody>
+              <motion.tbody
+                initial="hidden"
+                animate="visible"
+                variants={{
+                  hidden: { opacity: 0 },
+                  visible: { opacity: 1, transition: { staggerChildren: 0.05 } }
+                }}
+              >
                 {table.getRowModel().rows.map((row) => (
-                  <tr key={row.id}>
+                  <motion.tr 
+                    key={row.id}
+                    variants={{
+                      hidden: { opacity: 0, y: 10 },
+                      visible: { opacity: 1, y: 0, transition: { duration: 0.3 } }
+                    }}
+                    whileHover={{ backgroundColor: "rgba(0,0,0,0.01)" }}
+                  >
                     {row.getAllCells().map((cell) => (
                       <td key={cell.id}>
                         <table.FlexRender cell={cell} />
                       </td>
                     ))}
-                  </tr>
+                  </motion.tr>
                 ))}
-              </tbody>
+              </motion.tbody>
             </table>
           </div>
         )}
