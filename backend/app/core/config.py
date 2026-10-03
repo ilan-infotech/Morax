@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     access_token_minutes: int = 480
     # Support both common local Vite origins. Production must replace this
     # with the exact deployed frontend origin(s).
-    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    cors_origins: str = "https://ilaninfotech.com,https://splendid-zuccutto-4223c1.netlify.app,http://localhost:3000,http://localhost:5173"
     cors_origin_regex: str | None = r"^https?://(localhost|127\.0\.0\.1):\d+$"
     upload_dir: str = "./uploads"
     max_upload_bytes: int = 10 * 1024 * 1024
