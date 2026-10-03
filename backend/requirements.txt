@@ -9,3 +9,5 @@ openpyxl
 python-jose[cryptography]
 passlib
 email-validator
+libsql-client
+sqlalchemy-libsql
