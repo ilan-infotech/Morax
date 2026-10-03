@@ -1,5 +1,6 @@
 import { useDeferredValue, useEffect, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
+import { motion } from "framer-motion";
 import {
   BrowserRouter,
   Link,
@@ -239,10 +240,30 @@ function WorkspaceNavLink({ label, to }: { label: string; to: string }) {
   return (
     <NavLink
       to={to}
-      className={({ isActive }) => (isActive ? "active" : undefined)}
+      className={({ isActive }) => `relative flex items-center gap-2 p-2 rounded-md transition-colors ${isActive ? "text-white" : "text-slate-300 hover:text-white hover:bg-slate-800"}`}
     >
-      <Icon size={18} strokeWidth={2} aria-hidden="true" />
-      <span>{label}</span>
+      {({ isActive }) => (
+        <>
+          {isActive && (
+            <motion.div
+              layoutId="nav-highlight"
+              className="absolute inset-y-0 left-0 w-1 bg-teal-400 rounded-r-md"
+              initial={false}
+              transition={{ type: "spring", stiffness: 300, damping: 30 }}
+            />
+          )}
+          {isActive && (
+            <motion.div
+              layoutId="nav-bg"
+              className="absolute inset-0 bg-slate-800 rounded-md -z-10"
+              initial={false}
+              transition={{ type: "spring", stiffness: 300, damping: 30 }}
+            />
+          )}
+          <Icon size={18} strokeWidth={2} aria-hidden="true" className="relative z-10" />
+          <span className="relative z-10">{label}</span>
+        </>
+      )}
     </NavLink>
   );
 }

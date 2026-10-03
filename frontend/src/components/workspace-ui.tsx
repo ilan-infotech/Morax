@@ -1,4 +1,6 @@
+import { useEffect } from "react";
 import type { ComponentType, ReactNode } from "react";
+import { motion, useMotionValue, useTransform, animate } from "framer-motion";
 import {
   AlertCircle,
   CheckCircle2,
@@ -91,21 +93,39 @@ export function DashboardMetricCard({
   tone?: "total" | "success" | "warning" | "attention" | "critical";
 }) {
   const Icon = metricIcons[tone];
+  const count = useMotionValue(0);
+  const rounded = useTransform(count, Math.round);
+
+  useEffect(() => {
+    if (typeof value === "number") {
+      const animation = animate(count, value, { duration: 1.5, ease: "easeOut" });
+      return animation.stop;
+    }
+  }, [value, count]);
+
   return (
-    <article className={`dashboard-metric ${tone}`}>
+    <motion.article 
+      className={`dashboard-metric ${tone}`}
+      initial={{ opacity: 0, y: 15 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.5 }}
+    >
       <span className="metric-icon" aria-hidden="true">
         <Icon size={20} strokeWidth={2.25} />
       </span>
       <div>
         <p>{label}</p>
-        <strong>{value}</strong>
+        <strong>
+          {typeof value === "number" ? <motion.span>{rounded}</motion.span> : value}
+        </strong>
         {helper && <small>{helper}</small>}
       </div>
-    </article>
+    </motion.article>
   );
 }
 
 export function DashboardSection({
+
   title,
   description,
   action,
