@@ -35,16 +35,22 @@ def entity_dict(db: Session, entity: Any, kind: str) -> dict[str, Any]:
     return result
 
 
-def subject_name(db: Session, instance: ComplianceInstance) -> str:
-    model = {"UNIT": Unit, "CONTRACTOR": Contractor, "CONTRACTOR_SITE": ContractorSite}[instance.subject_type]
-    subject = db.get(model, instance.subject_id)
+def subject_name(db: Session, instance: ComplianceInstance, cache: dict | None = None) -> str:
+    cache = cache or {}
+    subject = cache.get(instance.subject_type, {}).get(instance.subject_id)
+    if not subject:
+        model = {"UNIT": Unit, "CONTRACTOR": Contractor, "CONTRACTOR_SITE": ContractorSite}[instance.subject_type]
+        subject = db.get(model, instance.subject_id)
     return subject.name if subject else "Deleted subject"
 
 
-def instance_dict(db: Session, instance: ComplianceInstance, detail: bool = False) -> dict[str, Any]:
-    version = db.get(ComplianceRuleVersion, instance.rule_version_id)
-    rule = db.get(ComplianceRule, version.rule_id) if version else None
+def instance_dict(db: Session, instance: ComplianceInstance, detail: bool = False, cache: dict | None = None) -> dict[str, Any]:
+    cache = cache or {}
+    version = cache.get("versions", {}).get(instance.rule_version_id) or db.get(ComplianceRuleVersion, instance.rule_version_id)
+    rule = cache.get("rules", {}).get(version.rule_id if version else None) or (db.get(ComplianceRule, version.rule_id) if version else None)
+    
     result = model_dict(instance, [field.name for field in instance.__table__.columns])
+    
     result.update({
         "rule_id": rule.id if rule else None,
         "rule_name": version.name if version else None,
@@ -58,7 +64,7 @@ def instance_dict(db: Session, instance: ComplianceInstance, detail: bool = Fals
         "frequency": version.frequency if version else None,
         "risk_level": version.risk_level if version else None,
         "required_document": version.required_document if version else None,
-        "subject_name": subject_name(db, instance),
+        "subject_name": subject_name(db, instance, cache),
         "is_overdue": instance.status not in {"APPROVED"} and instance.due_date < date.today(),
         "days_overdue": max(0, (date.today() - instance.due_date).days) if instance.status != "APPROVED" else 0,
     })

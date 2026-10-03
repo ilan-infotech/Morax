@@ -1006,9 +1006,17 @@ def filtered_instance_rows(
     date_to: date | None = None,
     q: str | None = None,
 ) -> list[dict]:
-    """Apply a single, access-controlled filter path for compliance worklists."""
     org = org_for(user)
     require_permission(db, user, "compliance.read")
+    
+    cache = {
+        "rules": {r.id: r for r in db.scalars(select(ComplianceRule).where(ComplianceRule.organization_id == org))},
+        "versions": {v.id: v for v in db.scalars(select(ComplianceRuleVersion).join(ComplianceRule).where(ComplianceRule.organization_id == org))},
+        "UNIT": {u.id: u for u in db.scalars(select(Unit).where(Unit.organization_id == org))},
+        "CONTRACTOR": {c.id: c for c in db.scalars(select(Contractor).where(Contractor.organization_id == org))},
+        "CONTRACTOR_SITE": {s.id: s for s in db.scalars(select(ContractorSite).where(ContractorSite.organization_id == org))},
+    }
+
     instances = list(
         db.scalars(
             select(ComplianceInstance)
@@ -1016,10 +1024,13 @@ def filtered_instance_rows(
             .order_by(ComplianceInstance.due_date)
         )
     )
+    
     results = []
     for instance in instances:
         if not can_access_subject(db, user, org, instance.subject_type, instance.subject_id): continue
-        row = instance_dict(db, instance)
+        
+        row = instance_dict(db, instance, detail=False, cache=cache)
+        
         if frequency and row["frequency"] != frequency: continue
         if status and status not in {instance.status, row["display_status"]}: continue
         if risk_level and row["risk_level"] != risk_level: continue
@@ -1030,6 +1041,7 @@ def filtered_instance_rows(
         if date_to and instance.due_date > date_to: continue
         if q and q.lower() not in " ".join(str(row.get(key) or "") for key in ("compliance_id", "compliance_name", "rule_name", "act", "rule_reference", "form_number", "subject_name")).lower(): continue
         results.append(row)
+        
     return results
 
 
