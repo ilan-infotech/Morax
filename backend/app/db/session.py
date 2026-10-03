@@ -1,6 +1,7 @@
 import os
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
 
@@ -13,12 +14,14 @@ if TURSO_DB_URL and TURSO_AUTH_TOKEN:
     engine = create_engine(
         f"{db_url}?secure=true",
         connect_args={"auth_token": TURSO_AUTH_TOKEN},
+        poolclass=NullPool,
     )
 else:
     # Fallback to existing local SQLite for development
     engine = create_engine(
         "sqlite:///./morax.db", 
-        connect_args={"check_same_thread": False}
+        connect_args={"check_same_thread": False},
+        poolclass=NullPool,
     )
 
 
