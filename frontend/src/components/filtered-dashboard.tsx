@@ -48,10 +48,16 @@ const chartColors = [
   '#7A8C66'
 ];
 
-function statusColor(_status: string, index: number) {
+function statusColor(status: string, index: number) {
+  const s = status.toLowerCase();
+  if (s.includes('completed late')) return '#a7f3d0';
+  if (s.includes('completed')) return '#22c55e';
+  if (s.includes('pending') || s.includes('approval')) return '#fbbf24';
+  if (s.includes('overdue') || s.includes('late')) return '#ef4444';
+  if (s.includes('not started') || s.includes('pending')) return '#94a3b8';
+  if (s.includes('in progress')) return '#3b82f6';
   return chartColors[index % chartColors.length];
 }
-
 function healthTone(rate: number, overdue: number) {
   if (overdue > 0) return "critical";
   if (rate >= 80) return "healthy";

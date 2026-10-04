@@ -158,6 +158,15 @@ def list_page(items: list, page: int, page_size: int) -> dict:
     return {"items": items[offset:offset + page_size], "total": total, "page": page, "page_size": page_size}
 
 
+def build_instance_cache(db: Session, org: str) -> dict:
+    return {
+        "rules": {r.id: r for r in db.scalars(select(ComplianceRule).where(ComplianceRule.organization_id == org))},
+        "versions": {v.id: v for v in db.scalars(select(ComplianceRuleVersion).join(ComplianceRule).where(ComplianceRule.organization_id == org))},
+        "UNIT": {u.id: u for u in db.scalars(select(Unit).where(Unit.organization_id == org))},
+        "CONTRACTOR": {c.id: c for c in db.scalars(select(Contractor).where(Contractor.organization_id == org))},
+        "CONTRACTOR_SITE": {s.id: s for s in db.scalars(select(ContractorSite).where(ContractorSite.organization_id == org))},
+    }
+
 def entity_page(
     db: Session,
     user: User,
@@ -1009,13 +1018,7 @@ def filtered_instance_rows(
     org = org_for(user)
     require_permission(db, user, "compliance.read")
     
-    cache = {
-        "rules": {r.id: r for r in db.scalars(select(ComplianceRule).where(ComplianceRule.organization_id == org))},
-        "versions": {v.id: v for v in db.scalars(select(ComplianceRuleVersion).join(ComplianceRule).where(ComplianceRule.organization_id == org))},
-        "UNIT": {u.id: u for u in db.scalars(select(Unit).where(Unit.organization_id == org))},
-        "CONTRACTOR": {c.id: c for c in db.scalars(select(Contractor).where(Contractor.organization_id == org))},
-        "CONTRACTOR_SITE": {s.id: s for s in db.scalars(select(ContractorSite).where(ContractorSite.organization_id == org))},
-    }
+    cache = build_instance_cache(db, org)
 
     instances = list(
         db.scalars(
@@ -1309,6 +1312,7 @@ def add_comment(instance_id: str, payload: CommentInput, user: User = Depends(cu
 def list_documents(q: str | None = None, entity_type: str | None = None, verification_state: str | None = None, paginated: bool = False, page: int = 1, page_size: int = 50, sort_by: str = "created_at", sort_dir: str = "desc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
     require_permission(db, user, "documents.read")
+    cache = build_instance_cache(db, org)
     documents = []
     for evidence, instance in db.query(ComplianceEvidence, ComplianceInstance).join(ComplianceInstance, ComplianceInstance.id == ComplianceEvidence.instance_id).filter(ComplianceInstance.organization_id == org).order_by(ComplianceEvidence.created_at.desc()):
         if entity_type and instance.subject_type != entity_type:
@@ -1320,7 +1324,7 @@ def list_documents(q: str | None = None, entity_type: str | None = None, verific
         if q and q.lower() not in evidence.original_filename.lower():
             continue
         row = model_dict(evidence, [field.name for field in evidence.__table__.columns])
-        detail = instance_dict(db, instance)
+        detail = instance_dict(db, instance, cache=cache)
         row.update({"compliance_instance_id": instance.id, "entity_type": instance.subject_type, "entity_id": instance.subject_id, "period": instance.period_key, "subject_name": detail["subject_name"], "compliance_name": detail["compliance_name"]})
         documents.append(row)
     sort_key = {
@@ -1370,11 +1374,12 @@ def delete_document(evidence_id: str, user: User = Depends(current_user), db: Se
 def compliance_status_report(status: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
     require_permission(db, user, "reports.read")
+    cache = build_instance_cache(db, org)
     rows = []
     for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org).order_by(ComplianceInstance.due_date)):
         if not can_access_subject(db, user, org, instance.subject_type, instance.subject_id):
             continue
-        item = instance_dict(db, instance)
+        item = instance_dict(db, instance, cache=cache)
         if status and item["display_status"] != status:
             continue
         rows.append(item)
@@ -1404,10 +1409,11 @@ def entity_compliance_report(user: User = Depends(current_user), db: Session = D
 def dashboard_status(user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
     require_permission(db, user, "dashboard.read")
+    cache = build_instance_cache(db, org)
     counts: dict[str, int] = {}
     for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)):
         if can_access_subject(db, user, org, instance.subject_type, instance.subject_id):
-            label = instance_dict(db, instance)["display_status"]
+            label = instance_dict(db, instance, cache=cache)["display_status"]
             counts[label] = counts.get(label, 0) + 1
     return counts
 
@@ -1717,10 +1723,11 @@ def dashboard_overview(
 def dashboard_frequency(user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
     require_permission(db, user, "dashboard.read")
+    cache = build_instance_cache(db, org)
     counts: dict[str, int] = {}
     for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)):
         if can_access_subject(db, user, org, instance.subject_type, instance.subject_id):
-            frequency = instance_dict(db, instance)["frequency"]
+            frequency = instance_dict(db, instance, cache=cache)["frequency"]
             counts[frequency] = counts.get(frequency, 0) + 1
     return counts
 
@@ -1729,11 +1736,12 @@ def dashboard_frequency(user: User = Depends(current_user), db: Session = Depend
 def dashboard_entities(user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
     require_permission(db, user, "dashboard.read")
+    cache = build_instance_cache(db, org)
     summary: dict[str, dict[str, int]] = {}
     for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)):
         if not can_access_subject(db, user, org, instance.subject_type, instance.subject_id):
             continue
-        row = instance_dict(db, instance)
+        row = instance_dict(db, instance, cache=cache)
         entity = summary.setdefault(row["subject_name"], {"due": 0, "overdue": 0, "done": 0, "total": 0})
         entity["total"] += 1
         if row["display_status"] == "OVERDUE": entity["overdue"] += 1
