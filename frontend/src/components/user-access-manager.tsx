@@ -6,6 +6,7 @@ import {
   useState,
 } from "react";
 import type { ReactNode } from "react";
+import GradientText from "./GradientText/GradientText";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -429,8 +430,12 @@ export function UserAccessManager({
     <section className="crud-page user-access-page">
       <header className="page-header">
         <div>
-          <p className="eyebrow">ACCESS CONTROL</p>
-          <h1>Users & access</h1>
+          <p className="eyebrow" style={{ fontWeight: 'bold' }}>
+            <GradientText colors={['#2A3620', '#B6D7A8', '#2A3620']} showBorder={false}>ACCESS CONTROL</GradientText>
+          </p>
+          <h1 style={{ fontWeight: 'bold' }}>
+            <GradientText colors={['#2A3620', '#B6D7A8', '#2A3620']} showBorder={false}>Users & access</GradientText>
+          </h1>
           <p className="muted">
             Create users, save their complete role-scope list, and validate
             their actual access with an audited temporary session.

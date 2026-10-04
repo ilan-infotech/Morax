@@ -42,6 +42,9 @@ import {
   YAxis,
 } from "recharts";
 
+import { animate, useMotionValue, useTransform, motion } from "framer-motion";
+import { SpecularCard } from "./specular-card";
+
 import { morax } from "../api/morax";
 import type { Evidence, GroupedCompliance, Instance, User } from "../api/morax";
 import {
@@ -526,16 +529,35 @@ function ComplianceKpiCard({
   tone: "due" | "overdue" | "completed" | "late" | "rejected" | "approval" | "rate";
   icon: ComponentType<{ size?: number }>;
 }) {
+  const isString = typeof value === "string";
+  const numValue = isString ? parseFloat(value.replace(/[^0-9.]/g, "")) : (value as number);
+  const suffix = isString ? value.replace(/[0-9.]/g, "") : "";
+
+  const count = useMotionValue(0);
+  const rounded = useTransform(count, Math.round);
+
+  useEffect(() => {
+    if (!isNaN(numValue)) {
+      const animation = animate(count, numValue, { duration: 1.5, ease: "easeOut" });
+      return animation.stop;
+    }
+  }, [numValue, count]);
+
   return (
-    <article className={`compliance-kpi-card ${tone}`}>
-      <span className="compliance-kpi-icon" aria-hidden="true">
-        <Icon size={21} />
-      </span>
-      <div>
-        <strong>{value}</strong>
-        <span>{label}</span>
-        {helper && <small>{helper}</small>}
-      </div>
+    <article className={`compliance-kpi-card ${tone}`} style={{ padding: 0, border: "none" }}>
+      <SpecularCard style={{ display: "flex", gap: "1rem", alignItems: "center", padding: "1.1rem" }}>
+        <span className="compliance-kpi-icon" aria-hidden="true">
+          <Icon size={21} />
+        </span>
+        <div>
+          <strong>
+            {!isNaN(numValue) ? <motion.span>{rounded}</motion.span> : value}
+            {!isNaN(numValue) && suffix}
+          </strong>
+          <span className="compliance-kpi-label">{label}</span>
+          {helper && <small>{helper}</small>}
+        </div>
+      </SpecularCard>
     </article>
   );
 }
