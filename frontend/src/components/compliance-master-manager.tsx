@@ -6,6 +6,7 @@ import { z } from "zod";
 import { Eye, FileSpreadsheet, Plus, Search, X } from "lucide-react";
 import { morax } from "../api/morax";
 import { EmptyState, InlineError, LoadingSkeleton } from "./workspace-ui";
+import GradientText from "./GradientText/GradientText";
 
 type Row = Record<string, unknown>;
 const text = (row: Row, key: string) =>
@@ -268,8 +269,12 @@ export function ComplianceMasterManager() {
     <section className="crud-page compliance-master-page">
       <header className="page-header">
         <div>
-          <p className="eyebrow">RULE CONFIGURATION</p>
-          <h1>Compliance Master</h1>
+          <p className="eyebrow" style={{ fontWeight: 'bold' }}>
+            <GradientText colors={['#2A3620', '#B6D7A8', '#2A3620']} showBorder={false}>RULE CONFIGURATION</GradientText>
+          </p>
+          <h1 style={{ fontWeight: 'bold' }}>
+            <GradientText colors={['#2A3620', '#B6D7A8', '#2A3620']} showBorder={false}>Compliance Master</GradientText>
+          </h1>
           <p className="muted">
             Rule versions are immutable once created. Use a revision for a
             change; deactivate a version instead of deleting its history.

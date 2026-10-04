@@ -8,6 +8,7 @@ import { Download, Eye, FileUp, Search, X } from "lucide-react";
 import { morax } from "../api/morax";
 import type { User } from "../api/morax";
 import { EmptyState, InlineError, LoadingSkeleton } from "./workspace-ui";
+import GradientText from "./GradientText/GradientText";
 
 type Row = Record<string, unknown>;
 const uploadSchema = z.object({
@@ -116,8 +117,12 @@ export function DocumentLibrary({ user }: { user: User }) {
     <section className="crud-page document-page">
       <header className="page-header">
         <div>
-          <p className="eyebrow">EVIDENCE REPOSITORY</p>
-          <h1>Document library</h1>
+          <p className="eyebrow" style={{ fontWeight: 'bold' }}>
+            <GradientText colors={['#2A3620', '#B6D7A8', '#2A3620']} showBorder={false}>EVIDENCE REPOSITORY</GradientText>
+          </p>
+          <h1 style={{ fontWeight: 'bold' }}>
+            <GradientText colors={['#2A3620', '#B6D7A8', '#2A3620']} showBorder={false}>Document library</GradientText>
+          </h1>
           <p className="muted">
             Evidence remains linked to the compliance obligation and its
             workflow history.

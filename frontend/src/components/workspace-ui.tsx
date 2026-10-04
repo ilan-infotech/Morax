@@ -1,6 +1,8 @@
 import { useEffect } from "react";
 import type { ComponentType, ReactNode } from "react";
+import GradientText from "./GradientText/GradientText";
 import { motion, useMotionValue, useTransform, animate } from "framer-motion";
+import { SpecularCard } from "./specular-card";
 import {
   AlertCircle,
   CheckCircle2,
@@ -25,10 +27,10 @@ export function formatDate(value?: string) {
   return Number.isNaN(date.getTime())
     ? value
     : new Intl.DateTimeFormat("en-IN", {
-        day: "2-digit",
-        month: "short",
-        year: "numeric",
-      }).format(date);
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    }).format(date);
 }
 
 export function ComplianceStatusBadge({ status }: { status: string }) {
@@ -64,8 +66,12 @@ export function WorkspacePageHeader({
   return (
     <header className="workspace-page-header">
       <div>
-        <p className="eyebrow">{eyebrow}</p>
-        <h1>{title}</h1>
+        <p className="eyebrow" style={{ fontWeight: 'bold' }}>
+          <GradientText colors={['#2A3620', '#B6D7A8', '#2A3620']} showBorder={false}>{eyebrow}</GradientText>
+        </p>
+        <h1 style={{ fontWeight: 'bold' }}>
+          <GradientText colors={['#2A3620', '#B6D7A8', '#2A3620']} showBorder={false}>{title}</GradientText>
+        </h1>
         {description && <p className="page-description">{description}</p>}
       </div>
       {actions && <div className="page-actions">{actions}</div>}
@@ -104,22 +110,25 @@ export function DashboardMetricCard({
   }, [value, count]);
 
   return (
-    <motion.article 
+    <motion.article
       className={`dashboard-metric ${tone}`}
       initial={{ opacity: 0, y: 15 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.5 }}
+      style={{ padding: 0, border: "none" }}
     >
-      <span className="metric-icon" aria-hidden="true">
-        <Icon size={20} strokeWidth={2.25} />
-      </span>
-      <div>
-        <p>{label}</p>
-        <strong>
-          {typeof value === "number" ? <motion.span>{rounded}</motion.span> : value}
-        </strong>
-        {helper && <small>{helper}</small>}
-      </div>
+      <SpecularCard style={{ padding: "1.05rem" }}>
+        <span className="metric-icon" aria-hidden="true">
+          <Icon size={20} strokeWidth={2.25} />
+        </span>
+        <div>
+          <p>{label}</p>
+          <strong>
+            {typeof value === "number" ? <motion.span>{rounded}</motion.span> : value}
+          </strong>
+          {helper && <small>{helper}</small>}
+        </div>
+      </SpecularCard>
     </motion.article>
   );
 }

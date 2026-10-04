@@ -1,6 +1,22 @@
-import { useDeferredValue, useEffect, useState } from "react";
+import { useDeferredValue, useEffect, useState, useRef } from "react";
+import ElasticMesh from "./components/ElasticMesh/ElasticMesh";
+import { SpecularCard } from "./components/specular-card";
+import {
+  PieChart,
+  Pie,
+  Cell,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+} from "recharts";
+import MoltenMetal from "./components/MoltenMetal/MoltenMetal";
+import GradientText from "./components/GradientText/GradientText";
+import Shuffle from "./components/Shuffle/Shuffle";
 import type { FormEvent, ReactNode } from "react";
-import { motion } from "framer-motion";
+import { motion, AnimatePresence } from "framer-motion";
 import {
   BrowserRouter,
   Link,
@@ -9,6 +25,7 @@ import {
   Route,
   Routes,
   useNavigate,
+  useLocation,
   useParams,
 } from "react-router-dom";
 import {
@@ -26,6 +43,11 @@ import {
   Settings as SettingsIcon,
   ShieldCheck,
   Users as UsersIcon,
+  Download,
+  ChevronDown,
+  LogOut,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { setToken } from "./api/client";
@@ -63,8 +85,12 @@ const Header = ({
 }) => (
   <header className="page-header">
     <div>
-      <p className="eyebrow">MORAX WORKSPACE</p>
-      <h1>{title}</h1>
+      <p className="eyebrow" style={{ fontWeight: 'bold' }}>
+        <GradientText colors={['#2A3620', '#B6D7A8', '#2A3620']} showBorder={false}>MORAX WORKSPACE</GradientText>
+      </p>
+      <h1 style={{ fontWeight: 'bold' }}>
+        <GradientText colors={['#2A3620', '#B6D7A8', '#2A3620']} showBorder={false}>{title}</GradientText>
+      </h1>
     </div>
     {children}
   </header>
@@ -110,6 +136,160 @@ const payload = (form: Record<string, string>, numbers: string[] = []) =>
     ]),
   );
 
+export function UserProfileDropdown({ user, logout, organizationName }: { user: User; logout: () => void; organizationName?: string }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsOpen(false);
+        buttonRef.current?.focus();
+      }
+    };
+    const handleClickOutside = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node) && buttonRef.current && !buttonRef.current.contains(e.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('keydown', handleEscape);
+    document.addEventListener('mousedown', handleClickOutside);
+    menuRef.current?.focus();
+    return () => {
+      document.removeEventListener('keydown', handleEscape);
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [isOpen]);
+
+  return (
+    <div style={{ position: "relative" }}>
+      <button
+        ref={buttonRef}
+        className="topbar-user"
+        aria-expanded={isOpen}
+        aria-haspopup="menu"
+        style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 0, outline: 'none', display: 'flex', alignItems: 'center', gap: '0.65rem' }}
+        onClick={(e) => {
+          e.preventDefault();
+          setIsOpen(!isOpen);
+        }}
+      >
+        <span className="avatar">
+          {user.name.slice(0, 1).toUpperCase()}
+        </span>
+        <span style={{ textAlign: 'left', display: 'flex', flexDirection: 'column' }}>
+          <b>{user.name}</b>
+          <small>
+            {user.platform_role || user.roles[0] || "Workspace user"}
+          </small>
+        </span>
+        <ChevronDown size={16} style={{ transition: 'transform 0.2s', transform: isOpen ? 'rotate(180deg)' : 'rotate(0deg)' }} />
+      </button>
+
+      <AnimatePresence>
+        {isOpen && (
+          <motion.div
+            ref={menuRef}
+            tabIndex={-1}
+            role="menu"
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            transition={{ duration: 0.15 }}
+            style={{
+              position: "absolute",
+              top: "100%",
+              right: 0,
+              marginTop: "0.5rem",
+              background: "#fff",
+              border: "1px solid #e5e7eb",
+              borderRadius: "16px",
+              boxShadow: "0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)",
+              padding: "24px",
+              zIndex: 50,
+              width: "320px",
+              maxWidth: "calc(100vw - 2rem)",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: "16px",
+              outline: "none"
+            }}
+          >
+            <div style={{
+              width: "64px",
+              height: "64px",
+              borderRadius: "50%",
+              background: "#2A3620",
+              color: "#fff",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: "1.75rem",
+              fontWeight: "bold"
+            }}>
+              {user.name.slice(0, 1).toUpperCase()}
+            </div>
+
+            <div style={{ textAlign: "center", display: "flex", flexDirection: "column", gap: "4px", width: "100%" }}>
+              <strong style={{ fontSize: "1.1rem", color: "#111827", fontFamily: "inherit" }}>{user.name}</strong>
+              <span style={{ fontSize: "0.85rem", color: "#6b7280", fontFamily: "inherit" }}>{user.platform_role || user.roles[0] || "Workspace user"}</span>
+            </div>
+
+            <p style={{ textAlign: "center", fontSize: "0.85rem", color: "#6b7280", margin: 0, lineHeight: 1.4, fontFamily: "inherit" }}>
+              Signed in to MORAX Workspace. Manage your account and session from here.
+            </p>
+
+            {organizationName && (
+              <div style={{
+                width: "100%",
+                background: "#f3f4f6",
+                borderRadius: "8px",
+                padding: "12px 16px",
+                display: "flex",
+                flexDirection: "column",
+                gap: "4px"
+              }}>
+                <span style={{ fontSize: "0.75rem", color: "#6b7280", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", fontFamily: "inherit" }}>Organization</span>
+                <span style={{ fontSize: "0.9rem", color: "#111827", fontWeight: 500, fontFamily: "inherit" }}>{organizationName}</span>
+              </div>
+            )}
+
+            <button
+              onClick={() => {
+                setIsOpen(false);
+                logout();
+              }}
+              style={{
+                width: "100%",
+                background: "#ef4444",
+                color: "white",
+                border: "none",
+                padding: "12px",
+                borderRadius: "8px",
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: "8px",
+                fontSize: "1rem",
+                fontWeight: 500,
+                marginTop: "4px",
+                fontFamily: "inherit"
+              }}
+            >
+              <LogOut size={18} />
+              Log Out
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
 function Login({ done }: { done: (user: User) => void }) {
   const [email, setEmail] = useState("admin@morax.example.com");
   const [password, setPassword] = useState("Admin@123");
@@ -125,13 +305,25 @@ function Login({ done }: { done: (user: User) => void }) {
     }
   }
   return (
-    <main className="login-shell">
+    <main className="login-shell" style={{ position: "relative", overflow: "hidden", background: "transparent" }}>
+      <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", zIndex: -1, backgroundColor: "#1c2617" }}>
+        <MoltenMetal
+          color1="#2b3622"
+          color2="#4b5a3f"
+          color3="#b3bfa0"
+        />
+      </div>
       <div className="login-intro">
-        <p className="eyebrow">MORAX · LABOUR COMPLIANCE</p>
-        <h1>Every obligation. One auditable flow.</h1>
-        <p>
-          Configure entities, govern the Compliance Master, prepare evidence,
-          assign accountability, and complete review with confidence.
+        <div className="eyebrow" style={{ margin: 0, padding: 0 }}>
+          <GradientText colors={['#FFFFFF', '#D9EAD3', '#B6D7A8']}>
+            MORAX · LABOUR COMPLIANCE
+          </GradientText>
+        </div>
+        <Shuffle tag="h1" text="Every obligation. One auditable flow." textAlign="left" />
+        <p style={{ marginTop: '1.25rem', lineHeight: 1.6, fontSize: '1.05rem', fontWeight: 800, maxWidth: '600px' }}>
+          <GradientText colors={['#FFFFFF', '#D9EAD3', '#B6D7A8']}>
+            Configure entities, govern the Compliance Master, prepare evidence, assign accountability, and complete review with confidence.
+          </GradientText>
         </p>
       </div>
       <form className="login-card" onSubmit={submit}>
@@ -235,19 +427,20 @@ const navIcons: Record<string, LucideIcon> = {
   Organizations: Building2,
 };
 
-function WorkspaceNavLink({ label, to }: { label: string; to: string }) {
+function WorkspaceNavLink({ label, to, collapsed }: { label: string; to: string; collapsed?: boolean }) {
   const Icon = navIcons[label] ?? FileText;
   return (
     <NavLink
       to={to}
-      className={({ isActive }) => `relative flex items-center gap-2 p-2 rounded-md transition-colors ${isActive ? "text-white" : "text-slate-300 hover:text-white hover:bg-slate-800"}`}
+      className={({ isActive }) => `relative flex items-center gap-2 p-2 rounded-md transition-colors ${isActive ? "text-[#F5F5DC]" : "text-slate-300 hover:text-white hover:bg-slate-800"} ${collapsed ? "justify-center" : ""}`}
+      title={collapsed ? label : undefined}
     >
       {({ isActive }) => (
         <>
           {isActive && (
             <motion.div
               layoutId="nav-highlight"
-              className="absolute inset-y-0 left-0 w-1 bg-teal-400 rounded-r-md"
+              className="absolute inset-y-0 left-0 w-1 bg-[#F5F5DC] rounded-r-md"
               initial={false}
               transition={{ type: "spring", stiffness: 300, damping: 30 }}
             />
@@ -255,13 +448,13 @@ function WorkspaceNavLink({ label, to }: { label: string; to: string }) {
           {isActive && (
             <motion.div
               layoutId="nav-bg"
-              className="absolute inset-0 bg-slate-800 rounded-md -z-10"
+              className="absolute inset-0 bg-[#424B35] rounded-md -z-10"
               initial={false}
               transition={{ type: "spring", stiffness: 300, damping: 30 }}
             />
           )}
           <Icon size={18} strokeWidth={2} aria-hidden="true" className="relative z-10" />
-          <span className="relative z-10">{label}</span>
+          {!collapsed && <span className="relative z-10">{label}</span>}
         </>
       )}
     </NavLink>
@@ -432,159 +625,104 @@ function Layout({
         .catch(() => setOrganizationName("Organization context"));
   }, [organizationId]);
   return (
-    <div className="app-shell">
-      <aside>
-        <div className="brand">
-          <img
-            src="https://www.morainsights.com/images/logo.png"
-            alt="MORAX"
-            style={{
-              background: "#fff",
-              borderRadius: "0.35rem",
-              display: "block",
-              maxWidth: "160px",
-              padding: "0.35rem",
-            }}
-          />
+    <main className="content">
+      <header className="app-topbar">
+        <div>
+          <span className="topbar-context">
+            {organizationId
+              ? organizationName || "Organization workspace"
+              : "MORAX Workspace"}
+          </span>
         </div>
-        <p className="tenant">
-          {user.name}
-          <br />
-          <small>
-            {user.platform_role || user.roles.join(", ") || "No role"}
-          </small>
-          {organizationId && (
-            <>
-              <br />
-              <small>Organization: {organizationName || "Loading..."}</small>
-            </>
-          )}
-        </p>
-        <nav aria-label="Workspace navigation">
-          {hasFeature(user, "platform.organizations") && (
-            <WorkspaceNavLink label="Organizations" to="/app/organizations" />
-          )}
-          {workspaceLinks(user).map(({ label, path }) => (
-            <WorkspaceNavLink
-              key={path}
-              label={label}
-              to={prefix + "/" + path}
-            />
-          ))}
-        </nav>
-        <button className="logout" onClick={logout}>
-          Log out
-        </button>
-      </aside>
-      <main className="content">
-        <header className="app-topbar">
-          <div>
-            <span className="topbar-context">
-              {organizationId
-                ? organizationName || "Organization workspace"
-                : "MORAX Workspace"}
-            </span>
-          </div>
-          <div className="topbar-actions">
-            <Link
-              className="topbar-icon-link"
-              to={prefix + "/notifications"}
-              aria-label="Notifications"
-            >
-              <Bell size={18} />
-            </Link>
-            <Link className="topbar-user" to={prefix + "/settings"}>
-              <span className="avatar">
-                {user.name.slice(0, 1).toUpperCase()}
-              </span>
-              <span>
-                <b>{user.name}</b>
-                <small>
-                  {user.platform_role || user.roles[0] || "Workspace user"}
-                </small>
-              </span>
-            </Link>
-          </div>
-        </header>
-        <ImpersonationBanner user={user} endImpersonation={endImpersonation} />
-        <Routes>
-          <Route
-            path="dashboard"
-            element={
-              <FeatureGate user={user} feature="dashboard">
-                <MainDashboard />
-              </FeatureGate>
-            }
-          />
-          <Route path="compliances/:kind" element={<ComplianceRoute user={user} />} />
-          <Route
-            path="compliances/detail/:id"
-            element={<Detail user={user} />}
-          />
-          <Route
-            path="entities/:kind"
-            element={<EntityRoute user={user} />}
-          />
-          <Route
-            path="users"
-            element={
-              <FeatureGate user={user} feature="users">
-                <UserAccessManager user={user} onImpersonate={onImpersonate} />
-              </FeatureGate>
-            }
-          />
-          <Route
-            path="compliance-master"
-            element={
-              <FeatureGate user={user} feature="compliance_master">
-                <ComplianceMasterManager />
-              </FeatureGate>
-            }
-          />
-          <Route
-            path="documents"
-            element={
-              <FeatureGate user={user} feature="documents">
-                <DocumentLibrary user={user} />
-              </FeatureGate>
-            }
-          />
-          <Route
-            path="notifications"
-            element={
-              <FeatureGate user={user} feature="notifications">
-                <Notifications />
-              </FeatureGate>
-            }
-          />
-          <Route
-            path="reports"
-            element={
-              <FeatureGate user={user} feature="reports">
-                <Reports />
-              </FeatureGate>
-            }
-          />
-          <Route
-            path="audit"
-            element={
-              <FeatureGate user={user} feature="audit">
-                <Audit />
-              </FeatureGate>
-            }
-          />
-          <Route
-            path="settings"
-            element={
-              <FeatureGate user={user} feature="settings">
-                <Settings user={user} />
-              </FeatureGate>
-            }
-          />
-          <Route path="*" element={<Navigate to={defaultWorkspacePath(user)} replace />} />
-        </Routes>
-      </main>
-    </div>
+        <div className="topbar-actions" style={{ position: "relative" }}>
+          <Link
+            className="topbar-icon-link"
+            to={prefix + "/notifications"}
+            aria-label="Notifications"
+          >
+            <Bell size={18} />
+          </Link>
+          <UserProfileDropdown user={user} logout={logout} organizationName={organizationId ? (organizationName || "Organization workspace") : undefined} />
+        </div>
+      </header>
+      <ImpersonationBanner user={user} endImpersonation={endImpersonation} />
+      <Routes>
+        <Route
+          path="dashboard"
+          element={
+            <FeatureGate user={user} feature="dashboard">
+              <MainDashboard />
+            </FeatureGate>
+          }
+        />
+        <Route path="compliances/:kind" element={<ComplianceRoute user={user} />} />
+        <Route
+          path="compliances/detail/:id"
+          element={<Detail user={user} />}
+        />
+        <Route
+          path="entities/:kind"
+          element={<EntityRoute user={user} />}
+        />
+        <Route
+          path="users"
+          element={
+            <FeatureGate user={user} feature="users">
+              <UserAccessManager user={user} onImpersonate={onImpersonate} />
+            </FeatureGate>
+          }
+        />
+        <Route
+          path="compliance-master"
+          element={
+            <FeatureGate user={user} feature="compliance_master">
+              <ComplianceMasterManager />
+            </FeatureGate>
+          }
+        />
+        <Route
+          path="documents"
+          element={
+            <FeatureGate user={user} feature="documents">
+              <DocumentLibrary user={user} />
+            </FeatureGate>
+          }
+        />
+        <Route
+          path="notifications"
+          element={
+            <FeatureGate user={user} feature="notifications">
+              <Notifications />
+            </FeatureGate>
+          }
+        />
+        <Route
+          path="reports"
+          element={
+            <FeatureGate user={user} feature="reports">
+              <Reports />
+            </FeatureGate>
+          }
+        />
+        <Route
+          path="audit"
+          element={
+            <FeatureGate user={user} feature="audit">
+              <Audit />
+            </FeatureGate>
+          }
+        />
+        <Route
+          path="settings"
+          element={
+            <FeatureGate user={user} feature="settings">
+              <Settings user={user} />
+            </FeatureGate>
+          }
+        />
+        <Route path="*" element={<Navigate to={defaultWorkspacePath(user)} replace />} />
+      </Routes>
+    </main>
   );
 }
 
@@ -909,87 +1047,33 @@ function PlatformShell({
   endImpersonation: () => Promise<void>;
   children: ReactNode;
 }) {
+  const [showLogout, setShowLogout] = useState(false);
   const { organizationId } = useParams();
   const prefix = organizationId
     ? "/app/organizations/" + organizationId
     : "/app";
   return (
-    <div className="app-shell">
-      <aside>
-        <div className="brand">
-          <img
-            src="https://www.morainsights.com/images/logo.png"
-            alt="MORAX"
-            style={{
-              background: "#fff",
-              borderRadius: "0.35rem",
-              display: "block",
-              maxWidth: "160px",
-              padding: "0.35rem",
-            }}
-          />
+    <main className="content">
+      <header className="app-topbar">
+        <span className="topbar-context">
+          {organizationId
+            ? "Organization workspace"
+            : "Platform administration"}
+        </span>
+        <div className="topbar-actions" style={{ position: "relative" }}>
+          <Link
+            className="topbar-icon-link"
+            to={prefix + "/notifications"}
+            aria-label="Notifications"
+          >
+            <Bell size={18} />
+          </Link>
+          <UserProfileDropdown user={user} logout={logout} organizationName={organizationId ? "Organization workspace" : undefined} />
         </div>
-        <p className="tenant">
-          {user.name}
-          <br />
-          <small>
-            {user.platform_role || user.roles.join(", ") || "No role"}
-          </small>
-          {organizationId && (
-            <>
-              <br />
-              <small>Organization context</small>
-            </>
-          )}
-        </p>
-        <nav aria-label="Workspace navigation">
-          {hasFeature(user, "platform.organizations") && (
-            <WorkspaceNavLink label="Organizations" to="/app/organizations" />
-          )}
-          {workspaceLinks(user).map(({ label, path }) => (
-            <WorkspaceNavLink
-              key={path}
-              label={label}
-              to={prefix + "/" + path}
-            />
-          ))}
-        </nav>
-        <button className="logout" onClick={logout}>
-          Log out
-        </button>
-      </aside>
-      <main className="content">
-        <header className="app-topbar">
-          <span className="topbar-context">
-            {organizationId
-              ? "Organization workspace"
-              : "Platform administration"}
-          </span>
-          <div className="topbar-actions">
-            <Link
-              className="topbar-icon-link"
-              to={prefix + "/notifications"}
-              aria-label="Notifications"
-            >
-              <Bell size={18} />
-            </Link>
-            <Link className="topbar-user" to={prefix + "/settings"}>
-              <span className="avatar">
-                {user.name.slice(0, 1).toUpperCase()}
-              </span>
-              <span>
-                <b>{user.name}</b>
-                <small>
-                  {user.platform_role || user.roles[0] || "Workspace user"}
-                </small>
-              </span>
-            </Link>
-          </div>
-        </header>
-        <ImpersonationBanner user={user} endImpersonation={endImpersonation} />
-        {children}
-      </main>
-    </div>
+      </header>
+      <ImpersonationBanner user={user} endImpersonation={endImpersonation} />
+      {children}
+    </main>
   );
 }
 
@@ -3625,62 +3709,108 @@ function Reports() {
       <ErrorBox text={error} />
       <Panel>
         <h2>CSV exports</h2>
-        <div className="action-row">
+        <div className="action-row" style={{ gap: "1.5rem", flexWrap: "wrap" }}>
           <button
+            className="button-outline"
+            style={{ color: "#F5F5DC", backgroundColor: "#424B35", borderColor: "#424B35", display: "flex", alignItems: "center", gap: "0.5rem" }}
             onClick={() =>
               morax
                 .downloadStatusReport()
                 .catch((err) => setError(message(err)))
             }
           >
-            Compliance status
+            <Download size={16} /> Compliance status
           </button>
           <button
+            className="button-outline"
+            style={{ color: "#F5F5DC", backgroundColor: "#424B35", borderColor: "#424B35", display: "flex", alignItems: "center", gap: "0.5rem" }}
             onClick={() =>
               morax
                 .downloadOverdueReport()
                 .catch((err) => setError(message(err)))
             }
           >
-            Overdue
+            <Download size={16} /> Overdue
           </button>
           <button
+            className="button-outline"
+            style={{ color: "#F5F5DC", backgroundColor: "#424B35", borderColor: "#424B35", display: "flex", alignItems: "center", gap: "0.5rem" }}
             onClick={() =>
               morax
                 .downloadCompletionReport()
                 .catch((err) => setError(message(err)))
             }
           >
-            Completion
+            <Download size={16} /> Completion
           </button>
           <button
+            className="button-outline"
+            style={{ color: "#F5F5DC", backgroundColor: "#424B35", borderColor: "#424B35", display: "flex", alignItems: "center", gap: "0.5rem" }}
             onClick={() =>
               morax
                 .downloadEntityReport()
                 .catch((err) => setError(message(err)))
             }
           >
-            Entity compliance
+            <Download size={16} /> Entity compliance
           </button>
         </div>
       </Panel>
       <div className="detail-grid">
-        <Panel>
-          <h2>Status summary</h2>
-          {Object.entries(status).map(([key, value]) => (
-            <p key={key}>
-              {key.replaceAll("_", " ")} <b>{value}</b>
-            </p>
-          ))}
-        </Panel>
-        <Panel>
-          <h2>Frequency summary</h2>
-          {Object.entries(frequency).map(([key, value]) => (
-            <p key={key}>
-              {key} <b>{value}</b>
-            </p>
-          ))}
-        </Panel>
+        <SpecularCard tint="#ffffff" textColor="#0f172a" baseColor="#e2e8f0" lineColor="#424B35" style={{ padding: 0, borderRadius: "1rem" }}>
+          <div style={{ padding: "1.5rem", width: "100%", height: "100%" }}>
+            <h2 style={{ margin: "0 0 1rem 0" }}>Status summary</h2>
+            <div style={{ display: "flex", alignItems: "center", gap: "1rem", height: "250px", width: "100%" }}>
+              <div style={{ flex: 1, height: "100%" }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <PieChart>
+                    <Pie
+                      data={Object.entries(status).map(([k, v]) => ({ name: k.replaceAll("_", " "), value: v }))}
+                      cx="50%"
+                      cy="50%"
+                      innerRadius={60}
+                      outerRadius={80}
+                      paddingAngle={5}
+                      dataKey="value"
+                    >
+                      {Object.keys(status).map((_, index) => (
+                        <Cell key={`cell-${index}`} fill={["#424B35", "#5C6B4A", "#854D0E", "#2C5234", "#B45309", "#475569"][index % 6]} />
+                      ))}
+                    </Pie>
+                    <Tooltip formatter={(value, name) => [value, name]} />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div>
+              <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: "0.75rem", overflowY: "auto", maxHeight: "100%" }}>
+                {Object.entries(status).map(([k, v], index) => {
+                  const color = ["#424B35", "#5C6B4A", "#854D0E", "#2C5234", "#B45309", "#475569"][index % 6];
+                  return (
+                    <div key={k} style={{ display: "flex", alignItems: "center", gap: "0.5rem", fontSize: "0.85rem", color: "#0f172a" }}>
+                      <span style={{ width: "12px", height: "12px", borderRadius: "50%", backgroundColor: color, flexShrink: 0 }}></span>
+                      <strong style={{ whiteSpace: "nowrap" }}>{k.replaceAll("_", " ")}:</strong>
+                      <span>{v}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </SpecularCard>
+        <SpecularCard tint="#ffffff" textColor="#0f172a" baseColor="#e2e8f0" lineColor="#424B35" style={{ padding: 0, borderRadius: "1rem" }}>
+          <div style={{ padding: "1.5rem", width: "100%", height: "100%" }}>
+            <h2 style={{ margin: "0 0 1rem 0" }}>Frequency summary</h2>
+            <div style={{ height: "250px", width: "100%" }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={Object.entries(frequency).map(([k, v]) => ({ name: k.replaceAll("_", " "), value: v }))}>
+                  <XAxis dataKey="name" tick={{ fontSize: 12, fill: "#424B35" }} axisLine={false} tickLine={false} />
+                  <YAxis hide />
+                  <Tooltip cursor={{ fill: "#f1f5f9" }} />
+                  <Bar dataKey="value" fill="#424B35" radius={[4, 4, 0, 0]} barSize={40} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        </SpecularCard>
       </div>
       <Panel>
         <h2>Entity compliance summary</h2>
@@ -4042,10 +4172,55 @@ function OrganizationSettings({ user }: { user: User }) {
     </>
   );
 }
+function GlobalSidebar({ user, logout, collapsed, setCollapsed }: { user: User; logout: () => void; collapsed: boolean; setCollapsed: (c: boolean) => void }) {
+  const location = useLocation();
+  const match = location.pathname.match(/\/app\/organizations\/([^\/]+)/);
+  const organizationId = match && match[1] !== "settings" ? match[1] : undefined;
+  const prefix = organizationId ? "/app/organizations/" + organizationId : "/app";
+
+  return (
+    <aside className={collapsed ? "collapsed" : ""}>
+      <div className="brand" style={{ display: 'flex', alignItems: 'center', justifyContent: collapsed ? 'center' : 'space-between', width: '100%', marginBottom: collapsed ? '2rem' : '1.5rem', flexDirection: collapsed ? 'column' : 'row', gap: collapsed ? '1rem' : '0' }}>
+        {!collapsed && (
+          <div style={{ width: "140px", height: "140px", display: "block", margin: "-10px 0 0 -10px", borderRadius: "0.35rem", overflow: "hidden" }}>
+            <ElasticMesh image="/morax/Mora_Final_Logo-01_3.png" interaction="hover" stiffness={0.15} damping={0.15} showGrid={false} color1="#172A1B" color2="#172A1B" />
+          </div>
+        )}
+        {collapsed && (
+          <div style={{ width: "40px", height: "40px", display: "block", borderRadius: "0.35rem", overflow: "hidden" }}>
+            <ElasticMesh image="/morax/Mora_Final_Logo-01_3.png" interaction="hover" stiffness={0.15} damping={0.15} showGrid={false} color1="#172A1B" color2="#172A1B" />
+          </div>
+        )}
+        <button onClick={() => setCollapsed(!collapsed)} style={{ background: 'transparent', border: 'none', color: '#cbd5e1', cursor: 'pointer', padding: '6px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '6px' }} className="hover:bg-slate-800 hover:text-white transition-colors" title={collapsed ? "Expand sidebar" : "Collapse sidebar"}>
+          {collapsed ? <PanelLeftOpen size={20} /> : <PanelLeftClose size={20} />}
+        </button>
+      </div>
+
+      <nav aria-label="Workspace navigation">
+        {hasFeature(user, "platform.organizations") && (
+          <WorkspaceNavLink label="Organizations" to="/app/organizations" collapsed={collapsed} />
+        )}
+        {workspaceLinks(user).map(({ label, path }) => (
+          <WorkspaceNavLink
+            key={path}
+            label={label}
+            to={prefix + "/" + path}
+            collapsed={collapsed}
+          />
+        ))}
+      </nav>
+      <button className="logout hover:bg-slate-800 hover:text-white transition-colors rounded-md" onClick={logout} style={{ padding: collapsed ? '0.5rem' : '0.5rem 1rem', display: 'flex', justifyContent: collapsed ? 'center' : 'flex-start', alignItems: 'center', gap: '0.5rem', marginTop: 'auto', color: '#fecaca', background: 'transparent', border: 'none', cursor: 'pointer', width: '100%' }} title={collapsed ? "Log out" : undefined}>
+        <LogOut size={18} />
+        {!collapsed && <span>Log out</span>}
+      </button>
+    </aside>
+  );
+}
 
 function AppRoutes() {
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   useEffect(() => {
     morax
       .me()
@@ -4079,72 +4254,87 @@ function AppRoutes() {
       ? "/app/organizations"
       : "/app/" + defaultWorkspacePath(user);
   return (
-    <Routes>
-      <Route
-        path="/app/organizations"
-        element={
-          <PlatformShell
-            user={user}
-            logout={logout}
-            endImpersonation={endImpersonation}
-          >
-            <OrganizationLanding user={user} />
-          </PlatformShell>
-        }
-      />
-      <Route
-        path="/app/organizations/:organizationId/settings"
-        element={
-          <PlatformShell
-            user={user}
-            logout={logout}
-            endImpersonation={endImpersonation}
-          >
-            <OrganizationSettings user={user} />
-          </PlatformShell>
-        }
-      />
-      <Route
-        path="/app/settings"
-        element={
-          <PlatformShell
-            user={user}
-            logout={logout}
-            endImpersonation={endImpersonation}
-          >
-            <OrganizationSettings user={user} />
-          </PlatformShell>
-        }
-      />
-      <Route
-        path="/app/organizations/:organizationId/*"
-        element={
-          <Layout
-            user={user}
-            logout={logout}
-            onImpersonate={impersonate}
-            endImpersonation={endImpersonation}
-          />
-        }
-      />
-      <Route
-        path="/app/*"
-        element={
-          <Layout
-            user={user}
-            logout={logout}
-            onImpersonate={impersonate}
-            endImpersonation={endImpersonation}
-          />
-        }
-      />
-      <Route path="*" element={<Navigate to={home} replace />} />
-    </Routes>
+    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+      <GlobalSidebar user={user} logout={logout} collapsed={sidebarCollapsed} setCollapsed={setSidebarCollapsed} />
+      <Routes>
+        <Route
+          path="/app/organizations"
+          element={
+            <PlatformShell
+              user={user}
+              logout={logout}
+              endImpersonation={endImpersonation}
+            >
+              <OrganizationLanding user={user} />
+            </PlatformShell>
+          }
+        />
+        <Route
+          path="/app/organizations/:organizationId/settings"
+          element={
+            <PlatformShell
+              user={user}
+              logout={logout}
+              endImpersonation={endImpersonation}
+            >
+              <OrganizationSettings user={user} />
+            </PlatformShell>
+          }
+        />
+        <Route
+          path="/app/settings"
+          element={
+            <PlatformShell
+              user={user}
+              logout={logout}
+              endImpersonation={endImpersonation}
+            >
+              <OrganizationSettings user={user} />
+            </PlatformShell>
+          }
+        />
+        <Route
+          path="/app/organizations/:organizationId/*"
+          element={
+            <Layout
+              user={user}
+              logout={logout}
+              onImpersonate={impersonate}
+              endImpersonation={endImpersonation}
+            />
+          }
+        />
+        <Route
+          path="/app/*"
+          element={
+            <Layout
+              user={user}
+              logout={logout}
+              onImpersonate={impersonate}
+              endImpersonation={endImpersonation}
+            />
+          }
+        />
+        <Route path="*" element={<Navigate to={home} replace />} />
+      </Routes>
+    </div>
   );
 }
+
+function ScrollToTop() {
+  const { pathname } = useLocation();
+
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, [pathname]);
+
+  return null;
+}
+
 export default function App() {
   return (
     <BrowserRouter basename="/morax">
+      <ScrollToTop />
       <AppRoutes />
     </BrowserRouter>
   )

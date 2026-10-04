@@ -39,25 +39,17 @@ type DashboardFilters = {
   period_key: string;
 };
 
-const fallbackStatusColors = [
-  "#059669",
-  "#7c3aed",
-  "#dc2626",
-  "#0f766e",
-  "#2563eb",
-  "#64748b",
+const chartColors = [
+  '#2A3620', 
+  '#A5B892', 
+  '#5C6B4A', 
+  '#D9EAD3', 
+  '#424B35', 
+  '#7A8C66'
 ];
 
-function statusColor(status: string, index: number) {
-  const value = status.toUpperCase();
-  if (value.includes("COMPLETED") || value.includes("APPROVED"))
-    return "#059669";
-  if (value.includes("OVERDUE") || value.includes("REJECTED")) return "#dc2626";
-  if (value === "DUE") return "#2563eb";
-  if (value.includes("PENDING")) return "#7c3aed";
-  if (value.includes("REVIEW") || value.includes("SUBMITTED")) return "#0f766e";
-  if (value.includes("CORRECTION")) return "#2563eb";
-  return fallbackStatusColors[index % fallbackStatusColors.length];
+function statusColor(_status: string, index: number) {
+  return chartColors[index % chartColors.length];
 }
 
 function healthTone(rate: number, overdue: number) {
@@ -106,7 +98,7 @@ function HealthRankings({
         const tone = healthTone(row.rate, row.overdue);
         return (
           <motion.div 
-            className="health-row flex flex-wrap sm:flex-nowrap items-center min-w-0 gap-2 sm:gap-4 w-full" 
+            className="health-row" 
             key={row.id}
             variants={{
               hidden: { opacity: 0, y: 15 },
@@ -311,33 +303,66 @@ export function MainDashboard() {
             <DashboardSection
               title="Compliance status"
               description="Current workflow state across the selected scope."
+              className="compliance-status-card"
             >
               {data?.status_distribution.length ? (
-                <div className="donut-chart">
-                  <ResponsiveContainer width="100%" height={290}>
-                    <PieChart>
-                      <Pie
-                        data={data.status_distribution}
-                        dataKey="value"
-                        nameKey="name"
-                        innerRadius={74}
-                        outerRadius={106}
-                        paddingAngle={3}
-                      >
-                        {data.status_distribution.map((entry, index) => (
-                          <Cell
-                            key={entry.name}
-                            fill={statusColor(entry.name, index)}
-                          />
-                        ))}
-                      </Pie>
-                      <Tooltip formatter={(value) => [value, "Obligations"]} />
-                      <Legend iconType="circle" />
-                    </PieChart>
-                  </ResponsiveContainer>
-                  <div className="donut-chart-total">
-                    <strong>{summary?.completion_rate ?? 0}%</strong>
-                    <span>completed</span>
+                <div className="compliance-chart-body" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, padding: '24px 16px', overflow: 'visible' }}>
+                  <div className="donut-chart-wrapper" style={{ width: '260px', height: '260px', position: 'relative', flexShrink: 0 }}>
+                    <ResponsiveContainer width="100%" height={260}>
+                      <PieChart>
+                        <Pie
+                          data={data.status_distribution}
+                          dataKey="value"
+                          nameKey="name"
+                          cx="50%"
+                          cy="50%"
+                          innerRadius={74}
+                          outerRadius={106}
+                          paddingAngle={3}
+                        >
+                          {data.status_distribution.map((entry, index) => (
+                            <Cell
+                              key={entry.name}
+                              fill={statusColor(entry.name, index)}
+                            />
+                          ))}
+                        </Pie>
+                        <Tooltip formatter={(value) => [value, "Obligations"]} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                    <div 
+                      className="donut-chart-total"
+                      style={{
+                        position: 'absolute',
+                        top: '50%',
+                        left: '50%',
+                        transform: 'translate(-50%, -50%)',
+                        textAlign: 'center',
+                        display: 'grid',
+                        gap: '0.1rem'
+                      }}
+                    >
+                      <strong>{summary?.completion_rate ?? 0}%</strong>
+                      <span>completed</span>
+                    </div>
+                  </div>
+                  <div className="compliance-legend" style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: '8px 20px', maxWidth: '100%', marginTop: '20px' }}>
+                    {data.status_distribution.map((entry, index) => (
+                      <div key={entry.name} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: '#4b5563' }}>
+                        <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: statusColor(entry.name, index) }} />
+                        <span>
+                          {{
+                            COMPLETED: "Completed",
+                            COMPLETED_LATE: "Completed late",
+                            DUE: "Due",
+                            NOT_APPLICABLE: "Not applicable",
+                            OVERDUE: "Overdue",
+                            PENDING_FOR_APPROVAL: "Pending approval",
+                            REJECTED_BY_CHECKER: "Rejected",
+                          }[entry.name] || entry.name}
+                        </span>
+                      </div>
+                    ))}
                   </div>
                 </div>
               ) : (
@@ -426,7 +451,7 @@ export function MainDashboard() {
                       <Bar
                         dataKey="value"
                         name="Obligations"
-                        fill="#4f46e5"
+                        fill="#424B35"
                         radius={[5, 5, 0, 0]}
                       />
                     </BarChart>
