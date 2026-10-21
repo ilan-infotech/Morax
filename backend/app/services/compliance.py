@@ -1,6 +1,6 @@
 import calendar
 import json
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from fastapi import HTTPException
 from sqlalchemy import func, select
@@ -19,7 +19,9 @@ from app.models import (
     ContractorSite,
     RuleApplicabilityCriteria,
     Unit,
+    User,
 )
+from app.services.access import can_access_subject, platform_master_organization_id
 from app.services.audit import audit
 
 
@@ -86,13 +88,29 @@ def evaluate(version: ComplianceRuleVersion, criteria: RuleApplicabilityCriteria
     return all(matches.values()), {"rule_version_id": version.id, "matched": matches, "criteria_notes": criteria.notes}
 
 
+def applies_in_month(version: ComplianceRuleVersion, as_of: date) -> bool:
+    """Apply optional Compliance Master month restrictions deterministically."""
+    if not version.applicable_months_json:
+        return True
+    try:
+        months = {int(item) for item in json.loads(version.applicable_months_json)}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        # A malformed historic value must not silently generate obligations.
+        return False
+    # An empty configured list means the rule applies in every normal period.
+    # Pydantic serializes the default as the truthy string "[]", so checking
+    # only the raw JSON value would incorrectly suppress every occurrence.
+    return not months or as_of.month in months
+
+
 def active_versions(db: Session, organization_id: str, as_of: date):
+    master_org = platform_master_organization_id(db)
     return db.query(ComplianceRuleVersion, ComplianceRule, RuleApplicabilityCriteria).join(
         ComplianceRule, ComplianceRule.id == ComplianceRuleVersion.rule_id
     ).join(
         RuleApplicabilityCriteria, RuleApplicabilityCriteria.rule_version_id == ComplianceRuleVersion.id
     ).filter(
-        ComplianceRule.organization_id == organization_id,
+        ComplianceRule.organization_id == master_org,
         ComplianceRuleVersion.active.is_(True),
         ComplianceRuleVersion.effective_from <= as_of,
         (ComplianceRuleVersion.effective_to.is_(None)) | (ComplianceRuleVersion.effective_to >= as_of),
@@ -109,7 +127,7 @@ def generate_for_subject(db: Session, organization_id: str, subject_type: str, s
     if subject.status != "ACTIVE":
         return []
     compliance_start = getattr(subject, "compliance_start_date", None) or getattr(subject, "effective_date", None)
-    if compliance_start and as_of < compliance_start:
+    if compliance_start and (as_of < compliance_start or period_end("MONTHLY", as_of) < compliance_start):
         return []
     setattr(subject, "__subject_type__", subject_type)
     created: list[ComplianceInstance] = []
@@ -117,6 +135,8 @@ def generate_for_subject(db: Session, organization_id: str, subject_type: str, s
         # Checklist imports without a configured scheduling rule are retained
         # in the Master but must not produce an invented legal due date.
         if version.due_date_rule.upper() == "MANUAL":
+            continue
+        if not applies_in_month(version, as_of):
             continue
         applicable, explanation = evaluate(version, criteria, subject)
         db.add(ApplicabilityEvaluation(
@@ -164,7 +184,15 @@ def instance_assignments(db: Session, instance_id: str, assignment_type: str | N
 
 
 def assert_assignment_or_admin(db: Session, instance: ComplianceInstance, user_id: str, roles: set[str], assignment_type: str) -> None:
-    if "ORGANIZATION_ADMIN" in roles or "UNIT_ADMIN" in roles or "CONTRACTOR_ADMIN" in roles:
+    required_roles = (
+        {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "CONTRACTOR_ADMIN", "CONTRACTOR_MAKER"}
+        if assignment_type == "MAKER"
+        else {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_CHECKER", "CONTRACTOR_ADMIN", "CONTRACTOR_CHECKER"}
+    )
+    user = db.get(User, user_id)
+    if user and roles & required_roles and can_access_subject(
+        db, user, instance.organization_id, instance.subject_type, instance.subject_id
+    ):
         return
     if not any(item.user_id == user_id for item in instance_assignments(db, instance.id, assignment_type)):
         raise HTTPException(403, f"This compliance is not assigned to you as {assignment_type.lower()}")
@@ -188,5 +216,5 @@ def submit(db: Session, instance: ComplianceInstance, actor_id: str) -> None:
         raise HTTPException(422, f"Required evidence is missing: {version.required_document}")
     revision = (db.scalar(select(func.max(ComplianceSubmission.revision)).where(ComplianceSubmission.instance_id == instance.id)) or 0) + 1
     db.add(ComplianceSubmission(instance_id=instance.id, revision=revision, submitted_by_id=actor_id, activity_snapshot_json=json.dumps({"filing_reference": instance.activity_reference, "completed_on": str(instance.completed_on) if instance.completed_on else None, "amount": instance.amount, "remarks": instance.remarks})))
-    instance.submitted_at = datetime.utcnow()
+    instance.submitted_at = datetime.now(UTC)
     transition(db, instance, actor_id, "SUBMIT", "SUBMITTED")

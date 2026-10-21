@@ -17,9 +17,11 @@ if TURSO_DB_URL and TURSO_AUTH_TOKEN:
         poolclass=NullPool,
     )
 else:
-    # Fallback to existing local SQLite for development
+    # Use the configured local database when Turso is not enabled.  This keeps
+    # development, test, migration, and deployment commands on the same
+    # explicitly selected database instead of silently writing to morax.db.
     engine = create_engine(
-        "sqlite:///./morax.db", 
+        settings.database_url,
         connect_args={"check_same_thread": False},
         poolclass=NullPool,
     )

@@ -855,12 +855,12 @@ def seed_qa_demo_workspace(
         email="sameer.contractor.maker@morax.example.com",
         scopes=[("CONTRACTOR_MAKER", "CONTRACTOR", contractors["QA-CT-MF-01"].id)],
     )
-    contractor_checker = _ensure_user(
+    principal_employer_checker = _ensure_user(
         db,
         organization,
-        name="Anika Rao (QA Contractor Checker)",
-        email="anika.contractor.checker@morax.example.com",
-        scopes=[("CONTRACTOR_CHECKER", "CONTRACTOR", contractors["QA-CT-MF-01"].id)],
+        name="Anika Rao (QA Principal Employer Checker)",
+        email="anika.principal-employer.checker@morax.example.com",
+        scopes=[("UNIT_CHECKER", "UNIT", units["QA-MFG-CHN"].id)],
     )
     _ensure_user(
         db,
@@ -890,7 +890,7 @@ def seed_qa_demo_workspace(
         db.add(
             ComplianceAssignment(
                 instance_id=instance.id,
-                user_id=(unit_checker.id if instance.subject_type == "UNIT" else contractor_checker.id),
+                user_id=(unit_checker.id if instance.subject_type == "UNIT" else principal_employer_checker.id),
                 assignment_type="CHECKER",
                 assigned_by_id=org_admin.id,
             )

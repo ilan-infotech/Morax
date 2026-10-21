@@ -7,14 +7,14 @@ from sqlalchemy.orm import Session
 
 from app.core.security import decode_access_token
 from app.db.session import get_db
-from app.models import AuthSession, Contractor, ContractorSite, Unit, User, UserRoleScope
+from app.models import AuthSession, Contractor, ContractorSite, Unit, User, UserPermissionGrant, UserRoleScope
 
 bearer = HTTPBearer(auto_error=False)
 PLATFORM_ADMIN_ROLE = "MORAX_ADMIN"
 ADMIN_ROLES = {"ORGANIZATION_ADMIN"}
 MANAGER_ROLES = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "CONTRACTOR_ADMIN"}
-MAKER_ROLES = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "CONTRACTOR_ADMIN", "UNIT_MAKER", "CONTRACTOR_MAKER"}
-CHECKER_ROLES = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "CONTRACTOR_ADMIN", "UNIT_CHECKER", "CONTRACTOR_CHECKER"}
+MAKER_ROLES = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "CONTRACTOR_ADMIN", "CONTRACTOR_MAKER"}
+CHECKER_ROLES = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_CHECKER", "CONTRACTOR_ADMIN", "CONTRACTOR_CHECKER"}
 
 ROLE_PERMISSIONS = {
     "MORAX_ADMIN": {
@@ -44,21 +44,10 @@ ROLE_PERMISSIONS = {
         "entities.read",
         "entities.manage",
         "users.manage",
-        "compliance_master.manage",
         "settings.read",
         "settings.manage",
     },
     "UNIT_ADMIN": {
-        "dashboard.read",
-        "compliance.read",
-        "compliance.manage",
-        "documents.read",
-        "documents.manage",
-        "reports.read",
-        "entities.read",
-        "settings.read",
-    },
-    "CONTRACTOR_ADMIN": {
         "dashboard.read",
         "compliance.read",
         "compliance.manage",
@@ -92,6 +81,16 @@ ROLE_PERMISSIONS = {
         "documents.verify",
         "settings.read",
     },
+    "CONTRACTOR_ADMIN": {
+        "dashboard.read",
+        "compliance.read",
+        "compliance.manage",
+        "documents.read",
+        "documents.manage",
+        "reports.read",
+        "entities.read",
+        "settings.read",
+    },
     "CONTRACTOR_CHECKER": {
         "dashboard.read",
         "compliance.read",
@@ -114,6 +113,15 @@ ROLE_PERMISSIONS = {
         "audit.read",
         "settings.read",
     },
+}
+
+# These are optional, additive product-area grants selected at user creation.
+# Privileged platform administration cannot be delegated through this list.
+MODULE_PERMISSION_CHOICES = {
+    permission
+    for role, permissions in ROLE_PERMISSIONS.items()
+    if role != "MORAX_ADMIN"
+    for permission in permissions
 }
 
 FEATURE_PERMISSIONS = {
@@ -146,7 +154,6 @@ ADMIN_FEATURES = BASE_FEATURES | {
     "entities.contractors",
     "entities.sites",
     "users",
-    "compliance_master",
     "reports",
     "audit",
 }
@@ -193,18 +200,45 @@ def roles_for(db: Session, user_id: str) -> set[str]:
     return {scope.role for scope in scopes_for(db, user_id)}
 
 
-def permissions_for(user: User, scopes: list[UserRoleScope]) -> set[str]:
+def permission_grants_for(db: Session, user_id: str) -> set[str]:
+    return set(db.scalars(select(UserPermissionGrant.permission).where(UserPermissionGrant.user_id == user_id)))
+
+
+def platform_master_organization_id(db: Session) -> str:
+    """Return the platform-owned tenant used solely to store global rules.
+
+    ComplianceRule retains its existing organization foreign key for data-model
+    compatibility, but the rows are now owned only by the bootstrap MORAX
+    platform organization and are applied to every tenant.
+    """
+    organization_id = db.scalar(
+        select(User.organization_id)
+        .where(User.platform_role == PLATFORM_ADMIN_ROLE, User.organization_id.is_not(None))
+        .order_by(User.created_at, User.id)
+        .limit(1)
+    )
+    if not organization_id:
+        raise HTTPException(409, "A MORAX platform master organization is not configured")
+    return organization_id
+
+
+def permissions_for(user: User, scopes: list[UserRoleScope], grants: set[str] | None = None) -> set[str]:
     permissions: set[str] = set()
     if user.platform_role == PLATFORM_ADMIN_ROLE:
         permissions.update(ROLE_PERMISSIONS["MORAX_ADMIN"])
     for scope in scopes:
         permissions.update(ROLE_PERMISSIONS.get(scope.role, set()))
+    # Existing tenant grants cannot preserve access to platform-only features.
+    permitted_grants = set(grants or set())
+    if user.platform_role != PLATFORM_ADMIN_ROLE:
+        permitted_grants -= {"compliance_master.manage", "platform.organizations"}
+    permissions.update(permitted_grants)
     return permissions
 
 
-def features_for(user: User, scopes: list[UserRoleScope]) -> list[str]:
+def features_for(user: User, scopes: list[UserRoleScope], grants: set[str] | None = None) -> list[str]:
     """Return product areas visible for the user's trusted organization context."""
-    permissions = permissions_for(user, scopes)
+    permissions = permissions_for(user, scopes, grants)
     features = {
         feature
         for feature, permission in FEATURE_PERMISSIONS.items()
@@ -214,7 +248,7 @@ def features_for(user: User, scopes: list[UserRoleScope]) -> list[str]:
 
 
 def has_permission(db: Session, user: User, permission: str) -> bool:
-    return permission in permissions_for(user, scopes_for(db, user.id))
+    return permission in permissions_for(user, scopes_for(db, user.id), permission_grants_for(db, user.id))
 
 
 def is_org_admin(db: Session, user: User, organization_id: str) -> bool:
@@ -313,6 +347,7 @@ def accessible_subject_ids(db: Session, user: User, organization_id: str, subjec
 
 def user_summary(db: Session, user: User) -> dict:
     scopes = scopes_for(db, user.id)
+    grants = permission_grants_for(db, user.id)
     impersonator_id = getattr(user, "_morax_impersonated_by_id", None)
     impersonator = db.get(User, impersonator_id) if impersonator_id else None
     return {
@@ -328,8 +363,8 @@ def user_summary(db: Session, user: User) -> dict:
         "must_change_password": user.must_change_password,
         "roles": sorted({scope.role for scope in scopes}),
         "scopes": [{"role": scope.role, "scope_type": scope.scope_type, "scope_id": scope.scope_id} for scope in scopes],
-        "features": features_for(user, scopes),
-        "permissions": sorted(permissions_for(user, scopes)),
+        "features": features_for(user, scopes, grants),
+        "permissions": sorted(permissions_for(user, scopes, grants)),
         "impersonation": {
             "active": bool(impersonator_id),
             "impersonator_id": impersonator_id,

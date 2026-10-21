@@ -22,7 +22,7 @@ const text = (row: Row, key: string) =>
 const canDelete = (user: User) =>
   user.platform_role === "MORAX_ADMIN" ||
   user.roles.some((role) =>
-    ["ORGANIZATION_ADMIN", "UNIT_ADMIN", "CONTRACTOR_ADMIN"].includes(role),
+    ["ORGANIZATION_ADMIN", "UNIT_ADMIN"].includes(role),
   );
 
 export function DocumentLibrary({ user }: { user: User }) {

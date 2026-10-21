@@ -385,7 +385,7 @@ export function MainDashboard() {
               action={
                 <Link
                   className="text-link"
-                  to={base + "/compliances/recurring"}
+                  to={base + "/compliances/company"}
                 >
                   View worklist
                 </Link>

@@ -101,7 +101,7 @@ const Panel = ({ children }: { children: ReactNode }) => (
 const canManage = (user: User) =>
   user.platform_role === "MORAX_ADMIN" ||
   user.roles.some((role) =>
-    ["ORGANIZATION_ADMIN", "UNIT_ADMIN", "CONTRACTOR_ADMIN"].includes(role),
+    ["ORGANIZATION_ADMIN", "UNIT_ADMIN"].includes(role),
   );
 const canManageEntity = (user: User) =>
   user.platform_role === "MORAX_ADMIN" ||
@@ -112,9 +112,7 @@ const canCheck = (user: User) =>
     [
       "ORGANIZATION_ADMIN",
       "UNIT_ADMIN",
-      "CONTRACTOR_ADMIN",
       "UNIT_CHECKER",
-      "CONTRACTOR_CHECKER",
     ].includes(role),
   );
 const subjectLabel = (type: string) =>
@@ -377,8 +375,13 @@ type WorkspaceLink = {
 const links: WorkspaceLink[] = [
   { label: "Dashboard", path: "dashboard", feature: "dashboard" },
   {
-    label: "Recurring",
-    path: "compliances/recurring",
+    label: "Company Compliance",
+    path: "compliances/company",
+    feature: "compliances.recurring",
+  },
+  {
+    label: "Contractor Compliance",
+    path: "compliances/contractor",
     feature: "compliances.recurring",
   },
   {
@@ -412,7 +415,8 @@ const links: WorkspaceLink[] = [
 
 const navIcons: Record<string, LucideIcon> = {
   Dashboard: LayoutDashboard,
-  Recurring: CalendarClock,
+  "Company Compliance": CalendarClock,
+  "Contractor Compliance": Landmark,
   "One-time": ClipboardList,
   Units: Building2,
   Contractors: Landmark,
@@ -476,7 +480,7 @@ function fallbackFeatures(user: User): WorkspaceFeature[] {
     "settings",
   ];
   if (
-    user.roles.some((role) => ["UNIT_ADMIN", "CONTRACTOR_ADMIN"].includes(role))
+    user.roles.some((role) => ["UNIT_ADMIN"].includes(role))
   )
     base.push("reports");
   if (user.roles.includes("AUDITOR")) base.push("reports", "audit");
@@ -616,14 +620,11 @@ function Layout({
     ? "/app/organizations/" + organizationId
     : "/app";
   useEffect(() => {
-    if (organizationId)
-      morax
-        .organization()
-        .then((row) =>
-          setOrganizationName(String(row.name ?? "Selected organization")),
-        )
-        .catch(() => setOrganizationName("Organization context"));
-  }, [organizationId]);
+    morax
+      .organization()
+      .then((row) => setOrganizationName(String(row.name ?? "Organization context")))
+      .catch(() => setOrganizationName(organizationId ? "Organization context" : ""));
+  }, [organizationId, user.organization_id]);
   return (
     <main className="content">
       <header className="app-topbar">
@@ -642,7 +643,7 @@ function Layout({
           >
             <Bell size={18} />
           </Link>
-          <UserProfileDropdown user={user} logout={logout} organizationName={organizationId ? (organizationName || "Organization workspace") : undefined} />
+          <UserProfileDropdown user={user} logout={logout} organizationName={organizationName || (organizationId ? "Organization workspace" : undefined)} />
         </div>
       </header>
       <ImpersonationBanner user={user} endImpersonation={endImpersonation} />
@@ -745,6 +746,10 @@ function Organizations({ user }: { user: User }) {
     primary_contact_name: "",
     primary_contact_email: "",
     primary_contact_phone: "",
+    organization_admin_name: "",
+    organization_admin_email: "",
+    organization_admin_password: "",
+    organization_admin_password_confirmation: "",
     compliance_start_date: today(),
     status: "ACTIVE",
   };
@@ -773,10 +778,16 @@ function Organizations({ user }: { user: User }) {
   };
   const save = async (event: FormEvent) => {
     event.preventDefault();
+    if (!editing && form.organization_admin_password !== form.organization_admin_password_confirmation) {
+      setError("Organization Admin passwords do not match");
+      return;
+    }
     try {
+      const request = payload(form);
+      delete request.organization_admin_password_confirmation;
       if (editing)
-        await morax.updatePlatformOrganization(editing, payload(form));
-      else await morax.createPlatformOrganization(payload(form));
+        await morax.updatePlatformOrganization(editing, request);
+      else await morax.createPlatformOrganization(request);
       setError("Success: Organization saved");
       setEditing("");
       setForm(blank);
@@ -856,6 +867,26 @@ function Organizations({ user }: { user: User }) {
               required
             />
           </label>
+          {!editing && (
+            <>
+              <label>
+                Organization Admin name
+                <input value={form.organization_admin_name} onChange={(e) => setForm({ ...form, organization_admin_name: e.target.value })} required />
+              </label>
+              <label>
+                Organization Admin email
+                <input type="email" value={form.organization_admin_email} onChange={(e) => setForm({ ...form, organization_admin_email: e.target.value })} required />
+              </label>
+              <label>
+                Organization Admin password
+                <input type="password" value={form.organization_admin_password} onChange={(e) => setForm({ ...form, organization_admin_password: e.target.value })} minLength={8} autoComplete="new-password" required />
+              </label>
+              <label>
+                Confirm Organization Admin password
+                <input type="password" value={form.organization_admin_password_confirmation} onChange={(e) => setForm({ ...form, organization_admin_password_confirmation: e.target.value })} minLength={8} autoComplete="new-password" required />
+              </label>
+            </>
+          )}
           <label>
             Legal name
             <input
@@ -1083,6 +1114,9 @@ function OrganizationLanding({ user }: { user: User }) {
   const [error, setError] = useState("");
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState("");
+  const [resetTarget, setResetTarget] = useState<Row | null>(null);
+  const [resetCode, setResetCode] = useState("");
+  const [resetting, setResetting] = useState(false);
   const [filters, setFilters] = useState({ q: "", status: "" });
   const deferredSearch = useDeferredValue(filters.q);
   const blank = {
@@ -1098,6 +1132,10 @@ function OrganizationLanding({ user }: { user: User }) {
     primary_contact_name: "",
     primary_contact_email: "",
     primary_contact_phone: "",
+    organization_admin_name: "",
+    organization_admin_email: "",
+    organization_admin_password: "",
+    organization_admin_password_confirmation: "",
     compliance_start_date: today(),
     status: "ACTIVE",
   };
@@ -1142,15 +1180,41 @@ function OrganizationLanding({ user }: { user: User }) {
   };
   async function save(event: FormEvent) {
     event.preventDefault();
+    if (!editing && form.organization_admin_password !== form.organization_admin_password_confirmation) {
+      setError("Organization Admin passwords do not match");
+      return;
+    }
     try {
+      const request = payload(form);
+      delete request.organization_admin_password_confirmation;
       if (editing)
-        await morax.updatePlatformOrganization(editing, payload(form));
-      else await morax.createPlatformOrganization(payload(form));
+        await morax.updatePlatformOrganization(editing, request);
+      else await morax.createPlatformOrganization(request);
       setError("Success: Organization saved");
       closeForm();
       load();
     } catch (err) {
       setError(message(err));
+    }
+  }
+
+  async function resetDevelopmentData(event: FormEvent) {
+    event.preventDefault();
+    if (!resetTarget) return;
+    setResetting(true);
+    try {
+      const result = await morax.resetPlatformOrganizationDevelopmentData(
+        String(resetTarget.id),
+        resetCode,
+      );
+      setError(`Success: ${result.message}`);
+      setResetTarget(null);
+      setResetCode("");
+      load();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setResetting(false);
     }
   }
 
@@ -1176,6 +1240,60 @@ function OrganizationLanding({ user }: { user: User }) {
         </div>
       </Header>
       <ErrorBox text={error} />
+      {resetTarget && (
+        <Panel>
+          <div className="split">
+            <div>
+              <h2>Development master delete</h2>
+              <p className="muted">
+                This permanently clears all operational data for{" "}
+                <b>{String(resetTarget.organization_name)}</b>: users, entities,
+                rules, compliance history, imports, notifications, and uploaded
+                files. The organization shell and your platform administrator
+                login are retained. It is available only on the local SQLite
+                development database.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => {
+                setResetTarget(null);
+                setResetCode("");
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+          <form className="form-grid" onSubmit={resetDevelopmentData}>
+            <label>
+              Type organization code <code>{String(resetTarget.organization_code)}</code> to confirm
+              <input
+                value={resetCode}
+                onChange={(e) => setResetCode(e.target.value)}
+                autoComplete="off"
+                required
+              />
+            </label>
+            <div className="action-row">
+              <button className="danger" disabled={resetting}>
+                {resetting ? "Deleting development data…" : "Master delete data"}
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                disabled={resetting}
+                onClick={() => {
+                  setResetTarget(null);
+                  setResetCode("");
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        </Panel>
+      )}
       {showForm && (
         <Panel>
           <div className="split">
@@ -1211,6 +1329,57 @@ function OrganizationLanding({ user }: { user: User }) {
                 required
               />
             </label>
+            {!editing && (
+              <>
+                <label>
+                  Organization Admin name
+                  <input
+                    value={form.organization_admin_name}
+                    onChange={(e) =>
+                      setForm({ ...form, organization_admin_name: e.target.value })
+                    }
+                    required
+                  />
+                </label>
+                <label>
+                  Organization Admin email
+                  <input
+                    type="email"
+                    value={form.organization_admin_email}
+                    onChange={(e) =>
+                      setForm({ ...form, organization_admin_email: e.target.value })
+                    }
+                    required
+                  />
+                </label>
+                <label>
+                  Organization Admin password
+                  <input
+                    type="password"
+                    value={form.organization_admin_password}
+                    onChange={(e) =>
+                      setForm({ ...form, organization_admin_password: e.target.value })
+                    }
+                    minLength={8}
+                    autoComplete="new-password"
+                    required
+                  />
+                </label>
+                <label>
+                  Confirm Organization Admin password
+                  <input
+                    type="password"
+                    value={form.organization_admin_password_confirmation}
+                    onChange={(e) =>
+                      setForm({ ...form, organization_admin_password_confirmation: e.target.value })
+                    }
+                    minLength={8}
+                    autoComplete="new-password"
+                    required
+                  />
+                </label>
+              </>
+            )}
             <label>
               Legal name
               <input
@@ -1394,6 +1563,17 @@ function OrganizationLanding({ user }: { user: User }) {
                       Manage
                     </button>
                     <button
+                      type="button"
+                      className="danger"
+                      onClick={() => {
+                        setResetTarget(row);
+                        setResetCode("");
+                        window.scrollTo({ top: 0, behavior: "smooth" });
+                      }}
+                    >
+                      Reset dev data
+                    </button>
+                    <button
                       className={
                         row.status === "ACTIVE" ? "danger" : "secondary"
                       }
@@ -1473,7 +1653,7 @@ function Dashboard() {
           Checker, then track submission through approval.
         </p>
         <div className="quick">
-          <Link to={`${base}/compliances/recurring`}>View worklist</Link>
+          <Link to={`${base}/compliances/company`}>View worklist</Link>
           <Link to={`${base}/compliance-master`}>Manage rules</Link>
           <Link to={`${base}/notifications`}>Open notifications</Link>
         </div>
@@ -1956,7 +2136,7 @@ function Detail({ user }: { user: User }) {
             {editable && (
               <button
                 onClick={() =>
-                  act(() => morax.submit(id), "Submitted for review")
+                  act(() => morax.submit(id, item.row_version), "Submitted for review")
                 }
               >
                 Submit for review
@@ -2633,9 +2813,7 @@ const roles = [
   "UNIT_ADMIN",
   "UNIT_MAKER",
   "UNIT_CHECKER",
-  "CONTRACTOR_ADMIN",
   "CONTRACTOR_MAKER",
-  "CONTRACTOR_CHECKER",
   "VIEWER",
   "AUDITOR",
 ];
@@ -4217,7 +4395,69 @@ function GlobalSidebar({ user, logout, collapsed, setCollapsed }: { user: User; 
   );
 }
 
+function AccountActivation() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const token = new URLSearchParams(location.search).get("token") ?? "";
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  return (
+    <main className="content" style={{ maxWidth: 560, margin: "4rem auto" }}>
+      <Panel>
+        <p className="eyebrow">ACCOUNT ACTIVATION</p>
+        <h1>Set your MORAX password</h1>
+        <p className="muted">
+          Choose a password to activate your account. This link can be used only once.
+        </p>
+        <ErrorBox text={error} />
+        {!token ? (
+          <p className="alert error">This activation link is incomplete. Ask your administrator to resend it.</p>
+        ) : (
+          <form
+            className="form-grid compact"
+            onSubmit={async (event) => {
+              event.preventDefault();
+              if (password !== confirmPassword) {
+                setError("Passwords do not match");
+                return;
+              }
+              setSubmitting(true);
+              try {
+                const result = await morax.activateAccount(token, password);
+                setError(`Success: ${result.message}`);
+                setPassword("");
+                setConfirmPassword("");
+              } catch (activationError) {
+                setError(message(activationError));
+              } finally {
+                setSubmitting(false);
+              }
+            }}
+          >
+            <label>
+              New password
+              <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={8} autoComplete="new-password" required />
+            </label>
+            <label>
+              Confirm password
+              <input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} minLength={8} autoComplete="new-password" required />
+            </label>
+            <div className="action-row">
+              <button disabled={submitting}>{submitting ? "Activating…" : "Activate account"}</button>
+              <button type="button" className="secondary" onClick={() => navigate("/")}>Back to sign in</button>
+            </div>
+          </form>
+        )}
+      </Panel>
+    </main>
+  );
+}
+
 function AppRoutes() {
+  const location = useLocation();
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -4229,6 +4469,7 @@ function AppRoutes() {
       .finally(() => setReady(true));
   }, []);
   if (!ready) return <div className="loading">Loading MORAX…</div>;
+  if (location.pathname === "/activate") return <AccountActivation />;
   if (!user) return <Login done={setUser} />;
   const impersonate = async (userId: string) => {
     const response = await morax.impersonate(userId);

@@ -18,6 +18,18 @@ class Settings(BaseSettings):
     max_upload_bytes: int = 10 * 1024 * 1024
     bootstrap_admin_email: str = "admin@morax.example.com"
     bootstrap_admin_password: str = "Admin@123"
+    # Account-activation mail is sent through SMTP when these values are set.
+    # In a local development environment without SMTP, the one-time link is
+    # written to the server log instead of exposing it through an API response.
+    frontend_base_url: str = "http://localhost:5173/morax"
+    activation_token_minutes: int = 60 * 24
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
+    mail_from: str = "no-reply@morax.local"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

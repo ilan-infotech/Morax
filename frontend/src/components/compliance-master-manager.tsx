@@ -46,6 +46,7 @@ const ruleSchema = z.object({
   state_id: z.string(),
   industry_type_id: z.string(),
   frequency: z.string().min(1),
+  applicable_months: z.string(),
   due_date_rule: z.string().min(1),
   due_date_offset: z.coerce.number().int().nullable(),
   due_date_anchor: z.string(),
@@ -74,6 +75,7 @@ const blankRule = (): RuleForm => ({
   state_id: "",
   industry_type_id: "",
   frequency: "MONTHLY",
+  applicable_months: "",
   due_date_rule: "FIXED_DAY_OF_MONTH",
   due_date_offset: 15,
   due_date_anchor: "",
@@ -165,6 +167,9 @@ export function ComplianceMasterManager() {
     mutationFn: (values: RuleForm) =>
       morax.createRule({
         ...values,
+        applicable_months: values.applicable_months
+          ? values.applicable_months.split(",").map((month) => Number(month.trim())).filter(Boolean)
+          : [],
         state_id: values.state_id || null,
         industry_type_id: values.industry_type_id || null,
         due_date_offset: values.due_date_offset || null,
@@ -244,6 +249,7 @@ export function ComplianceMasterManager() {
           row[key] == null ? value : row[key],
         ]),
       ),
+      applicable_months: Array.isArray(row.applicable_months) ? row.applicable_months.join(",") : String(row.applicable_months ?? ""),
       version: Number(row.version || 0) + 1,
       active: true,
     } as RuleForm);
@@ -677,6 +683,9 @@ export function ComplianceMasterManager() {
                       <option key={item}>{item}</option>
                     ))}
                   </select>
+                </RuleField>
+                <RuleField label="Applicable months">
+                  <input {...form.register("applicable_months")} placeholder="e.g. 6,12 for half-yearly PT" />
                 </RuleField>
                 <RuleField label="Due date method">
                   <select {...form.register("due_date_rule")}>

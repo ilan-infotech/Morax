@@ -1,0 +1,319 @@
+from datetime import date
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+
+import app.api.v1.router as api
+from app.core.security import hash_password, verify_password
+from app.db.base import Base
+from app.models import AuditLog, Contractor, IndustryType, Organization, State, Unit, User, UserActivation, UserRoleScope
+from app.schemas import EntityUserAssignmentInput, LoginRequest, PlatformOrganizationInput, RoleScopeInput, UnitInput, UserCreateInput
+
+
+@pytest.fixture()
+def db():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        yield session
+    engine.dispose()
+
+
+def test_platform_organization_provisions_admin_password(db, monkeypatch):
+    platform_admin = User(
+        name="MORAX Admin",
+        email="platform@example.test",
+        password_hash="not-a-real-password",
+        active=True,
+        platform_role="MORAX_ADMIN",
+    )
+    db.add(platform_admin)
+    db.flush()
+
+    delivered: dict[str, str] = {}
+
+    def capture_delivery(user: User, token: str) -> str:
+        delivered["email"] = user.email
+        delivered["token"] = token
+        return "test"
+
+    monkeypatch.setattr(api, "send_activation_email", capture_delivery)
+    created = api.create_platform_organization(
+        PlatformOrganizationInput(
+            organization_name="Acme Compliance",
+            organization_code="ACME",
+            organization_admin_name="Acme Admin",
+            organization_admin_email="admin@acme.example.com",
+            organization_admin_password="Acme-Admin-Password-1",
+        ),
+        platform_admin,
+        db,
+    )
+
+    organization_id = created["id"]
+    admin = db.scalar(select(User).where(User.email == "admin@acme.example.com"))
+    assert "activation_delivery" not in created
+    assert delivered == {}
+    assert admin.organization_id == organization_id
+    assert admin.must_change_password is False
+    assert verify_password("Acme-Admin-Password-1", admin.password_hash)
+    assert db.scalar(select(UserActivation).where(UserActivation.user_id == admin.id)) is None
+    assert db.scalar(select(UserRoleScope).where(
+        UserRoleScope.user_id == admin.id,
+        UserRoleScope.role == "ORGANIZATION_ADMIN",
+        UserRoleScope.scope_id == organization_id,
+    )) is not None
+
+    # The centralized User Access endpoint provisions the same immediately
+    # usable, password-based user records used by the Unit/Contractor popup.
+    created_user = api.create_user(
+        UserCreateInput(
+            name="Shared Access User",
+            email="shared@acme.example.com",
+            password="Shared-Access-Password-1",
+            role_scopes=[RoleScopeInput(
+                role="VIEWER", scope_type="ORGANIZATION", scope_id=organization_id,
+            )],
+        ),
+        admin,
+        db,
+    )
+    assert delivered == {}
+    assert db.get(User, created_user["id"]).must_change_password is False
+    assert verify_password("Shared-Access-Password-1", db.get(User, created_user["id"]).password_hash)
+    assert db.scalar(select(UserActivation).where(UserActivation.user_id == created_user["id"])) is None
+    assert any(row["id"] == created_user["id"] for row in api.list_users(user=admin, db=db))
+
+    actions = set(db.scalars(select(AuditLog.action).where(AuditLog.organization_id == organization_id)))
+    assert {"ORGANIZATION_CREATED", "CREATE_ORGANIZATION_ADMIN", "ORGANIZATION_ADMIN_PASSWORD_SET", "CREATE_USER", "USER_PASSWORD_SET"} <= actions
+
+
+def test_mrf_onboarding_login_unit_and_assigned_user_logins(db):
+    master_organization = Organization(name="MORAX Master", code="MORAX-MASTER", status="ACTIVE")
+    db.add(master_organization)
+    db.flush()
+    platform_admin = User(
+        organization_id=master_organization.id,
+        name="MORAX Product Admin",
+        email="product.admin@example.com",
+        password_hash=hash_password("Product-Admin-Password-1"),
+        active=True,
+        platform_role="MORAX_ADMIN",
+    )
+    state = State(name="Maharashtra", code="MH")
+    industry = IndustryType(name="Tyre Manufacturing", code="TYRE")
+    db.add_all([platform_admin, state, industry])
+    db.commit()
+
+    mrf = api.create_platform_organization(
+        PlatformOrganizationInput(
+            organization_name="MRF",
+            organization_code="MRF",
+            organization_admin_name="MRF Organization Admin",
+            organization_admin_email="org.admin@mrf.example.com",
+            organization_admin_password="Mrf-Organization-Admin-1",
+            status="ACTIVE",
+        ),
+        platform_admin,
+        db,
+    )
+    organization_id = mrf["id"]
+    org_admin_login = api.login(LoginRequest(
+        email="org.admin@mrf.example.com",
+        password="Mrf-Organization-Admin-1",
+    ), db)
+    assert org_admin_login["user"]["organization_id"] == organization_id
+    assert "ORGANIZATION_ADMIN" in org_admin_login["user"]["roles"]
+
+    organization_admin = db.scalar(select(User).where(User.email == "org.admin@mrf.example.com"))
+    unit = api.create_unit(
+        UnitInput(
+            name="MRF Chennai Plant",
+            code="MRF-CHN-01",
+            industry_type_id=industry.id,
+            state_id=state.id,
+            compliance_start_date=date(2026, 10, 21),
+            status="ACTIVE",
+        ),
+        organization_admin,
+        db,
+    )
+
+    assigned_users = {
+        "ADMIN": ("unit.admin@mrf.example.com", "Mrf-Unit-Admin-1", "UNIT_ADMIN"),
+        "MAKER": ("unit.maker@mrf.example.com", "Mrf-Unit-Maker-1", "UNIT_MAKER"),
+        "CHECKER": ("unit.checker@mrf.example.com", "Mrf-Unit-Checker-1", "UNIT_CHECKER"),
+    }
+    created_ids: dict[str, str] = {}
+    for assignment_role, (email, password, scope_role) in assigned_users.items():
+        created = api.create_user(
+            UserCreateInput(
+                name=f"MRF {assignment_role.title()} User",
+                email=email,
+                password=password,
+                role_scopes=[RoleScopeInput(
+                    role=scope_role,
+                    scope_type="UNIT",
+                    scope_id=unit["id"],
+                )],
+            ),
+            organization_admin,
+            db,
+        )
+        created_ids[assignment_role] = created["id"]
+
+    assignments = api.replace_unit_user_assignments(
+        unit["id"],
+        [
+            EntityUserAssignmentInput(user_id=created_ids["ADMIN"], role="ADMIN"),
+            EntityUserAssignmentInput(user_id=created_ids["MAKER"], role="MAKER"),
+            EntityUserAssignmentInput(user_id=created_ids["CHECKER"], role="CHECKER"),
+        ],
+        organization_admin,
+        db,
+    )
+    assert {(item["user_id"], item["role"]) for item in assignments} == {
+        (created_ids["ADMIN"], "ADMIN"),
+        (created_ids["MAKER"], "MAKER"),
+        (created_ids["CHECKER"], "CHECKER"),
+    }
+
+    for assignment_role, (email, password, scope_role) in assigned_users.items():
+        signed_in = api.login(LoginRequest(email=email, password=password), db)
+        assert signed_in["user"]["organization_id"] == organization_id
+        assert scope_role in signed_in["user"]["roles"]
+        assert db.scalar(select(UserActivation).where(UserActivation.user_id == created_ids[assignment_role])) is None
+
+
+def test_entity_assignments_are_centralized_multi_role_and_tenant_scoped(db):
+    org_a = Organization(name="Org A", code="ORGA", status="ACTIVE")
+    org_b = Organization(name="Org B", code="ORGB", status="ACTIVE")
+    state = State(name="Karnataka", code="KA")
+    industry = IndustryType(name="Manufacturing", code="MFG")
+    db.add_all([org_a, org_b, state, industry])
+    db.flush()
+
+    actor = User(
+        organization_id=org_a.id,
+        name="Org A Admin",
+        email="actor@orga.test",
+        password_hash="not-a-real-password",
+        active=True,
+        platform_role="MORAX_ADMIN",
+    )
+    organization_admin = User(
+        organization_id=org_a.id,
+        name="Organization Admin",
+        email="org-admin@orga.example.com",
+        password_hash="not-a-real-password",
+        active=True,
+    )
+    member_a = User(
+        organization_id=org_a.id,
+        name="Shared User",
+        email="shared@orga.test",
+        password_hash="not-a-real-password",
+        active=True,
+    )
+    member_b = User(
+        organization_id=org_b.id,
+        name="Other Tenant User",
+        email="member@orgb.test",
+        password_hash="not-a-real-password",
+        active=True,
+    )
+    unit_a = Unit(
+        organization_id=org_a.id,
+        name="Org A Unit",
+        code="UNIT-A",
+        industry_type_id=industry.id,
+        state_id=state.id,
+        compliance_start_date=date(2026, 1, 1),
+        status="ACTIVE",
+    )
+    unit_b = Unit(
+        organization_id=org_b.id,
+        name="Org B Unit",
+        code="UNIT-B",
+        industry_type_id=industry.id,
+        state_id=state.id,
+        compliance_start_date=date(2026, 1, 1),
+        status="ACTIVE",
+    )
+    db.add_all([actor, organization_admin, member_a, member_b, unit_a, unit_b])
+    db.flush()
+    db.add(UserRoleScope(
+        user_id=organization_admin.id,
+        role="ORGANIZATION_ADMIN",
+        scope_type="ORGANIZATION",
+        scope_id=org_a.id,
+    ))
+    contractor = Contractor(
+        organization_id=org_a.id,
+        unit_id=unit_a.id,
+        name="Org A Contractor",
+        code="CON-A",
+        status="ACTIVE",
+    )
+    db.add(contractor)
+    db.flush()
+
+    unit_assignments = api.replace_entity_assignments(
+        db,
+        org_a.id,
+        "UNIT",
+        unit_a.id,
+        [
+            EntityUserAssignmentInput(user_id=member_a.id, role="ADMIN"),
+            EntityUserAssignmentInput(user_id=member_a.id, role="MAKER"),
+        ],
+        actor.id,
+    )
+    contractor_assignments = api.replace_entity_assignments(
+        db,
+        org_a.id,
+        "CONTRACTOR",
+        contractor.id,
+        [EntityUserAssignmentInput(user_id=member_a.id, role="CHECKER")],
+        actor.id,
+    )
+    db.commit()
+
+    assert {(row["user_id"], row["role"]) for row in unit_assignments} == {
+        (member_a.id, "ADMIN"), (member_a.id, "MAKER"),
+    }
+    assert contractor_assignments[0]["role"] == "CHECKER"
+    roles = set(db.scalars(select(UserRoleScope.role).where(UserRoleScope.user_id == member_a.id)))
+    assert {"UNIT_ADMIN", "UNIT_MAKER", "CONTRACTOR_CHECKER"} <= roles
+
+    with pytest.raises(HTTPException, match="Unit not found"):
+        api.replace_entity_assignments(
+            db, org_a.id, "UNIT", unit_b.id,
+            [EntityUserAssignmentInput(user_id=member_a.id, role="MAKER")], actor.id,
+        )
+    with pytest.raises(HTTPException, match="active organization"):
+        api.replace_entity_assignments(
+            db, org_a.id, "UNIT", unit_a.id,
+            [EntityUserAssignmentInput(user_id=member_b.id, role="MAKER")], actor.id,
+        )
+    # Route-level checks protect against a tenant administrator addressing an
+    # entity ID owned by another organization.
+    with pytest.raises(HTTPException, match="Unit not found"):
+        api.replace_unit_user_assignments(
+            unit_b.id,
+            [EntityUserAssignmentInput(user_id=member_a.id, role="MAKER")],
+            organization_admin,
+            db,
+        )
+
+    api.replace_entity_assignments(db, org_a.id, "UNIT", unit_a.id, [], actor.id)
+    db.commit()
+    assert db.get(User, member_a.id) is not None
+    assert api.entity_assignment_rows(db, org_a.id, "UNIT", unit_a.id) == []
+    assert db.scalar(select(UserRoleScope).where(
+        UserRoleScope.user_id == member_a.id,
+        UserRoleScope.scope_type == "CONTRACTOR",
+        UserRoleScope.scope_id == contractor.id,
+    )) is not None

@@ -13,6 +13,7 @@ from app.models import (
     ComplianceInstance,
     ComplianceRule,
     ComplianceRuleVersion,
+    City,
     Contractor,
     ContractorSite,
     IndustryType,
@@ -282,6 +283,16 @@ def seed_baseline() -> None:
             ("Gujarat", "GJ"),
         ]:
             if not db.scalar(select(State).where(State.code == code)): db.add(State(name=name, code=code))
+        db.flush()
+        for state_code, city_name in [
+            ("TN", "Chennai"), ("TN", "Coimbatore"), ("TN", "Madurai"),
+            ("KA", "Bengaluru"), ("KA", "Mysuru"),
+            ("MH", "Mumbai"), ("MH", "Pune"), ("MH", "Nagpur"),
+            ("DL", "New Delhi"), ("TS", "Hyderabad"), ("GJ", "Ahmedabad"), ("GJ", "Surat"),
+        ]:
+            state = db.scalar(select(State).where(State.code == state_code))
+            if state and not db.scalar(select(City).where(City.state_id == state.id, City.name == city_name)):
+                db.add(City(state_id=state.id, name=city_name))
         for name, code in [
             ("Air Transport Services", "AIR_TRANSPORT"), ("Any Central Govt. Undertaking", "CENTRAL_GOVT"), ("Any Other Industry", "OTHER"),
             ("Audio-video Production", "AUDIO_VIDEO"), ("Banking / Insurance", "BANKING"), ("Beedi & Cigar", "BEEDI"),
@@ -312,9 +323,11 @@ def seed_baseline() -> None:
         user.platform_role = "MORAX_ADMIN"
         if not db.scalar(select(UserRoleScope).where(UserRoleScope.user_id == user.id, UserRoleScope.role == "ORGANIZATION_ADMIN", UserRoleScope.scope_id == organization.id)):
             db.add(UserRoleScope(user_id=user.id, role="ORGANIZATION_ADMIN", scope_type="ORGANIZATION", scope_id=organization.id))
-        # Normal startup is idempotent. `python seed.py` performs the explicit
-        # reset of known test tenants requested for the retained QA dataset.
-        seed_qa_demo_workspace(db, organization, preserve_demo_admin_id=user.id)
+        # Normal startup is idempotent. A platform-admin development reset
+        # deliberately suppresses automatic QA data recreation for that
+        # workspace, so it stays empty for manual scenario testing.
+        if not organization.development_reset_at:
+            seed_qa_demo_workspace(db, organization, preserve_demo_admin_id=user.id)
         db.commit()
     finally:
         db.close()

@@ -54,23 +54,34 @@ const SCOPE_TYPES = [
   "CONTRACTOR_SITE",
 ] as const;
 
+const roleScopeSchema = z.object({
+  role: z.enum(ROLES),
+  scope_type: z.enum(SCOPE_TYPES),
+  scope_id: z.string().min(1, "Select an assigned scope"),
+});
+const MODULE_PERMISSIONS = [
+  "dashboard.read", "compliance.read", "compliance.make", "compliance.check",
+  "documents.read", "documents.upload", "documents.verify", "reports.read",
+  "entities.read", "entities.manage", "users.manage",
+] as const;
+
 const createUserSchema = z.object({
   name: z.string().trim().min(2, "Enter a name").max(150),
   email: z.string().trim().email("Enter a valid email address"),
   mobile: z.string(),
   password: z.string().min(8, "Use at least 8 characters"),
+  password_confirmation: z.string(),
   active: z.boolean(),
+  role_scopes: z.array(roleScopeSchema).min(1, "Assign at least one role and access scope"),
+  module_permissions: z.array(z.string()),
+}).refine((values) => values.password === values.password_confirmation, {
+  message: "Passwords do not match",
+  path: ["password_confirmation"],
 });
 type CreateUserForm = z.infer<typeof createUserSchema>;
 
 const scopesSchema = z.object({
-  scopes: z.array(
-    z.object({
-      role: z.enum(ROLES),
-      scope_type: z.enum(SCOPE_TYPES),
-      scope_id: z.string().min(1, "Select an assigned scope"),
-    }),
-  ),
+  scopes: z.array(roleScopeSchema),
 });
 type ScopesForm = z.infer<typeof scopesSchema>;
 
@@ -160,9 +171,18 @@ export function UserAccessManager({
       email: "",
       mobile: "",
       password: "",
+      password_confirmation: "",
       active: true,
+      role_scopes: [],
+      module_permissions: [],
     },
   });
+  const createScopeFields = useFieldArray({
+    control: createForm.control,
+    name: "role_scopes",
+  });
+  const watchedCreateScopes = createForm.watch("role_scopes");
+  const createPermissions = createForm.watch("module_permissions");
   const scopeForm = useForm<ScopesForm>({
     resolver: zodResolver(scopesSchema),
     defaultValues: { scopes: [] },
@@ -177,12 +197,10 @@ export function UserAccessManager({
     await queryClient.invalidateQueries({ queryKey: ["users-page"] });
   };
   const createMutation = useMutation({
-    mutationFn: (values: CreateUserForm) =>
+    mutationFn: ({ password_confirmation: _passwordConfirmation, ...values }: CreateUserForm) =>
       morax.createUser({ ...values, mobile: values.mobile || null }),
     onSuccess: async () => {
-      setNotice(
-        "User created successfully. Assign a role scope to grant access.",
-      );
+      setNotice("User, password, roles, permissions, and access scope were created.");
       createForm.reset();
       setCreateOpen(false);
       await refreshUsers();
@@ -241,7 +259,15 @@ export function UserAccessManager({
   const addScope = () => {
     const unit = scopeOptions.data?.units[0];
     scopeFields.append({
-      role: "UNIT_MAKER",
+      role: unit ? "UNIT_MAKER" : "VIEWER",
+      scope_type: unit ? "UNIT" : "ORGANIZATION",
+      scope_id: unit ? String(unit.id) : user.organization_id,
+    });
+  };
+  const addCreateScope = () => {
+    const unit = scopeOptions.data?.units[0];
+    createScopeFields.append({
+      role: unit ? "UNIT_MAKER" : "VIEWER",
       scope_type: unit ? "UNIT" : "ORGANIZATION",
       scope_id: unit ? String(unit.id) : user.organization_id,
     });
@@ -322,10 +348,9 @@ export function UserAccessManager({
           const roles = row.original.roles.length ? row.original.roles : row.original.scopes.map((scope) => scope.role);
           return roles.length ? (
             <div className="user-chip-list">
-              {roles.slice(0, 2).map((role) => (
+              {roles.map((role) => (
                 <span className={`user-role-chip ${role.toLowerCase()}`} key={role}>{roleLabel(role)}</span>
               ))}
-              {roles.length > 2 && <span className="user-more-chip">+{roles.length - 2} more</span>}
             </div>
           ) : (
             <span className="muted">No role</span>
@@ -341,12 +366,11 @@ export function UserAccessManager({
           if (!scopes.length) return <span className="muted">No entities</span>;
           return (
             <div className="user-chip-list entity-scope-list">
-              {scopes.slice(0, 2).map((scope, index) => (
+              {scopes.map((scope, index) => (
                 <span className="user-entity-chip" title={`${roleLabel(scope.role)} - ${scopeLabel(scope)}`} key={`${scope.scope_type}-${scope.scope_id}-${index}`}>
-                  {scopeLabel(scope)}
+                  {roleLabel(scope.role)} · {scopeLabel(scope)}
                 </span>
               ))}
-              {scopes.length > 2 && <span className="user-more-chip">+{scopes.length - 2} more</span>}
             </div>
           );
         },
@@ -438,7 +462,8 @@ export function UserAccessManager({
           </h1>
           <p className="muted">
             Create users, save their complete role-scope list, and validate
-            their actual access with an audited temporary session.
+            their actual access with an audited temporary session. Set each
+            new user's password during creation so they can sign in immediately.
           </p>
         </div>
         <button
@@ -446,7 +471,16 @@ export function UserAccessManager({
           className="primary-action"
           onClick={() => {
             setNotice("");
-            createForm.reset();
+            const unit = scopeOptions.data?.units[0];
+            createForm.reset({
+              name: "", email: "", mobile: "", password: "", password_confirmation: "", active: true,
+              role_scopes: [{
+                role: unit ? "UNIT_MAKER" : "VIEWER",
+                scope_type: unit ? "UNIT" : "ORGANIZATION",
+                scope_id: unit ? String(unit.id) : user.organization_id,
+              }],
+              module_permissions: [],
+            });
             setCreateOpen(true);
           }}
         >
@@ -623,19 +657,68 @@ export function UserAccessManager({
                 <input {...createForm.register("mobile")} />
               </FormField>
               <FormField
-                label="Temporary password"
+                label="Password"
                 error={createForm.formState.errors.password?.message}
               >
-                <input
-                  type="password"
-                  autoComplete="new-password"
-                  {...createForm.register("password")}
-                />
+                <input type="password" autoComplete="new-password" {...createForm.register("password")} />
+              </FormField>
+              <FormField
+                label="Confirm password"
+                error={createForm.formState.errors.password_confirmation?.message}
+              >
+                <input type="password" autoComplete="new-password" {...createForm.register("password_confirmation")} />
               </FormField>
               <label className="inline">
                 <input type="checkbox" {...createForm.register("active")} />{" "}
                 Create as active
               </label>
+            </div>
+            <div className="form-section">
+              <h3>Roles and project/site access</h3>
+              {createScopeFields.fields.map((field, index) => {
+                const scopeType = watchedCreateScopes[index]?.scope_type || "UNIT";
+                const choices = candidates(scopeType);
+                return (
+                  <div className="scope-row" key={field.id}>
+                    <FormField label="Role">
+                      <select {...createForm.register(`role_scopes.${index}.role`)}>
+                        {ROLES.map((role) => <option key={role} value={role}>{roleLabel(role)}</option>)}
+                      </select>
+                    </FormField>
+                    <FormField label="Access type">
+                      <select {...createForm.register(`role_scopes.${index}.scope_type`, {
+                        onChange: (event) => {
+                          const choicesForType = candidates(event.target.value);
+                          createForm.setValue(`role_scopes.${index}.scope_id`, choicesForType[0] ? String(choicesForType[0].id) : "");
+                        },
+                      })}>
+                        {SCOPE_TYPES.map((type) => <option key={type} value={type}>{roleLabel(type)}</option>)}
+                      </select>
+                    </FormField>
+                    <FormField label="Project / site" error={createForm.formState.errors.role_scopes?.[index]?.scope_id?.message}>
+                      <select {...createForm.register(`role_scopes.${index}.scope_id`)} disabled={!choices.length}>
+                        {choices.map((choice) => <option key={String(choice.id)} value={String(choice.id)}>{String(choice.name)}</option>)}
+                      </select>
+                    </FormField>
+                    <button type="button" className="icon-action danger" aria-label="Remove role scope" onClick={() => createScopeFields.remove(index)}><X size={16} /></button>
+                  </div>
+                );
+              })}
+              <button type="button" className="secondary add-scope-button" onClick={addCreateScope}><Plus size={16} /> Add role scope</button>
+            </div>
+            <div className="form-section">
+              <h3>Additional module permissions</h3>
+              <div className="form-grid">
+                {MODULE_PERMISSIONS.map((permission) => (
+                  <label className="inline" key={permission}>
+                    <input
+                      type="checkbox"
+                      checked={createPermissions.includes(permission)}
+                      onChange={(event) => createForm.setValue("module_permissions", event.target.checked ? [...createPermissions, permission] : createPermissions.filter((item) => item !== permission))}
+                    /> {permission}
+                  </label>
+                ))}
+              </div>
             </div>
             <DrawerFooter
               onCancel={() => setCreateOpen(false)}

@@ -33,7 +33,7 @@ import {
   X,
 } from "lucide-react";
 import { morax } from "../api/morax";
-import type { Master, User } from "../api/morax";
+import type { EntityUserAssignment, Master, User } from "../api/morax";
 import { EmptyState, InlineError, LoadingSkeleton } from "./workspace-ui";
 
 type Row = Record<string, unknown>;
@@ -46,7 +46,10 @@ type EntityForm = {
   contractor_type: string;
   unit_id: string;
   contractor_id: string;
+  maker_user_id: string;
+  checker_user_id: string;
   state_id: string;
+  city_id: string;
   industry_type_id: string;
   other_industry_name: string;
   city: string;
@@ -64,10 +67,30 @@ type EntityForm = {
   female_workers: string;
   contact_email: string;
   contact_phone: string;
+  worker_limit: string;
   effective_date: string;
   compliance_start_date: string;
+  contract_start_date: string;
+  contract_end_date: string;
+  work_order_expiry_date: string;
   status: "ACTIVE" | "INACTIVE";
 };
+
+type AssignmentRole = "ADMIN" | "MAKER" | "CHECKER";
+type PendingEntityUser = { name: string; email: string; mobile: string; password: string };
+type FormAssignment = {
+  key: string;
+  user_id?: string;
+  role: AssignmentRole;
+  pending_user?: PendingEntityUser;
+};
+
+const assignmentKey = () =>
+  `assignment-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const scopeRoleFor = (kind: "units" | "contractors", role: AssignmentRole) =>
+  kind === "units"
+    ? ({ ADMIN: "UNIT_ADMIN", MAKER: "UNIT_MAKER", CHECKER: "UNIT_CHECKER" } as const)[role]
+    : ({ ADMIN: "CONTRACTOR_ADMIN", MAKER: "CONTRACTOR_MAKER", CHECKER: "CONTRACTOR_CHECKER" } as const)[role];
 
 const entityTableFeatures = tableFeatures({ rowSortingFeature });
 const EMPTY_ROWS: Row[] = [];
@@ -79,7 +102,10 @@ const blankEntity = (): EntityForm => ({
   contractor_type: "",
   unit_id: "",
   contractor_id: "",
+  maker_user_id: "",
+  checker_user_id: "",
   state_id: "",
+  city_id: "",
   industry_type_id: "",
   other_industry_name: "",
   city: "",
@@ -97,8 +123,12 @@ const blankEntity = (): EntityForm => ({
   female_workers: "0",
   contact_email: "",
   contact_phone: "",
+  worker_limit: "",
   effective_date: "",
   compliance_start_date: new Date().toISOString().slice(0, 10),
+  contract_start_date: "",
+  contract_end_date: "",
+  work_order_expiry_date: "",
   status: "ACTIVE",
 });
 
@@ -109,7 +139,10 @@ const entitySchema = z.object({
   contractor_type: z.string(),
   unit_id: z.string(),
   contractor_id: z.string(),
+  maker_user_id: z.string(),
+  checker_user_id: z.string(),
   state_id: z.string(),
+  city_id: z.string(),
   industry_type_id: z.string(),
   other_industry_name: z.string(),
   city: z.string(),
@@ -127,8 +160,12 @@ const entitySchema = z.object({
   female_workers: z.string().regex(/^\d+$/, "Use a whole number"),
   contact_email: z.string(),
   contact_phone: z.string(),
+  worker_limit: z.string().regex(/^\d*$/, "Use a whole number"),
   effective_date: z.string(),
   compliance_start_date: z.string(),
+  contract_start_date: z.string(),
+  contract_end_date: z.string(),
+  work_order_expiry_date: z.string(),
   status: z.enum(["ACTIVE", "INACTIVE"]),
 });
 
@@ -167,12 +204,12 @@ function asForm(row: Row): EntityForm {
 function requestBody(values: EntityForm, kind: EntityKind) {
   const numericFields =
     kind === "units"
-      ? ["male_employees", "female_employees"]
+      ? ["male_employees", "female_employees", "worker_limit"]
       : ["male_workers", "female_workers"];
   return Object.fromEntries(
     Object.entries(values).map(([key, value]) => [
       key,
-      numericFields.includes(key) ? Number(value || 0) : value || null,
+      key === "worker_limit" ? (value === "" ? null : Number(value)) : numericFields.includes(key) ? Number(value || 0) : value || null,
     ]),
   );
 }
@@ -204,6 +241,19 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Row | null>(null);
   const [notice, setNotice] = useState("");
+  const [entityAssignments, setEntityAssignments] = useState<FormAssignment[]>([]);
+  const [newUserOpen, setNewUserOpen] = useState(false);
+  const [newEntityUser, setNewEntityUser] = useState<{
+    name: string;
+    email: string;
+    mobile: string;
+    password: string;
+    password_confirmation: string;
+    role: AssignmentRole;
+  }>({ name: "", email: "", mobile: "", password: "", password_confirmation: "", role: "MAKER" });
+  const [contractorFiles, setContractorFiles] = useState<Record<string, File | null>>({
+    WORK_ORDER: null, REGISTRATION_CERTIFICATE: null, PF: null, ESI: null, LABOUR_LICENCE: null,
+  });
 
   const sort = sorting[0];
   const listFilters = useMemo(
@@ -236,31 +286,78 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
   const optionsQuery = useQuery({
     queryKey: ["entity-form-options"],
     queryFn: async () => {
-      const [states, industries, units, contractors] = await Promise.all([
+      const [states, industries, units, contractors, users] = await Promise.all([
         morax.states(),
         morax.industries(),
         morax.unitsPage({ page: "1", page_size: "100" }),
         morax.contractors(),
+        morax.users(),
       ]);
-      return { states, industries, units: units.items, contractors };
+      return { states, industries, units: units.items, contractors, users };
     },
     staleTime: 5 * 60_000,
+  });
+  const entityAssignmentsQuery = useQuery({
+    queryKey: ["entity-user-assignments", kind, editing?.id],
+    queryFn: () =>
+      kind === "units"
+        ? morax.unitUserAssignments(String(editing?.id))
+        : morax.contractorUserAssignments(String(editing?.id)),
+    enabled: canManage && formOpen && Boolean(editing?.id) && kind !== "sites",
   });
 
   const form = useForm<EntityForm>({
     resolver: zodResolver(entitySchema),
     defaultValues: blankEntity(),
   });
+  const selectedStateId = form.watch("state_id");
+  const selectedPrincipalEmployerId = form.watch("unit_id");
   const selectedIndustryId = form.watch("industry_type_id");
+  const citiesQuery = useQuery({
+    queryKey: ["cities", selectedStateId],
+    queryFn: () => morax.cities(selectedStateId),
+    enabled: Boolean(selectedStateId),
+    staleTime: 5 * 60_000,
+  });
   const otherIndustryId = optionsQuery.data?.industries.find(
     (industry) => industry.code.toUpperCase() === "OTHER",
   )?.id;
   const isOtherIndustry = selectedIndustryId === otherIndustryId;
+  const selectedPrincipalEmployer = optionsQuery.data?.units.find((unit) => String(unit.id) === selectedPrincipalEmployerId);
+  const requestedWorkers = Number(form.watch("male_workers") || 0) + Number(form.watch("female_workers") || 0);
+  const allocatedWorkers = (optionsQuery.data?.contractors ?? [])
+    .filter((contractor) => String(contractor.unit_id ?? "") === selectedPrincipalEmployerId && String(contractor.id) !== String(editing?.id ?? ""))
+    .reduce((total, contractor) => total + Number(contractor.total_workers ?? 0), 0);
+  const workerLimit = selectedPrincipalEmployer?.worker_limit == null ? null : Number(selectedPrincipalEmployer.worker_limit);
+  const remainingWorkers = workerLimit == null ? null : workerLimit - allocatedWorkers;
+  const availableUsers = (optionsQuery.data?.users ?? []).filter(
+    (person) => person.active !== false,
+  );
+
+  useEffect(() => {
+    if (!entityAssignmentsQuery.data) return;
+    setEntityAssignments(entityAssignmentsQuery.data.map((assignment) => ({
+      key: assignmentKey(),
+      user_id: assignment.user_id,
+      role: assignment.role,
+    })));
+  }, [entityAssignmentsQuery.data]);
+
+  useEffect(() => {
+    if (kind !== "contractors" || !selectedPrincipalEmployerId) return;
+    const employer = optionsQuery.data?.units.find((unit) => String(unit.id) === selectedPrincipalEmployerId);
+    if (!employer) return;
+    form.setValue("state_id", String(employer.state_id ?? ""));
+    form.setValue("city_id", String(employer.city_id ?? ""));
+    form.setValue("city", String(employer.city ?? ""));
+  }, [form, kind, optionsQuery.data?.units, selectedPrincipalEmployerId]);
 
   const invalidateEntities = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["entity-list", kind] }),
       queryClient.invalidateQueries({ queryKey: ["entity-form-options"] }),
+      queryClient.invalidateQueries({ queryKey: ["entity-user-assignments"] }),
+      queryClient.invalidateQueries({ queryKey: ["users-page"] }),
       queryClient.invalidateQueries({ queryKey: ["dashboard-overview"] }),
     ]);
   };
@@ -273,20 +370,92 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
       if ((kind === "units" || kind === "sites") && !values.industry_type_id) {
         throw new Error("Select an industry type before saving");
       }
+      if (kind === "contractors" && !values.unit_id) {
+        throw new Error("Select the Principal Employer before saving");
+      }
       if (kind === "sites" && !values.contractor_id) {
         throw new Error("Select a contractor before saving");
       }
+      const stagedAssignmentKeys = new Set<string>();
+      for (const assignment of entityAssignments) {
+        const assignmentUserKey = assignment.pending_user
+          ? assignment.pending_user.email.trim().toLowerCase()
+          : assignment.user_id;
+        if (!assignmentUserKey) {
+          throw new Error("Select a user for every assignment.");
+        }
+        const stagedAssignmentKey = `${assignmentUserKey}:${assignment.role}`;
+        if (stagedAssignmentKeys.has(stagedAssignmentKey)) {
+          throw new Error("A user can be assigned to the same role only once.");
+        }
+        stagedAssignmentKeys.add(stagedAssignmentKey);
+        if (!assignment.pending_user) continue;
+        const duplicate = optionsQuery.data?.users.some(
+          (person) => person.email.toLowerCase() === assignment.pending_user?.email.trim().toLowerCase(),
+        );
+        if (duplicate) {
+          throw new Error(`${assignment.pending_user.email} already has an account. Select the existing user instead.`);
+        }
+      }
       const body = requestBody(values, kind);
       const id = editing ? String(editing.id) : "";
+      let saved: Record<string, unknown>;
       if (kind === "units") {
-        return id ? morax.updateUnit(id, body) : morax.createUnit(body);
-      }
-      if (kind === "contractors") {
-        return id
+        saved = await (id ? morax.updateUnit(id, body) : morax.createUnit(body)) as Record<string, unknown>;
+      } else if (kind === "contractors") {
+        saved = await (id
           ? morax.updateContractor(id, body)
-          : morax.createContractor(body);
+          : morax.createContractor(body)) as Record<string, unknown>;
+        const contractorId = String(saved.id);
+        const uploads: Promise<unknown>[] = [];
+        for (const [documentType, file] of Object.entries(contractorFiles)) {
+          if (file) uploads.push(morax.uploadContractorDocument(contractorId, documentType, file));
+        }
+        await Promise.all(uploads);
+      } else {
+        return id ? morax.updateSite(id, body) : morax.createSite(body);
       }
-      return id ? morax.updateSite(id, body) : morax.createSite(body);
+
+      const entityId = String(saved.id);
+      const assignments: EntityUserAssignment[] = [];
+      const createdPendingUsers = new Map<string, string>();
+      const assignmentKeys = new Set<string>();
+      for (const assignment of entityAssignments) {
+        let userId = assignment.user_id;
+        if (assignment.pending_user) {
+          const email = assignment.pending_user.email.trim().toLowerCase();
+          userId = createdPendingUsers.get(email);
+          if (!userId) {
+            const created = await morax.createUser({
+              ...assignment.pending_user,
+              mobile: assignment.pending_user.mobile || null,
+              active: true,
+              role_scopes: [{
+                role: scopeRoleFor(kind, assignment.role),
+                scope_type: kind === "units" ? "UNIT" : "CONTRACTOR",
+                scope_id: entityId,
+              }],
+              module_permissions: [],
+            });
+            userId = created.id;
+            createdPendingUsers.set(email, userId);
+          }
+        }
+        if (userId) {
+          const assignmentKey = `${userId}:${assignment.role}`;
+          if (assignmentKeys.has(assignmentKey)) {
+            throw new Error("A user can be assigned to the same role only once.");
+          }
+          assignmentKeys.add(assignmentKey);
+          assignments.push({ user_id: userId, role: assignment.role });
+        }
+      }
+      if (kind === "units") {
+        await morax.replaceUnitUserAssignments(entityId, assignments);
+      } else {
+        await morax.replaceContractorUserAssignments(entityId, assignments);
+      }
+      return saved;
     },
     onSuccess: async () => {
       setNotice(
@@ -324,6 +493,10 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
     setNotice("");
     setEditing(null);
     form.reset(blankEntity());
+    setEntityAssignments([]);
+    setNewUserOpen(false);
+    setNewEntityUser({ name: "", email: "", mobile: "", password: "", password_confirmation: "", role: "MAKER" });
+    setContractorFiles({ WORK_ORDER: null, REGISTRATION_CERTIFICATE: null, PF: null, ESI: null, LABOUR_LICENCE: null });
     setFormOpen(true);
   };
   const openEdit = useCallback(
@@ -331,6 +504,9 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
       setNotice("");
       setEditing(row);
       form.reset(asForm(row));
+      setEntityAssignments([]);
+      setNewUserOpen(false);
+      setContractorFiles({ WORK_ORDER: null, REGISTRATION_CERTIFICATE: null, PF: null, ESI: null, LABOUR_LICENCE: null });
       setFormOpen(true);
     },
     [form],
@@ -338,6 +514,10 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
   const closeForm = () => {
     setEditing(null);
     form.reset(blankEntity());
+    setEntityAssignments([]);
+    setNewUserOpen(false);
+    setNewEntityUser({ name: "", email: "", mobile: "", password: "", password_confirmation: "", role: "MAKER" });
+    setContractorFiles({ WORK_ORDER: null, REGISTRATION_CERTIFICATE: null, PF: null, ESI: null, LABOUR_LICENCE: null });
     setFormOpen(false);
   };
 
@@ -664,9 +844,9 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                       />
                     </Field>
                   ) : (
-                    <Field label="Parent unit">
-                      <select {...form.register("unit_id")}>
-                        <option value="">Not linked</option>
+                    <Field label={kind === "contractors" ? "Principal Employer" : "Parent unit"}>
+                      <select {...form.register("unit_id")} required={kind === "contractors"}>
+                        <option value="">{kind === "contractors" ? "Select Principal Employer" : "Not linked"}</option>
                         {optionsQuery.data?.units.map((unit) => (
                           <option key={String(unit.id)} value={String(unit.id)}>
                             {text(unit, "name")}
@@ -708,7 +888,7 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                     label="State"
                     error={form.formState.errors.state_id?.message}
                   >
-                    <select {...form.register("state_id")}>
+                    <select {...form.register("state_id")} disabled={kind === "contractors"}>
                       <option value="">
                         {kind === "contractors"
                           ? "Not configured"
@@ -754,12 +934,14 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                       {...form.register("compliance_start_date")}
                     />
                   </Field>
-                  <Field label="Status">
-                    <select {...form.register("status")}>
-                      <option value="ACTIVE">Active</option>
-                      <option value="INACTIVE">Inactive</option>
-                    </select>
-                  </Field>
+                  {kind === "sites" && (
+                    <Field label="Status">
+                      <select {...form.register("status")}>
+                        <option value="ACTIVE">Active</option>
+                        <option value="INACTIVE">Inactive</option>
+                      </select>
+                    </Field>
+                  )}
                   <Field
                     label={kind === "units" ? "Male employees" : "Male workers"}
                     error={
@@ -796,6 +978,22 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                       )}
                     />
                   </Field>
+                  {kind === "units" && (
+                    <>
+                      <Field label="Total employees">
+                        <input readOnly value={Number(form.watch("male_employees") || 0) + Number(form.watch("female_employees") || 0)} />
+                      </Field>
+                      <Field label="Worker limit for Principal Employer">
+                        <input type="number" min="0" {...form.register("worker_limit")} placeholder="No limit when blank" />
+                      </Field>
+                    </>
+                  )}
+                  {kind !== "units" && (
+                    <Field label="Total workers">
+                      <input readOnly value={requestedWorkers} />
+                      {kind === "contractors" && selectedPrincipalEmployerId && <small className="muted">Principal Employer limit: {workerLimit == null ? "Not configured" : workerLimit}; allocated: {allocatedWorkers}; remaining: {remainingWorkers == null ? "Unlimited" : remainingWorkers}</small>}
+                    </Field>
+                  )}
                 </div>
               </div>
 
@@ -803,7 +1001,10 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                 <h3>Contact and registration</h3>
                 <div className="form-grid">
                   <Field label="City">
-                    <input {...form.register("city")} />
+                    <select {...form.register("city_id")} disabled={!selectedStateId || kind === "contractors"}>
+                      <option value="">{selectedStateId ? "Select city" : "Select State first"}</option>
+                      {citiesQuery.data?.map((city: Master) => <option key={city.id} value={city.id}>{city.name}</option>)}
+                    </select>
                   </Field>
                   <Field label="Pincode">
                     <input {...form.register("pincode")} />
@@ -829,23 +1030,133 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                   <Field label="Effective date">
                     <input type="date" {...form.register("effective_date")} />
                   </Field>
+                  {kind === "contractors" && (
+                    <>
+                      <Field label="Contract start date"><input type="date" {...form.register("contract_start_date")} /></Field>
+                      <Field label="Contract end date"><input type="date" {...form.register("contract_end_date")} /></Field>
+                      <Field label="Work order expiry"><input type="date" {...form.register("work_order_expiry_date")} /></Field>
+                    </>
+                  )}
                   <Field label="Address" wide>
                     <textarea rows={3} {...form.register("address")} />
                   </Field>
-                  <Field label="Registration identifiers" wide>
-                    <textarea
-                      rows={2}
-                      {...form.register("registration_identifiers")}
-                    />
-                  </Field>
-                  <Field label="Applicable regulations" wide>
-                    <textarea
-                      rows={2}
-                      {...form.register("applicable_regulations")}
-                    />
-                  </Field>
+                  {kind === "sites" && (
+                    <>
+                      <Field label="Registration identifiers" wide>
+                        <textarea
+                          rows={2}
+                          {...form.register("registration_identifiers")}
+                        />
+                      </Field>
+                      <Field label="Applicable regulations" wide>
+                        <textarea
+                          rows={2}
+                          {...form.register("applicable_regulations")}
+                        />
+                      </Field>
+                    </>
+                  )}
                 </div>
               </div>
+              {kind !== "sites" && (
+                <div className="form-section">
+                  <div className="action-row">
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={!availableUsers.length}
+                        onClick={() => setEntityAssignments((current) => [
+                          ...current,
+                          {
+                            key: assignmentKey(),
+                            user_id: availableUsers[0]?.id,
+                            role: "MAKER",
+                          },
+                        ])}
+                      >
+                        Assign existing user
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={() => {
+                          setNewEntityUser({ name: "", email: "", mobile: "", password: "", password_confirmation: "", role: "MAKER" });
+                          setNewUserOpen(true);
+                        }}
+                      >
+                        Create new user
+                      </button>
+                  </div>
+                  {entityAssignments.length === 0 ? (
+                    <p className="muted">No users are assigned yet.</p>
+                  ) : (
+                    <div className="scope-list">
+                      {entityAssignments.map((assignment, index) => (
+                        <div className="scope-row" key={assignment.key}>
+                          {assignment.pending_user ? (
+                            <div className="wide">
+                              <b>{assignment.pending_user.name}</b>
+                              <small className="muted">
+                                {assignment.pending_user.email} — account and password will be created when this {meta.singular} is saved.
+                              </small>
+                            </div>
+                          ) : (
+                            <Field label="User">
+                              <select
+                                value={assignment.user_id ?? ""}
+                                onChange={(event) => setEntityAssignments((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, user_id: event.target.value } : item))}
+                              >
+                                {availableUsers.map((person) => (
+                                  <option key={person.id} value={person.id}>
+                                    {person.name} — {person.email}
+                                  </option>
+                                ))}
+                              </select>
+                            </Field>
+                          )}
+                          <Field label="Role">
+                            <select
+                              value={assignment.role}
+                              onChange={(event) => setEntityAssignments((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, role: event.target.value as AssignmentRole } : item))}
+                            >
+                              <option value="ADMIN">Admin</option>
+                              <option value="MAKER">Maker</option>
+                              <option value="CHECKER">Checker</option>
+                            </select>
+                          </Field>
+                          <button
+                            type="button"
+                            className="icon-action danger"
+                            aria-label="Remove user assignment"
+                            title="Remove assignment"
+                            onClick={() => setEntityAssignments((current) => current.filter((item) => item.key !== assignment.key))}
+                          >
+                            <Trash2 size={16} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {kind === "contractors" && (
+                <div className="form-section">
+                  <h3>Contractor documents</h3>
+                  <p className="muted">Files selected here are saved immediately after the contractor record succeeds.</p>
+                  <div className="form-grid">
+                    {[
+                      ["WORK_ORDER", "Work order upload"],
+                      ["REGISTRATION_CERTIFICATE", "Registration certificate"],
+                      ["PF", "PF document"], ["ESI", "ESI document"],
+                      ["LABOUR_LICENCE", "Labour licence"],
+                    ].map(([type, label]) => (
+                      <Field label={label} key={type}>
+                        <input type="file" accept=".pdf,.png,.jpg,.jpeg,.xlsx,.xls,.doc,.docx" onChange={(event) => setContractorFiles((current) => ({ ...current, [type]: event.target.files?.[0] ?? null }))} />
+                      </Field>
+                    ))}
+                  </div>
+                </div>
+              )}
               <footer className="drawer-footer">
                 <button type="button" className="secondary" onClick={closeForm}>
                   Cancel
@@ -863,6 +1174,85 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                 </button>
               </footer>
             </form>
+            {newUserOpen && kind !== "sites" && (
+              <div
+                className="crud-drawer-backdrop"
+                role="presentation"
+                onMouseDown={() => setNewUserOpen(false)}
+              >
+                <section
+                  className="crud-drawer assignment-user-drawer"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="new-entity-user-title"
+                  onMouseDown={(event) => event.stopPropagation()}
+                >
+                  <div className="drawer-heading">
+                    <div>
+                      <span className="drawer-icon"><UsersRound size={19} /></span>
+                      <div>
+                        <h2 id="new-entity-user-title">Create and assign user</h2>
+                        <p>The account is created when you save this {meta.singular}. Set a password so the user can sign in immediately.</p>
+                      </div>
+                    </div>
+                    <button type="button" className="icon-action" onClick={() => setNewUserOpen(false)} aria-label="Close user form"><X size={18} /></button>
+                  </div>
+                  <form
+                    className="entity-form"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      if (newEntityUser.password !== newEntityUser.password_confirmation) {
+                        setNotice("User passwords do not match.");
+                        return;
+                      }
+                      setEntityAssignments((current) => [
+                        ...current,
+                        {
+                          key: assignmentKey(),
+                          role: newEntityUser.role,
+                          pending_user: {
+                            name: newEntityUser.name.trim(),
+                            email: newEntityUser.email.trim(),
+                            mobile: newEntityUser.mobile.trim(),
+                            password: newEntityUser.password,
+                          },
+                        },
+                      ]);
+                      setNewUserOpen(false);
+                    }}
+                  >
+                    <div className="form-grid">
+                      <Field label="Name">
+                        <input value={newEntityUser.name} onChange={(event) => setNewEntityUser((current) => ({ ...current, name: event.target.value }))} required autoFocus />
+                      </Field>
+                      <Field label="Email">
+                        <input type="email" value={newEntityUser.email} onChange={(event) => setNewEntityUser((current) => ({ ...current, email: event.target.value }))} required />
+                      </Field>
+                      <Field label="Mobile">
+                        <input value={newEntityUser.mobile} onChange={(event) => setNewEntityUser((current) => ({ ...current, mobile: event.target.value }))} />
+                      </Field>
+                      <Field label="Password">
+                        <input type="password" value={newEntityUser.password} onChange={(event) => setNewEntityUser((current) => ({ ...current, password: event.target.value }))} minLength={8} autoComplete="new-password" required />
+                      </Field>
+                      <Field label="Confirm password">
+                        <input type="password" value={newEntityUser.password_confirmation} onChange={(event) => setNewEntityUser((current) => ({ ...current, password_confirmation: event.target.value }))} minLength={8} autoComplete="new-password" required />
+                      </Field>
+                      <Field label="Role">
+                        <select value={newEntityUser.role} onChange={(event) => setNewEntityUser((current) => ({ ...current, role: event.target.value as AssignmentRole }))}>
+                          <option value="ADMIN">Admin</option>
+                          <option value="MAKER">Maker</option>
+                          <option value="CHECKER">Checker</option>
+                        </select>
+                      </Field>
+                    </div>
+                    <footer className="drawer-footer">
+                      <button type="button" className="secondary" onClick={() => setNewUserOpen(false)}>Cancel</button>
+                      <button type="submit" className="primary-action">Add assignment</button>
+                    </footer>
+                  </form>
+                </section>
+              </div>
+            )}
           </section>
         </div>
       )}

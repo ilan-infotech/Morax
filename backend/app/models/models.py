@@ -37,6 +37,9 @@ class Organization(Timestamped, Base):
     primary_contact_name: Mapped[str | None] = mapped_column(String(150))
     created_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
     updated_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+    # A development reset must not be followed by the automatic QA demo seed
+    # on the next application start.
+    development_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class State(Base):
@@ -44,6 +47,15 @@ class State(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     code: Mapped[str] = mapped_column(String(20), unique=True, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class City(Base):
+    __tablename__ = "cities"
+    __table_args__ = (UniqueConstraint("state_id", "name", name="uq_city_state_name"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    state_id: Mapped[str] = mapped_column(ForeignKey("states.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
@@ -70,6 +82,7 @@ class Unit(Timestamped, Base):
     # controlled industry_type_id, so it remains driven by Compliance Master.
     other_industry_name: Mapped[str | None] = mapped_column(String(150))
     state_id: Mapped[str] = mapped_column(ForeignKey("states.id"), nullable=False)
+    city_id: Mapped[str | None] = mapped_column(ForeignKey("cities.id"))
     city: Mapped[str | None] = mapped_column(String(100))
     pincode: Mapped[str | None] = mapped_column(String(20))
     address: Mapped[str | None] = mapped_column(Text)
@@ -78,6 +91,9 @@ class Unit(Timestamped, Base):
     pan: Mapped[str | None] = mapped_column(String(20))
     lin: Mapped[str | None] = mapped_column(String(30))
     employer_name: Mapped[str | None] = mapped_column(String(250))
+    contact_email: Mapped[str | None] = mapped_column(String(255))
+    contact_phone: Mapped[str | None] = mapped_column(String(50))
+    worker_limit: Mapped[int | None] = mapped_column(Integer)
     applicable_regulations: Mapped[str | None] = mapped_column(Text)
     male_employees: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     female_employees: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -94,6 +110,8 @@ class Contractor(Timestamped, Base):
     __table_args__ = (UniqueConstraint("organization_id", "code", name="uq_contractor_org_code"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
     organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    # Kept as unit_id for backwards-compatible storage; it is the Principal
+    # Employer in the product/API terminology.
     unit_id: Mapped[str | None] = mapped_column(ForeignKey("units.id"), index=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     code: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -101,6 +119,7 @@ class Contractor(Timestamped, Base):
     industry_type_id: Mapped[str | None] = mapped_column(ForeignKey("industry_types.id"))
     other_industry_name: Mapped[str | None] = mapped_column(String(150))
     state_id: Mapped[str | None] = mapped_column(ForeignKey("states.id"))
+    city_id: Mapped[str | None] = mapped_column(ForeignKey("cities.id"))
     city: Mapped[str | None] = mapped_column(String(100))
     contact_email: Mapped[str | None] = mapped_column(String(255))
     contact_phone: Mapped[str | None] = mapped_column(String(50))
@@ -115,6 +134,9 @@ class Contractor(Timestamped, Base):
     female_workers: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     effective_date: Mapped[date | None] = mapped_column(Date)
     compliance_start_date: Mapped[date | None] = mapped_column(Date)
+    contract_start_date: Mapped[date | None] = mapped_column(Date)
+    contract_end_date: Mapped[date | None] = mapped_column(Date)
+    work_order_expiry_date: Mapped[date | None] = mapped_column(Date)
     status: Mapped[str] = mapped_column(String(30), default="ACTIVE", nullable=False)
 
     @property
@@ -135,6 +157,7 @@ class ContractorSite(Timestamped, Base):
     industry_type_id: Mapped[str] = mapped_column(ForeignKey("industry_types.id"), nullable=False)
     other_industry_name: Mapped[str | None] = mapped_column(String(150))
     state_id: Mapped[str] = mapped_column(ForeignKey("states.id"), nullable=False)
+    city_id: Mapped[str | None] = mapped_column(ForeignKey("cities.id"))
     city: Mapped[str | None] = mapped_column(String(100))
     pincode: Mapped[str | None] = mapped_column(String(20))
     address: Mapped[str | None] = mapped_column(Text)
@@ -166,6 +189,22 @@ class User(Timestamped, Base):
     platform_role: Mapped[str | None] = mapped_column(String(40), index=True)
 
 
+class UserActivation(Base):
+    """One-time, hashed account-activation credentials.
+
+    The browser receives the raw token only through the activation link. The
+    database stores its SHA-256 digest, never a recoverable password or token.
+    """
+    __tablename__ = "user_activations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class UserRoleScope(Timestamped, Base):
     __tablename__ = "user_role_scopes"
     __table_args__ = (UniqueConstraint("user_id", "role", "scope_type", "scope_id", name="uq_user_role_scope"),)
@@ -174,6 +213,14 @@ class UserRoleScope(Timestamped, Base):
     role: Mapped[str] = mapped_column(String(40), nullable=False)
     scope_type: Mapped[str] = mapped_column(String(40), nullable=False)
     scope_id: Mapped[str] = mapped_column(String(36), nullable=False)
+
+
+class UserPermissionGrant(Timestamped, Base):
+    __tablename__ = "user_permission_grants"
+    __table_args__ = (UniqueConstraint("user_id", "permission", name="uq_user_permission_grant"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    permission: Mapped[str] = mapped_column(String(80), nullable=False)
 
 
 class AuthSession(Base):
@@ -220,6 +267,8 @@ class ComplianceRuleVersion(Timestamped, Base):
     consequence_or_penalty: Mapped[str | None] = mapped_column(Text)
     central_or_state: Mapped[str | None] = mapped_column(String(30))
     frequency: Mapped[str] = mapped_column(String(30), nullable=False)
+    # JSON list of month numbers (1-12). Empty means all normal periods.
+    applicable_months_json: Mapped[str | None] = mapped_column(Text)
     due_date_rule: Mapped[str] = mapped_column(String(50), default="FIXED_DAY_OF_MONTH", nullable=False)
     due_date_offset: Mapped[int | None] = mapped_column(Integer)
     due_date_anchor: Mapped[str | None] = mapped_column(String(50))
@@ -360,6 +409,22 @@ class ComplianceEvidence(Timestamped, Base):
     verification_reason: Mapped[str | None] = mapped_column(Text)
     verified_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ContractorDocument(Timestamped, Base):
+    __tablename__ = "contractor_documents"
+    __table_args__ = (UniqueConstraint("contractor_id", "document_type", "version", name="uq_contractor_document_version"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    contractor_id: Mapped[str] = mapped_column(ForeignKey("contractors.id", ondelete="CASCADE"), nullable=False, index=True)
+    document_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    stored_filename: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    content_type: Mapped[str | None] = mapped_column(String(150))
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64))
+    uploaded_by_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="ACTIVE", nullable=False)
 
 
 class ComplianceComment(Base):

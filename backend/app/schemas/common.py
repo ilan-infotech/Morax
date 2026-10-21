@@ -45,6 +45,11 @@ class PasswordChangeRequest(BaseModel):
     new_password: str = Field(min_length=8)
 
 
+class AccountActivationInput(BaseModel):
+    token: str = Field(min_length=32, max_length=512)
+    password: str = Field(min_length=8, max_length=256)
+
+
 class OrganizationInput(BaseModel):
     name: str = Field(min_length=2, max_length=200)
     legal_name: str | None = None
@@ -74,10 +79,20 @@ class PlatformOrganizationInput(BaseModel):
     primary_contact_phone: str | None = Field(default=None, max_length=50)
     compliance_start_date: date | None = None
     status: str = "ACTIVE"
+    # Required only by the organization-create endpoint. They stay optional
+    # here so an organization edit does not overwrite its administrator
+    # account or password.
+    organization_admin_name: str | None = Field(default=None, min_length=2, max_length=150)
+    organization_admin_email: EmailStr | None = None
+    organization_admin_password: str | None = Field(default=None, min_length=8, max_length=256, repr=False)
 
 
 class OrganizationStatusInput(BaseModel):
     status: str = Field(pattern="^(ACTIVE|INACTIVE)$")
+
+
+class DevelopmentResetInput(BaseModel):
+    confirmation_code: str = Field(min_length=2, max_length=50)
 
 
 class UnitInput(BaseModel):
@@ -87,6 +102,7 @@ class UnitInput(BaseModel):
     industry_type_id: str
     other_industry_name: str | None = Field(default=None, max_length=150)
     state_id: str
+    city_id: str | None = None
     city: str | None = None
     pincode: str | None = None
     address: str | None = None
@@ -95,6 +111,9 @@ class UnitInput(BaseModel):
     pan: str | None = None
     lin: str | None = None
     employer_name: str | None = None
+    contact_email: EmailStr | None = None
+    contact_phone: str | None = None
+    worker_limit: int | None = Field(default=None, ge=0)
     applicable_regulations: str | None = None
     male_employees: int = Field(default=0, ge=0)
     female_employees: int = Field(default=0, ge=0)
@@ -105,11 +124,13 @@ class UnitInput(BaseModel):
 class ContractorInput(BaseModel):
     name: str = Field(min_length=2, max_length=200)
     code: str = Field(min_length=2, max_length=50)
-    unit_id: str | None = None
+    unit_id: str
     contractor_type: str | None = None
     industry_type_id: str | None = None
     other_industry_name: str | None = Field(default=None, max_length=150)
+    # Location is copied from the selected Principal Employer by the server.
     state_id: str | None = None
+    city_id: str | None = None
     contact_email: EmailStr | None = None
     contact_phone: str | None = None
     address: str | None = None
@@ -124,7 +145,20 @@ class ContractorInput(BaseModel):
     female_workers: int = Field(default=0, ge=0)
     effective_date: date | None = None
     compliance_start_date: date | None = None
+    contract_start_date: date | None = None
+    contract_end_date: date | None = None
+    work_order_expiry_date: date | None = None
+    maker_user_id: str | None = Field(default=None, exclude=True)
+    checker_user_id: str | None = Field(default=None, exclude=True)
     status: str = "ACTIVE"
+
+    @model_validator(mode="after")
+    def contract_dates_are_in_order(self) -> "ContractorInput":
+        if self.contract_end_date and not self.contract_start_date:
+            raise ValueError("Contract Start Date is required when Contract End Date is supplied")
+        if self.contract_start_date and self.contract_end_date and self.contract_end_date < self.contract_start_date:
+            raise ValueError("Contract End Date cannot be earlier than Contract Start Date")
+        return self
 
 
 class ContractorSiteInput(BaseModel):
@@ -136,6 +170,7 @@ class ContractorSiteInput(BaseModel):
     industry_type_id: str
     other_industry_name: str | None = Field(default=None, max_length=150)
     state_id: str
+    city_id: str | None = None
     city: str | None = None
     pincode: str | None = None
     address: str | None = None
@@ -154,7 +189,6 @@ class UserInput(BaseModel):
     name: str = Field(min_length=2, max_length=150)
     email: EmailStr
     mobile: str | None = None
-    password: str = Field(min_length=8)
     active: bool = True
 
 
@@ -168,6 +202,20 @@ class RoleScopeInput(BaseModel):
     role: str
     scope_type: str
     scope_id: str
+
+
+class UserCreateInput(UserInput):
+    """Provision a user, password, and authorization choices in one transaction."""
+    password: str = Field(min_length=8, max_length=256, repr=False)
+    role_scopes: list[RoleScopeInput] = Field(default_factory=list)
+    module_permissions: list[str] = Field(default_factory=list)
+
+
+class EntityUserAssignmentInput(BaseModel):
+    user_id: str
+    # Entity forms use the friendly roles; the API maps these to existing
+    # concrete RBAC roles for a Unit or Contractor scope.
+    role: str = Field(pattern="^(ADMIN|MAKER|CHECKER)$")
 
 
 class ActivityInput(BaseModel):
@@ -185,6 +233,10 @@ class AssignmentInput(BaseModel):
 
 class WorkflowDecision(BaseModel):
     comment: str = Field(min_length=1, max_length=4000)
+    row_version: int
+
+
+class SubmissionInput(BaseModel):
     row_version: int
 
 
@@ -218,6 +270,7 @@ class RuleInput(BaseModel):
     state_id: str | None = None
     industry_type_id: str | None = None
     frequency: str
+    applicable_months: list[int] = Field(default_factory=list)
     due_date_rule: str = "FIXED_DAY_OF_MONTH"
     due_date_offset: int | None = None
     due_date_anchor: str | None = None
@@ -252,6 +305,14 @@ class RuleInput(BaseModel):
         if self.effective_to and self.effective_to < self.effective_from:
             raise ValueError("Effective To cannot be earlier than Effective From")
         return self
+
+    @field_validator("applicable_months")
+    @classmethod
+    def months_are_valid(cls, values: list[int]) -> list[int]:
+        normalized = sorted(set(values))
+        if any(month < 1 or month > 12 for month in normalized):
+            raise ValueError("Applicable months must be between 1 and 12")
+        return normalized
 
 
 class RuleStatusInput(BaseModel):

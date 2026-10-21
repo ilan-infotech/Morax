@@ -19,12 +19,10 @@ import {
   FileUp,
   Filter,
   History,
-  Info,
   Layers3,
   MessageSquare,
   RefreshCw,
   Search,
-  Send,
   ShieldCheck,
   UserCheck,
   X,
@@ -290,7 +288,7 @@ export function ModernDashboard() {
               title="Upcoming deadlines"
               description="Open obligations due in the next 14 days."
               action={
-                <Link className="text-link" to={`${base}/compliances/recurring`}>
+                <Link className="text-link" to={`${base}/compliances/company`}>
                   View worklist
                 </Link>
               }
@@ -433,7 +431,7 @@ const canManageCompliance = (user?: User) =>
   !!user &&
   (user.platform_role === "MORAX_ADMIN" ||
     user.roles.some((role) =>
-      ["ORGANIZATION_ADMIN", "UNIT_ADMIN", "CONTRACTOR_ADMIN"].includes(role),
+      ["ORGANIZATION_ADMIN", "UNIT_ADMIN"].includes(role),
     ));
 
 const canCheckCompliance = (user?: User) =>
@@ -443,9 +441,7 @@ const canCheckCompliance = (user?: User) =>
       [
         "ORGANIZATION_ADMIN",
         "UNIT_ADMIN",
-        "CONTRACTOR_ADMIN",
         "UNIT_CHECKER",
-        "CONTRACTOR_CHECKER",
       ].includes(role),
     ));
 
@@ -459,20 +455,6 @@ const detailText = (value: unknown, fallback = "Not provided") => {
 
 const snapshotText = (item: Instance, key: string, fallback = "Not provided") =>
   detailText(item[key as keyof Instance] ?? item.rule_snapshot?.[key], fallback);
-
-type ComplianceDialogTab = "overview" | "action" | "documents" | "history";
-type DialogTabConfig = {
-  id: ComplianceDialogTab;
-  icon: ComponentType<{ size?: number }>;
-  label: string;
-};
-
-const complianceDialogTabs: DialogTabConfig[] = [
-  { id: "overview", icon: Info, label: "Overview" },
-  { id: "action", icon: Send, label: "Action & Evidence" },
-  { id: "documents", icon: FileText, label: "Documents" },
-  { id: "history", icon: History, label: "History" },
-];
 
 type EntityOption = {
   id: string;
@@ -670,12 +652,11 @@ function ComplianceActionDialog({
   detailPath: string;
   onUpdated?: () => void | Promise<unknown>;
 }) {
-  const [activeTab, setActiveTab] = useState<ComplianceDialogTab>("overview");
   const [notice, setNotice] = useState("");
   const [decisionNote, setDecisionNote] = useState("");
   const [comment, setComment] = useState("");
   const [category, setCategory] = useState("SUPPORTING_DOCUMENT");
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [verifyReason, setVerifyReason] = useState("");
   const [assignment, setAssignment] = useState({ maker: "", checker: "" });
   const [activityForm, setActivityForm] = useState({
@@ -715,11 +696,10 @@ function ComplianceActionDialog({
 
   useEffect(() => {
     if (!item) return;
-    setActiveTab("overview");
     setNotice("");
     setDecisionNote("");
     setComment("");
-    setFile(null);
+    setFiles([]);
     setVerifyReason("");
     setCategory("SUPPORTING_DOCUMENT");
   }, [item?.id]);
@@ -859,24 +839,8 @@ function ComplianceActionDialog({
           </div>
         ) : (
           <>
-            <div className="compliance-dialog-tabs" role="tablist" aria-label="Compliance detail sections">
-              {complianceDialogTabs.map(({ id, icon: Icon, label }) => (
-                <button
-                  className={activeTab === id ? "active" : ""}
-                  type="button"
-                  role="tab"
-                  aria-selected={activeTab === id}
-                  onClick={() => setActiveTab(id)}
-                  key={id}
-                >
-                  <Icon size={15} />
-                  {label}
-                </button>
-              ))}
-            </div>
-
             <div className="compliance-dialog-body">
-              {activeTab === "overview" && (
+              {true && (
                 <div className="dialog-section-grid">
                   <section className="dialog-section wide">
                     <h3>Requirement</h3>
@@ -929,7 +893,7 @@ function ComplianceActionDialog({
                 </div>
               )}
 
-              {activeTab === "action" && (
+              {true && (
                 <div className="dialog-section-grid">
                   {manager && (
                     <section className="dialog-section wide">
@@ -1000,7 +964,7 @@ function ComplianceActionDialog({
                     <h3><ShieldCheck size={16} /> Workflow action</h3>
                     <textarea placeholder="Decision comment or not-applicable reason" value={decisionNote} onChange={(event) => setDecisionNote(event.target.value)} />
                     <div className="dialog-action-row">
-                      {editable && <button disabled={working} type="button" onClick={() => act(() => morax.submit(detail.id), "Submitted for review")}>Submit for review</button>}
+                      {editable && <button disabled={working} type="button" onClick={() => act(() => morax.submit(detail.id, detail.row_version), "Submitted for review")}>SUBMIT COMPLIANCE</button>}
                       {detail.status === "SUBMITTED" && checker && <button disabled={working} type="button" onClick={() => act(() => morax.review(detail.id, { comment: decisionNote || "Review started", row_version: detail.row_version }), "Review started")}>Begin review</button>}
                       {detail.status === "UNDER_REVIEW" && checker && (
                         <>
@@ -1016,7 +980,7 @@ function ComplianceActionDialog({
                 </div>
               )}
 
-              {activeTab === "documents" && (
+              {true && (
                 <div className="dialog-section-grid">
                   <section className="dialog-section wide">
                     <h3><FileUp size={16} /> Required documents / evidence</h3>
@@ -1028,9 +992,9 @@ function ComplianceActionDialog({
                       </label>
                       <label>
                         File
-                        <input type="file" disabled={!editable || working} onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
+                        <input type="file" multiple disabled={!editable || working} onChange={(event) => setFiles(Array.from(event.target.files ?? []))} />
                       </label>
-                      <button className="button-secondary" disabled={!file || !editable || working} type="button" onClick={() => file && act(() => morax.evidence(detail.id, file, category), "Evidence uploaded")}>Upload evidence</button>
+                      <button className="button-secondary" disabled={!files.length || !editable || working} type="button" onClick={() => act(() => Promise.all(files.map((file) => morax.evidence(detail.id, file, category))), `${files.length} document(s) uploaded`)}>Upload documents</button>
                     </div>
                   </section>
                   <section className="dialog-section wide">
@@ -1067,7 +1031,7 @@ function ComplianceActionDialog({
                 </div>
               )}
 
-              {activeTab === "history" && (
+              {true && (
                 <div className="dialog-section-grid">
                   <section className="dialog-section wide">
                     <h3><MessageSquare size={16} /> Comments</h3>
@@ -1284,7 +1248,7 @@ function GroupedRecurringWorklist() {
   );
 }
 
-function EnterpriseRecurringWorklist() {
+function EnterpriseRecurringWorklist({ complianceArea }: { complianceArea?: "COMPANY" | "CONTRACTOR" }) {
   const { organizationId } = useParams();
   const base = organizationId ? `/app/organizations/${organizationId}` : "/app";
   const [selected, setSelected] = useState<Instance>();
@@ -1292,6 +1256,13 @@ function EnterpriseRecurringWorklist() {
   const [page, setPage] = useState(1);
   const [filters, setFilters] = useState<WorklistFilters & { document_type: string; subject_id: string }>({
     q: "", status: "", risk_level: "", entity_type: "", subject_id: "", frequency: "", due_window: "THIS_MONTH", document_type: "",
+  });
+  const currentUser = useQuery({ queryKey: ["current-user"], queryFn: () => morax.me(), staleTime: 60_000 });
+  const pendingApprovals = useQuery({
+    queryKey: ["my-pending-approvals"],
+    queryFn: () => morax.myPendingApprovals(),
+    enabled: Boolean(currentUser.data?.roles.some((role) => role === "UNIT_CHECKER" || role === "UNIT_ADMIN" || role === "ORGANIZATION_ADMIN")),
+    staleTime: 15_000,
   });
   const debouncedSearch = useDebouncedValue(filters.q.trim());
   const entities = useQuery({
@@ -1326,6 +1297,7 @@ function EnterpriseRecurringWorklist() {
     if (filters.subject_id) values.subject_id = filters.subject_id;
     if (filters.frequency) values.frequency = filters.frequency;
     if (filters.document_type) values.document_type = filters.document_type;
+    if (complianceArea) values.compliance_area = complianceArea;
     if (filters.due_window === "THIS_MONTH") {
       const current = new Date();
       values.date_from = toDateInput(new Date(current.getFullYear(), current.getMonth(), 1));
@@ -1336,7 +1308,7 @@ function EnterpriseRecurringWorklist() {
       values.date_to = filters.due_window === "NEXT_7" ? dateAfter(7) : dateAfter(30);
     }
     return values;
-  }, [debouncedSearch, filters, page]);
+  }, [complianceArea, debouncedSearch, filters, page]);
   const grouped = useQuery({
     queryKey: ["enterprise-recurring-compliances", queryFilters],
     queryFn: () => morax.groupedInstances(queryFilters),
@@ -1386,10 +1358,24 @@ function EnterpriseRecurringWorklist() {
     <div className="modern-page grouped-compliance-page recurring-compliance-page">
       <WorkspacePageHeader
         eyebrow="COMPLIANCE MONITORING"
-        title="Recurring Compliance"
-        description="Track. Manage. Stay Compliant."
+        title={complianceArea === "COMPANY" ? "Company Compliance" : complianceArea === "CONTRACTOR" ? "Contractor Compliance" : "Recurring Compliance"}
+        description={complianceArea === "COMPANY" ? "Manage the company’s own labour-law obligations and filings." : complianceArea === "CONTRACTOR" ? "Manage contractor submissions, documents, and Principal Employer approvals." : "Track. Manage. Stay Compliant."}
         actions={<button className="button-secondary" type="button" onClick={() => grouped.refetch()} disabled={grouped.isFetching}><RefreshCw size={16} className={grouped.isFetching ? "spin" : ""} />Refresh</button>}
       />
+      {pendingApprovals.data && (
+        <DashboardSection title="Pending My Approval" description="Submitted compliances assigned to you as Principal Employer Checker.">
+          {pendingApprovals.data.items.length ? (
+            <div className="evidence-list">
+              {pendingApprovals.data.items.map((item) => (
+                <article className="evidence-card" key={item.id}>
+                  <div><b>{item.compliance_name}</b><small>{item.subject_name} · {item.period_key} · submitted for approval</small></div>
+                  <button type="button" onClick={() => setSelected(item)}>Review</button>
+                </article>
+              ))}
+            </div>
+          ) : <p className="muted">No compliance is awaiting your approval.</p>}
+        </DashboardSection>
+      )}
       <InlineError message={grouped.error instanceof Error ? grouped.error.message : ""} />
 
       <section className="recurring-kpi-grid" aria-label="Recurring compliance health">
@@ -1428,13 +1414,15 @@ function EnterpriseRecurringWorklist() {
           return <RecurringRuleGroup group={group} expanded={isExpanded} onToggle={() => toggleGroup(group.id)} onOpen={setSelected} key={group.id} />;
         })}{totalPages > 1 && <div className="pagination-row"><span>Showing rule groups {(page - 1) * (data.page_size ?? 20) + 1}-{Math.min(page * (data.page_size ?? 20), data.total_rules)} of {data.total_rules}</span><div><button className="icon-button" type="button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page === 1} aria-label="Previous rule groups"><ChevronLeft size={17} /></button><span>Page {page} of {totalPages}</span><button className="icon-button" type="button" onClick={() => setPage((current) => Math.min(totalPages, current + 1))} disabled={page === totalPages} aria-label="Next rule groups"><ChevronRight size={17} /></button></div></div>}</div> : <EmptyState title="No recurring compliance records match" description="Try removing a filter or generate applicable obligations from the Compliance Master." icon={FileText} />}
       </DashboardSection>
-      <ComplianceActionDialog item={selected} onClose={() => setSelected(undefined)} detailPath={selected ? `${base}/compliances/detail/${selected.id}` : ""} onUpdated={() => grouped.refetch()} />
+      <ComplianceActionDialog item={selected} onClose={() => setSelected(undefined)} detailPath={selected ? `${base}/compliances/detail/${selected.id}` : ""} onUpdated={() => Promise.all([grouped.refetch(), pendingApprovals.refetch()])} />
     </div>
   );
 }
 
 export function ModernWorklist() {
   const { kind } = useParams();
+  if (kind === "company") return <EnterpriseRecurringWorklist complianceArea="COMPANY" />;
+  if (kind === "contractor") return <EnterpriseRecurringWorklist complianceArea="CONTRACTOR" />;
   return kind === "recurring" ? <EnterpriseRecurringWorklist /> : <OneTimeWorklist />;
 }
 
