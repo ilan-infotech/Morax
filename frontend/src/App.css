@@ -2312,6 +2312,24 @@ dd {
   grid-column: 1 / -1;
 }
 
+.form-grid-break {
+  grid-column: 1 / -1;
+  height: 0;
+}
+
+.organization-form > label:has(:is(input, select, textarea):required) {
+  position: relative;
+}
+
+.organization-form > label:has(:is(input, select, textarea):required)::before {
+  position: absolute;
+  top: 0;
+  left: -0.6rem;
+  color: #dc2626;
+  content: "*";
+  font-weight: 700;
+}
+
 label.inline {
   display: flex;
   align-items: center;
@@ -3097,14 +3115,73 @@ textarea:focus-visible {
   border-left: 3px solid #b45309;
 }
 
-.entity-form label:has(:required) > span:first-child::after {
-  content: " *";
-  color: #b91c1c;
-}
-
 .field-error {
   color: #b91c1c;
   font-size: 0.68rem;
+}
+
+.required-indicator {
+  color: #dc2626;
+  font-weight: 700;
+}
+
+.form-grid label.has-error :is(input, select, textarea) {
+  border-color: #dc2626;
+  box-shadow: 0 0 0 1px rgb(220 38 38 / 18%);
+}
+
+.capacity-helper {
+  display: block;
+  min-height: 1.25rem;
+  margin-top: 0.25rem;
+}
+
+.workforce-capacity-helper {
+  grid-column: 1 / -1;
+  margin-top: -0.35rem;
+}
+
+.legacy-assignment-panel {
+  display: none;
+}
+
+.assignment-role-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.assignment-role-card {
+  display: grid;
+  gap: 0.55rem;
+  min-width: 0;
+  padding: 0.85rem;
+  border: 1px solid #dbe3d3;
+  border-radius: 0.6rem;
+  background: #fbfcf9;
+}
+
+.assignment-role-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.assignment-pending-user {
+  display: grid;
+  min-height: 2.5rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid #dbe3d3;
+  border-radius: 0.4rem;
+  background: #fff;
+}
+
+.assignment-pending-user small {
+  color: #64748b;
+}
+
+.danger-text {
+  color: #b91c1c;
 }
 
 .drawer-footer {
@@ -3142,6 +3219,48 @@ textarea:focus-visible {
 
 .existing-document-list {
   margin-top: 0.85rem;
+}
+
+/* A document register keeps every file category in its own stable row. File
+   chips can grow vertically without shifting a neighbouring upload field. */
+.document-upload-list {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.document-upload-list > label {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.3fr) minmax(220px, 0.42fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 0.8rem;
+  margin: 0;
+  padding: 0.8rem;
+  border: 1px solid #dbe3d3;
+  border-radius: 0.55rem;
+  background: #fbfcf9;
+}
+
+.document-upload-list > label > span {
+  padding-top: 0.42rem;
+}
+
+.document-upload-list > label > input[type="file"] {
+  min-width: 0;
+}
+
+.document-upload-list .selected-file-list {
+  min-width: 0;
+  align-self: center;
+}
+
+@media (max-width: 760px) {
+  .document-upload-list > label {
+    grid-template-columns: 1fr;
+  }
+
+  .document-upload-list > label > span {
+    padding-top: 0;
+  }
 }
 
 @media (max-width: 1280px) {
@@ -3291,6 +3410,10 @@ textarea:focus-visible {
   .dashboard-filter-grid,
   .detail-grid,
   .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .assignment-role-grid {
     grid-template-columns: 1fr;
   }
 

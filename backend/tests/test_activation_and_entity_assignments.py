@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from fastapi import HTTPException
@@ -9,7 +9,7 @@ import app.api.v1.router as api
 import app.services.access as access
 from app.core.security import hash_password, verify_password
 from app.db.base import Base
-from app.models import AuditLog, Contractor, IndustryType, Organization, State, Unit, User, UserActivation, UserRoleScope
+from app.models import AuditLog, AuthSession, Contractor, IndustryType, Organization, State, Unit, User, UserActivation, UserRoleScope
 from app.schemas import AdministratorPasswordResetInput, ContractorInput, EntityUserAssignmentInput, LoginRequest, PlatformOrganizationInput, RoleScopeInput, UnitInput, UserCreateInput
 
 
@@ -32,6 +32,9 @@ def test_platform_organization_provisions_admin_password(db):
     )
     db.add(platform_admin)
     db.flush()
+
+    preview = api.preview_platform_organization_code("Acme Compliance", platform_admin, db)
+    assert preview["code"] == "ORG-ACME-COMPLIANCE"
 
     created = api.create_platform_organization(
         PlatformOrganizationInput(
@@ -107,6 +110,37 @@ def test_platform_organization_provisions_admin_password(db):
 
     actions = set(db.scalars(select(AuditLog.action).where(AuditLog.organization_id == organization_id)))
     assert {"ORGANIZATION_CREATED", "CREATE_ORGANIZATION_ADMIN", "ORGANIZATION_ADMIN_PASSWORD_SET", "CREATE_USER", "USER_PASSWORD_SET", "PRODUCT_ADMIN_RESET_ORGANIZATION_ADMIN_PASSWORD", "ORGANIZATION_ADMIN_RESET_USER_PASSWORD"} <= actions
+
+
+def test_product_admin_can_start_and_end_an_audited_organization_session(db):
+    platform_admin = User(
+        name="MORAX Admin", email="platform-login@example.test", password_hash="not-a-real-password",
+        active=True, platform_role="MORAX_ADMIN",
+    )
+    db.add(platform_admin)
+    db.flush()
+    created = api.create_platform_organization(
+        PlatformOrganizationInput(
+            organization_name="Organization Login Test", organization_code="ORG-LOGIN",
+            organization_admin_name="Organization Admin", organization_admin_email="org-login@morax.example.com",
+            organization_admin_password="Organization-Admin-Password-1",
+        ),
+        platform_admin,
+        db,
+    )
+    originating_session = AuthSession(user_id=platform_admin.id, expires_at=datetime.now(UTC) + timedelta(minutes=30))
+    db.add(originating_session)
+    db.commit()
+    setattr(platform_admin, "_morax_session_id", originating_session.id)
+
+    switched = api.login_as_organization(created["id"], platform_admin, db)
+    organization_admin = db.scalar(select(User).where(User.email == "org-login@morax.example.com"))
+    assert switched["user"]["id"] == organization_admin.id
+    assert "ORGANIZATION_ADMIN" in switched["user"]["roles"]
+    switched_session = db.scalar(select(AuthSession).where(AuthSession.user_id == organization_admin.id))
+    assert switched_session.impersonated_by_id == platform_admin.id
+    assert switched_session.impersonated_by_session_id == originating_session.id
+    assert "PLATFORM_ORGANIZATION_LOGIN_STARTED" in set(db.scalars(select(AuditLog.action)))
 
 
 def test_mrf_onboarding_login_unit_and_assigned_user_logins(db):

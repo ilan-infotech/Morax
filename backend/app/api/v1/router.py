@@ -717,6 +717,17 @@ def list_platform_organizations(q: str | None = None, status: str | None = None,
     return [platform_organization_dict(db, item) for item in db.scalars(query.order_by(Organization.name))]
 
 
+@router.get("/platform/organization-code-preview")
+def preview_platform_organization_code(
+    name: str = Query(min_length=1, max_length=200),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the next available readable Organization Code for the create form."""
+    require_platform_admin(user)
+    return {"code": generated_code(db, Organization, name, "ORG")}
+
+
 @router.post("/platform/organizations")
 def create_platform_organization(payload: PlatformOrganizationInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     require_platform_admin(user)
@@ -765,6 +776,74 @@ def get_platform_organization(organization_id: str, user: User = Depends(current
     if not organization:
         raise HTTPException(404, "Organization not found")
     return platform_organization_dict(db, organization)
+
+
+@router.post("/platform/organizations/{organization_id}/login-as-organization")
+def login_as_organization(
+    organization_id: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Temporarily switch a Product Admin into an Organization Admin session.
+
+    This deliberately uses the same server-linked impersonation model as User
+    Access.  It never reads or changes the Organization Admin password and the
+    original Product Admin session remains available for a secure return.
+    """
+    require_platform_admin(user)
+    if getattr(user, "_morax_impersonated_by_id", None):
+        raise HTTPException(409, "End the current impersonation before starting another one")
+    organization = db.get(Organization, organization_id)
+    if not organization:
+        raise HTTPException(404, "Organization not found")
+    if organization.status != "ACTIVE":
+        raise HTTPException(422, "Inactive organizations cannot be opened")
+    organization_admin = db.scalar(
+        select(User)
+        .join(UserRoleScope, UserRoleScope.user_id == User.id)
+        .where(
+            User.organization_id == organization.id,
+            User.active.is_(True),
+            UserRoleScope.role == "ORGANIZATION_ADMIN",
+            UserRoleScope.scope_type == "ORGANIZATION",
+            UserRoleScope.scope_id == organization.id,
+        )
+        .order_by(User.created_at, User.id)
+        .limit(1)
+    )
+    if not organization_admin:
+        raise HTTPException(422, "This organization does not have an active Organization Admin account")
+    originating_session = db.get(AuthSession, getattr(user, "_morax_session_id", None))
+    if not originating_session or originating_session.user_id != user.id:
+        raise HTTPException(401, "Your Product Admin session is no longer available")
+    session = AuthSession(
+        user_id=organization_admin.id,
+        active_organization_id=organization.id,
+        impersonated_by_session_id=originating_session.id,
+        impersonated_by_id=user.id,
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
+    )
+    db.add(session)
+    audit(
+        db,
+        organization_id=organization.id,
+        actor_id=user.id,
+        action="PLATFORM_ORGANIZATION_LOGIN_STARTED",
+        module="AUTH",
+        entity_type="User",
+        entity_id=organization_admin.id,
+        new={"target_email": organization_admin.email, "organization_id": organization.id},
+    )
+    db.commit()
+    setattr(organization_admin, "_morax_active_organization_id", organization.id)
+    setattr(organization_admin, "_morax_session_id", session.id)
+    setattr(organization_admin, "_morax_impersonated_by_id", user.id)
+    setattr(organization_admin, "_morax_impersonated_by_session_id", originating_session.id)
+    return {
+        "access_token": create_access_token(organization_admin.id, session.id),
+        "token_type": "bearer",
+        "user": user_summary(db, organization_admin),
+    }
 
 
 @router.patch("/platform/organizations/{organization_id}")

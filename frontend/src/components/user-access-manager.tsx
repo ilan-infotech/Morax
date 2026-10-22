@@ -534,7 +534,7 @@ export function UserAccessManager({
             setCreateOpen(true);
           }}
         >
-          <Plus size={17} /> Add {userType === "CONTRACTOR" ? "contractor user" : "user"}
+          <Plus size={17} /> Add {userType === "CONTRACTOR" ? "Contractor User" : "Company User"}
         </button>
       </header>
       <div className="user-access-tabs" role="tablist" aria-label="User categories">
@@ -700,7 +700,7 @@ export function UserAccessManager({
 
       {createOpen && (
         <Drawer
-          title={userType === "CONTRACTOR" ? "Create contractor user" : "Create user"}
+          title={userType === "CONTRACTOR" ? "Add Contractor User" : "Add Company User"}
           icon={<UserRoundCog size={19} />}
           onClose={() => setCreateOpen(false)}
           pageForm
@@ -714,35 +714,35 @@ export function UserAccessManager({
             <div className="form-grid">
               <FormField
                 label="Name"
+                required
                 error={createForm.formState.errors.name?.message}
               >
-                <input autoFocus {...createForm.register("name")} />
+                <input autoFocus required maxLength={150} {...createForm.register("name")} />
               </FormField>
               <FormField
                 label="Email"
+                required
                 error={createForm.formState.errors.email?.message}
               >
-                <input type="email" {...createForm.register("email")} />
+                <input type="email" required {...createForm.register("email")} />
               </FormField>
-              <FormField label="Mobile">
-                <input inputMode="numeric" minLength={10} maxLength={10} pattern="[6-9][0-9]{9}" {...createForm.register("mobile")} />
+              <FormField label="Mobile" required error={createForm.formState.errors.mobile?.message}>
+                <input inputMode="numeric" minLength={10} maxLength={10} pattern="[6-9][0-9]{9}" required {...createForm.register("mobile")} />
               </FormField>
               <FormField
                 label="Password"
+                required
                 error={createForm.formState.errors.password?.message}
               >
-                <input type="password" autoComplete="new-password" {...createForm.register("password")} />
+                <input type="password" autoComplete="new-password" minLength={8} required {...createForm.register("password")} />
               </FormField>
               <FormField
                 label="Confirm password"
+                required
                 error={createForm.formState.errors.password_confirmation?.message}
               >
-                <input type="password" autoComplete="new-password" {...createForm.register("password_confirmation")} />
+                <input type="password" autoComplete="new-password" minLength={8} required {...createForm.register("password_confirmation")} />
               </FormField>
-              <label className="inline">
-                <input type="checkbox" {...createForm.register("active")} />{" "}
-                Create as active
-              </label>
             </div>
             <div className="form-section">
               <h3>Roles and project/site access</h3>
@@ -751,13 +751,13 @@ export function UserAccessManager({
                 const choices = candidates(scopeType);
                 return (
                   <div className="scope-row" key={field.id}>
-                    <FormField label="Role">
-                      <select {...createForm.register(`role_scopes.${index}.role`)}>
+                    <FormField label="Role" required>
+                      <select required {...createForm.register(`role_scopes.${index}.role`)}>
                         {(userType === "CONTRACTOR" ? CONTRACTOR_ROLES : ROLES).map((role) => <option key={role} value={role}>{roleLabel(role)}</option>)}
                       </select>
                     </FormField>
-                    <FormField label="Access type">
-                      <select {...createForm.register(`role_scopes.${index}.scope_type`, {
+                    <FormField label="Access type" required>
+                      <select required {...createForm.register(`role_scopes.${index}.scope_type`, {
                         onChange: (event) => {
                           const choicesForType = candidates(event.target.value);
                           createForm.setValue(`role_scopes.${index}.scope_id`, choicesForType[0] ? String(choicesForType[0].id) : "");
@@ -766,8 +766,8 @@ export function UserAccessManager({
                         {SCOPE_TYPES.map((type) => <option key={type} value={type}>{roleLabel(type)}</option>)}
                       </select>
                     </FormField>
-                    <FormField label="Authorized entity" error={createForm.formState.errors.role_scopes?.[index]?.scope_id?.message}>
-                      <select {...createForm.register(`role_scopes.${index}.scope_id`)} disabled={!choices.length} aria-label="Searchable authorized entity list">
+                    <FormField label="Authorized entity" required error={createForm.formState.errors.role_scopes?.[index]?.scope_id?.message}>
+                      <select required {...createForm.register(`role_scopes.${index}.scope_id`)} disabled={!choices.length} aria-label="Searchable authorized entity list">
                         {choices.map((choice) => <option key={String(choice.id)} value={String(choice.id)}>{String(choice.name)}</option>)}
                       </select>
                     </FormField>
@@ -780,7 +780,7 @@ export function UserAccessManager({
             <DrawerFooter
               onCancel={() => setCreateOpen(false)}
               busy={createMutation.isPending}
-              label="Create user"
+              label={userType === "CONTRACTOR" ? "Create Contractor User" : "Create Company User"}
             />
           </form>
         </Drawer>
@@ -1046,15 +1046,17 @@ function DrawerFooter({
 function FormField({
   label,
   error,
+  required = false,
   children,
 }: {
   label: string;
   error?: string;
+  required?: boolean;
   children: ReactNode;
 }) {
   return (
-    <label>
-      <span>{label}</span>
+    <label className={error ? "has-error" : undefined}>
+      <span>{label}{required && <b className="required-indicator" aria-label="required"> *</b>}</span>
       {children}
       {error && <small className="field-error">{error}</small>}
     </label>

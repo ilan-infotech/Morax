@@ -1,4 +1,5 @@
 import { useDeferredValue, useEffect, useState, useRef } from "react";
+import { createPortal } from "react-dom";
 import ElasticMesh from "./components/ElasticMesh/ElasticMesh";
 import { SpecularCard } from "./components/specular-card";
 import {
@@ -17,6 +18,8 @@ import GradientText from "./components/GradientText/GradientText";
 import Shuffle from "./components/Shuffle/Shuffle";
 import type { FormEvent, ReactNode } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { Toaster } from "sonner";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   BrowserRouter,
   Link,
@@ -48,6 +51,7 @@ import {
   LogOut,
   PanelLeftClose,
   PanelLeftOpen,
+  X,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { setToken } from "./api/client";
@@ -540,7 +544,7 @@ function ComplianceRoute({ user }: { user: User }) {
   );
 }
 
-function EntityRoute({ user }: { user: User }) {
+function EntityRoute({ user, onImpersonate }: { user: User; onImpersonate: (userId: string) => Promise<void> }) {
   const { kind } = useParams();
   const feature =
     kind === "contractors"
@@ -550,7 +554,7 @@ function EntityRoute({ user }: { user: User }) {
         : "entities.units";
   return (
     <FeatureGate user={user} feature={feature}>
-      <ModernEntities user={user} />
+      <ModernEntities user={user} onImpersonate={onImpersonate} />
     </FeatureGate>
   );
 }
@@ -668,7 +672,7 @@ function Layout({
         />
         <Route
           path="entities/:kind"
-          element={<EntityRoute user={user} />}
+          element={<EntityRoute user={user} onImpersonate={onImpersonate} />}
         />
         <Route
           path="users"
@@ -1114,7 +1118,13 @@ function PlatformShell({
   );
 }
 
-function OrganizationLanding({ user }: { user: User }) {
+function OrganizationLanding({
+  user,
+  onLoginAsOrganization,
+}: {
+  user: User;
+  onLoginAsOrganization: (organizationId: string) => Promise<void>;
+}) {
   const navigate = useNavigate();
   const [rows, setRows] = useState<Row[]>([]);
   const [error, setError] = useState("");
@@ -1126,6 +1136,7 @@ function OrganizationLanding({ user }: { user: User }) {
   const [resetting, setResetting] = useState(false);
   const [adminReplacementPassword, setAdminReplacementPassword] = useState("");
   const [adminReplacementPasswordConfirmation, setAdminReplacementPasswordConfirmation] = useState("");
+  const [adminPasswordError, setAdminPasswordError] = useState("");
   const [adminPasswordResetting, setAdminPasswordResetting] = useState(false);
   const [locationStates, setLocationStates] = useState<Master[]>([]);
   const [locationCities, setLocationCities] = useState<Master[]>([]);
@@ -1155,7 +1166,28 @@ function OrganizationLanding({ user }: { user: User }) {
     status: "ACTIVE",
   };
   const [form, setForm] = useState(blank);
+  const organizationAdminPasswordMismatch = !editing && Boolean(form.organization_admin_password_confirmation) && form.organization_admin_password !== form.organization_admin_password_confirmation;
   const selectedOrganizationStateId = form.state_id;
+  useEffect(() => {
+    if (editing || !form.organization_name.trim()) {
+      if (!editing && form.organization_code) setForm((current) => ({ ...current, organization_code: "" }));
+      return;
+    }
+    let active = true;
+    const timer = window.setTimeout(() => {
+      morax.previewPlatformOrganizationCode(form.organization_name.trim())
+        .then(({ code }) => {
+          if (active) setForm((current) => current.organization_name.trim() === form.organization_name.trim() ? { ...current, organization_code: code } : current);
+        })
+        .catch((err) => {
+          if (active) setError(message(err, "Could not generate the Organization Code."));
+        });
+    }, 250);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [editing, form.organization_name]);
   const load = () =>
     morax
       .platformOrganizations(filters)
@@ -1216,12 +1248,11 @@ function OrganizationLanding({ user }: { user: User }) {
     setShowForm(true);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
-  const enter = async (id: string) => {
+  const loginAsOrganization = async (id: string) => {
     try {
-      await morax.enterPlatformOrganization(id);
-      navigate(`/app/organizations/${id}/dashboard`);
+      await onLoginAsOrganization(id);
     } catch (err) {
-      setError(message(err));
+      setError(message(err, "Could not open the Organization Admin session."));
     }
   };
   async function save(event: FormEvent) {
@@ -1268,9 +1299,10 @@ function OrganizationLanding({ user }: { user: User }) {
     event.preventDefault();
     if (!adminPasswordTarget) return;
     if (adminReplacementPassword !== adminReplacementPasswordConfirmation) {
-      setError("Organization Admin passwords do not match");
+      setAdminPasswordError("Password and Confirm password must match.");
       return;
     }
+    setAdminPasswordError("");
     setAdminPasswordResetting(true);
     try {
       const result = await morax.resetOrganizationAdminPassword(
@@ -1283,7 +1315,7 @@ function OrganizationLanding({ user }: { user: User }) {
       setAdminReplacementPasswordConfirmation("");
       load();
     } catch (err) {
-      setError(message(err));
+      setAdminPasswordError(message(err));
     } finally {
       setAdminPasswordResetting(false);
     }
@@ -1365,29 +1397,39 @@ function OrganizationLanding({ user }: { user: User }) {
           </form>
         </Panel>
       )}
-      {adminPasswordTarget && (
-        <Panel>
-          <div className="split">
+      {adminPasswordTarget && createPortal(
+        <div
+          className="assignment-user-backdrop"
+          role="presentation"
+          onMouseDown={() => !adminPasswordResetting && setAdminPasswordTarget(null)}
+        >
+          <section
+            className="crud-drawer assignment-user-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Set Organization Admin password"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+          <div className="drawer-heading">
             <div>
-              <h2>Set Organization Admin password</h2>
-              <p className="muted">
-                Login username: <b>{String((adminPasswordTarget.organization_admin as Row | null)?.email ?? "Not available")}</b>. Existing passwords cannot be viewed because MORAX stores only secure hashes. Set a new password and share it directly; no email, OTP, or activation link is sent.
-              </p>
+              <span className="drawer-icon"><UsersIcon size={19} /></span>
+              <div>
+                <h2>Set Organization Admin password</h2>
+              </div>
             </div>
             <button
               type="button"
-              className="secondary"
+              className="icon-action"
               disabled={adminPasswordResetting}
-              onClick={() => {
-                setAdminPasswordTarget(null);
-                setAdminReplacementPassword("");
-                setAdminReplacementPasswordConfirmation("");
-              }}
+              onClick={() => setAdminPasswordTarget(null)}
+              aria-label="Close password form"
             >
-              Cancel
+              <X size={18} />
             </button>
           </div>
-          <form className="form-grid" onSubmit={resetOrganizationAdminPassword}>
+          <form className="entity-form" onSubmit={resetOrganizationAdminPassword}>
+            {adminPasswordError && <p className="alert error">{adminPasswordError}</p>}
+            <div className="form-grid">
             <label>
               New password
               <input
@@ -1410,13 +1452,29 @@ function OrganizationLanding({ user }: { user: User }) {
                 required
               />
             </label>
-            <div className="action-row">
+            </div>
+            <footer className="drawer-footer">
+              <button
+                type="button"
+                className="secondary"
+                disabled={adminPasswordResetting}
+                onClick={() => {
+                  setAdminPasswordTarget(null);
+                  setAdminReplacementPassword("");
+                  setAdminReplacementPasswordConfirmation("");
+                  setAdminPasswordError("");
+                }}
+              >
+                Cancel
+              </button>
               <button disabled={adminPasswordResetting}>
                 {adminPasswordResetting ? "Saving password…" : "Set new password"}
               </button>
-            </div>
+            </footer>
           </form>
-        </Panel>
+          </section>
+        </div>,
+        document.body,
       )}
       {showForm && (
         <Panel>
@@ -1428,7 +1486,7 @@ function OrganizationLanding({ user }: { user: User }) {
               Cancel
             </button>
           </div>
-          <form className="form-grid" onSubmit={save}>
+          <form className="form-grid organization-form" onSubmit={save}>
             <label>
               Organization name
               <input
@@ -1444,7 +1502,12 @@ function OrganizationLanding({ user }: { user: User }) {
                 Organization code
                 <input value={form.organization_code} readOnly />
               </label>
-            ) : null}
+            ) : (
+              <label>
+                Organization code
+                <input value={form.organization_code || "Generating code…"} readOnly aria-label="Organization code" />
+              </label>
+            )}
             {!editing && (
               <>
                 <label>
@@ -1493,6 +1556,7 @@ function OrganizationLanding({ user }: { user: User }) {
                     autoComplete="new-password"
                     required
                   />
+                  {organizationAdminPasswordMismatch && <small className="field-error">Password and Confirm password must match.</small>}
                 </label>
               </>
             )}
@@ -1519,6 +1583,9 @@ function OrganizationLanding({ user }: { user: User }) {
               <input
                 value={form.pan}
                 onChange={(e) => setForm({ ...form, pan: e.target.value })}
+                maxLength={10}
+                pattern="[A-Za-z]{5}[0-9]{4}[A-Za-z]"
+                title="Enter PAN in ABCDE1234F format"
               />
             </label>
             <label>
@@ -1526,6 +1593,9 @@ function OrganizationLanding({ user }: { user: User }) {
               <input
                 value={form.gstin}
                 onChange={(e) => setForm({ ...form, gstin: e.target.value })}
+                maxLength={15}
+                pattern="[0-9A-Za-z]{15}"
+                title="Enter a valid 15-character GSTIN"
               />
             </label>
             <label>
@@ -1571,6 +1641,10 @@ function OrganizationLanding({ user }: { user: User }) {
               <input
                 value={form.pincode}
                 onChange={(e) => setForm({ ...form, pincode: e.target.value })}
+                inputMode="numeric"
+                pattern="[0-9]{6}"
+                maxLength={6}
+                title="Enter a valid 6-digit PIN code"
                 required
               />
             </label>
@@ -1714,11 +1788,23 @@ function OrganizationLanding({ user }: { user: User }) {
                 </td>
                 <td>
                   {row.organization_admin ? (
-                    <>
+                    <div className="entity-login-cell">
                       <b>{String((row.organization_admin as Row).name)}</b>
-                      <br />
                       <small>{String((row.organization_admin as Row).email)}</small>
-                    </>
+                      <button
+                        type="button"
+                        className="text-action"
+                        onClick={() => {
+                          setAdminPasswordTarget(row);
+                          setAdminReplacementPassword("");
+                          setAdminReplacementPasswordConfirmation("");
+                          setAdminPasswordError("");
+                          window.scrollTo({ top: 0, behavior: "smooth" });
+                        }}
+                      >
+                        Set new password
+                      </button>
+                    </div>
                   ) : (
                     <span className="muted">No Organization Admin</span>
                   )}
@@ -1729,21 +1815,12 @@ function OrganizationLanding({ user }: { user: User }) {
                     <button className="secondary" onClick={() => edit(row)}>
                       View / Edit
                     </button>
-                    <button onClick={() => enter(String(row.id))}>
-                      Manage
-                    </button>
                     <button
                       type="button"
-                      className="secondary"
-                      disabled={!row.organization_admin}
-                      onClick={() => {
-                        setAdminPasswordTarget(row);
-                        setAdminReplacementPassword("");
-                        setAdminReplacementPasswordConfirmation("");
-                        window.scrollTo({ top: 0, behavior: "smooth" });
-                      }}
+                      disabled={row.status !== "ACTIVE" || !row.organization_admin}
+                      onClick={() => loginAsOrganization(String(row.id))}
                     >
-                      Set Admin password
+                      Login as Organization
                     </button>
                     <button
                       type="button"
@@ -4676,6 +4753,7 @@ function AccountActivation() {
 function AppRoutes() {
   const location = useLocation();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -4688,25 +4766,43 @@ function AppRoutes() {
   }, []);
   if (!ready) return <div className="loading">Loading MORAX…</div>;
   if (location.pathname === "/activate") return <AccountActivation />;
+  const resetTenantWorkspace = () => queryClient.clear();
   if (!user) return <Login done={(signedIn) => {
+    resetTenantWorkspace();
     setUser(signedIn);
     navigate(signedIn.platform_role === "MORAX_ADMIN" ? "/app/organizations" : `/app/${defaultWorkspacePath(signedIn)}`, { replace: true });
   }} />;
   const impersonate = async (userId: string) => {
     const response = await morax.impersonate(userId);
+    resetTenantWorkspace();
     setToken(response.access_token);
     setUser(response.user);
   };
-  const endImpersonation = async () => {
-    const response = await morax.endImpersonation();
+  const loginAsOrganization = async (organizationId: string) => {
+    const response = await morax.loginAsOrganization(organizationId);
+    resetTenantWorkspace();
     setToken(response.access_token);
     setUser(response.user);
+    navigate(`/app/${defaultWorkspacePath(response.user)}`, { replace: true });
+  };
+  const endImpersonation = async () => {
+    const response = await morax.endImpersonation();
+    resetTenantWorkspace();
+    setToken(response.access_token);
+    setUser(response.user);
+    navigate(
+      response.user.platform_role === "MORAX_ADMIN"
+        ? "/app/organizations"
+        : `/app/${defaultWorkspacePath(response.user)}`,
+      { replace: true },
+    );
   };
   const logout = async () => {
     try {
       if (user.impersonation?.active) await endImpersonation();
       await morax.logout();
     } finally {
+      resetTenantWorkspace();
       setToken(null);
       setUser(null);
     }
@@ -4727,7 +4823,7 @@ function AppRoutes() {
               logout={logout}
               endImpersonation={endImpersonation}
             >
-              <OrganizationLanding user={user} />
+              <OrganizationLanding user={user} onLoginAsOrganization={loginAsOrganization} />
             </PlatformShell>
           }
         />
@@ -4759,6 +4855,7 @@ function AppRoutes() {
           path="/app/organizations/:organizationId/*"
           element={
             <Layout
+              key={`workspace-${user.id}-${user.organization_id}`}
               user={user}
               logout={logout}
               onImpersonate={impersonate}
@@ -4770,6 +4867,7 @@ function AppRoutes() {
           path="/app/*"
           element={
             <Layout
+              key={`workspace-${user.id}-${user.organization_id}`}
               user={user}
               logout={logout}
               onImpersonate={impersonate}
@@ -4798,6 +4896,7 @@ export default function App() {
     <BrowserRouter basename="/morax">
       <ScrollToTop />
       <AppRoutes />
+      <Toaster position="top-right" richColors closeButton duration={4000} />
     </BrowserRouter>
   )
 }
