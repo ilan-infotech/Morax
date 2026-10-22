@@ -339,8 +339,9 @@ app.include_router(router, prefix=settings.api_v1_prefix)
 
 
 def ensure_database_schema() -> None:
-    """Ensure all required database tables exist in SQLite/Turso before running baseline seeding."""
+    """Ensure all required database tables and columns exist in SQLite/Turso before running baseline seeding."""
     import logging
+    from sqlalchemy import inspect, text
     from app.db.base import Base
     from app.db.session import engine
     import app.models  # noqa: F401 - registers all SQLAlchemy models
@@ -348,7 +349,45 @@ def ensure_database_schema() -> None:
     logger = logging.getLogger("uvicorn.info")
     logger.info("Ensuring database tables exist...")
     Base.metadata.create_all(bind=engine)
-    logger.info("Database tables verified.")
+
+    # Inspect and dynamically add any columns defined in models but missing in the database
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        for table_name, table in Base.metadata.tables.items():
+            if inspector.has_table(table_name):
+                existing_cols = {col["name"] for col in inspector.get_columns(table_name)}
+                for col in table.columns:
+                    if col.name not in existing_cols:
+                        col_type = col.type.compile(engine.dialect)
+                        logger.info(f"Adding missing column {table_name}.{col.name} ({col_type})...")
+                        conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col.name} {col_type}"))
+
+        try:
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_active_compliance_assignment "
+                    "ON compliance_assignments(instance_id, assignment_type) WHERE active = 1"
+                )
+            )
+        except Exception:
+            pass
+
+        # Synchronize alembic_version table to latest head
+        try:
+            conn.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS alembic_version "
+                    "(version_num VARCHAR(32) NOT NULL, PRIMARY KEY (version_num))"
+                )
+            )
+            conn.execute(text("DELETE FROM alembic_version"))
+            conn.execute(
+                text("INSERT INTO alembic_version (version_num) VALUES ('0012_unit_compliance_types')")
+            )
+        except Exception as e:
+            logger.warning(f"Could not synchronize alembic_version: {e}")
+
+    logger.info("Database tables and columns verified.")
 
 
 @app.on_event("startup")
