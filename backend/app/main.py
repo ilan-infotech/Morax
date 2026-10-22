@@ -338,30 +338,31 @@ app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allo
 app.include_router(router, prefix=settings.api_v1_prefix)
 
 
-def apply_db_migrations() -> None:
-    """Ensure database schema is up-to-date with Alembic before running startup seeds."""
-    from pathlib import Path
+def ensure_database_schema() -> None:
+    """Ensure all required database tables exist in SQLite/Turso before running baseline seeding."""
     import logging
-    from alembic.config import Config
-    from alembic import command
+    from app.db.base import Base
+    from app.db.session import engine
+    import app.models  # noqa: F401 - registers all SQLAlchemy models
 
     logger = logging.getLogger("uvicorn.info")
-    backend_dir = Path(__file__).resolve().parent.parent
-    ini_path = backend_dir / "alembic.ini"
-    alembic_dir = backend_dir / "alembic"
-    if ini_path.exists() and alembic_dir.exists():
-        logger.info("Checking and applying pending database migrations...")
-        cfg = Config(str(ini_path))
-        cfg.set_main_option("script_location", str(alembic_dir))
-        command.upgrade(cfg, "head")
-        logger.info("Database migrations up-to-date.")
+    logger.info("Ensuring database tables exist...")
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables verified.")
 
 
 @app.on_event("startup")
 def startup() -> None:
-    settings.upload_path.mkdir(parents=True, exist_ok=True)
-    apply_db_migrations()
-    seed_baseline()
+    import sys, traceback
+    try:
+        settings.upload_path.mkdir(parents=True, exist_ok=True)
+        ensure_database_schema()
+        seed_baseline()
+    except Exception as exc:
+        sys.stderr.write(f"\nFATAL STARTUP EXCEPTION: {exc}\n")
+        traceback.print_exc()
+        sys.stderr.flush()
+        raise
 
 
 @app.get("/health")
