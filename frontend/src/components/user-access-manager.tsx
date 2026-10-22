@@ -23,6 +23,7 @@ import {
   ChevronLeft,
   ChevronRight,
   KeyRound,
+  LogIn,
   Pencil,
   Plus,
   Search,
@@ -53,22 +54,18 @@ const SCOPE_TYPES = [
   "CONTRACTOR",
   "CONTRACTOR_SITE",
 ] as const;
+const CONTRACTOR_ROLES = ROLES.filter((role) => role.startsWith("CONTRACTOR_"));
 
 const roleScopeSchema = z.object({
   role: z.enum(ROLES),
   scope_type: z.enum(SCOPE_TYPES),
   scope_id: z.string().min(1, "Select an assigned scope"),
 });
-const MODULE_PERMISSIONS = [
-  "dashboard.read", "compliance.read", "compliance.make", "compliance.check",
-  "documents.read", "documents.upload", "documents.verify", "reports.read",
-  "entities.read", "entities.manage", "users.manage",
-] as const;
 
 const createUserSchema = z.object({
   name: z.string().trim().min(2, "Enter a name").max(150),
   email: z.string().trim().email("Enter a valid email address"),
-  mobile: z.string(),
+  mobile: z.string().trim().regex(/^[6-9]\d{9}$/, "Enter a valid 10-digit Indian mobile number"),
   password: z.string().min(8, "Use at least 8 characters"),
   password_confirmation: z.string(),
   active: z.boolean(),
@@ -123,11 +120,16 @@ export function UserAccessManager({
   const [search, setSearch] = useState("");
   const deferredSearch = useDeferredValue(search);
   const [active, setActive] = useState("");
+  const [userType, setUserType] = useState<"COMPANY" | "CONTRACTOR">("COMPANY");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
   const [sorting, setSorting] = useState<SortingState>([]);
   const [createOpen, setCreateOpen] = useState(false);
   const [scopeUser, setScopeUser] = useState<User | null>(null);
+  const [passwordResetUser, setPasswordResetUser] = useState<User | null>(null);
+  const [replacementPassword, setReplacementPassword] = useState("");
+  const [replacementPasswordConfirmation, setReplacementPasswordConfirmation] = useState("");
+  const [passwordResetError, setPasswordResetError] = useState("");
   const [notice, setNotice] = useState("");
   const sort = sorting[0];
 
@@ -137,12 +139,13 @@ export function UserAccessManager({
       page_size: String(pageSize),
       q: deferredSearch.trim() || undefined,
       active: active || undefined,
+      user_type: userType,
       sort_by: sort?.id || "name",
       sort_dir: sort?.desc ? "desc" : "asc",
     }),
-    [active, deferredSearch, page, pageSize, sort?.desc, sort?.id],
+    [active, deferredSearch, page, pageSize, sort?.desc, sort?.id, userType],
   );
-  useEffect(() => setPage(1), [active, deferredSearch, pageSize, sort?.desc, sort?.id]);
+  useEffect(() => setPage(1), [active, deferredSearch, pageSize, sort?.desc, sort?.id, userType]);
 
   const usersQuery = useQuery({
     queryKey: ["users-page", filters],
@@ -182,7 +185,6 @@ export function UserAccessManager({
     name: "role_scopes",
   });
   const watchedCreateScopes = createForm.watch("role_scopes");
-  const createPermissions = createForm.watch("module_permissions");
   const scopeForm = useForm<ScopesForm>({
     resolver: zodResolver(scopesSchema),
     defaultValues: { scopes: [] },
@@ -234,6 +236,22 @@ export function UserAccessManager({
         error instanceof Error ? error.message : "Could not update user status.",
       ),
   });
+  const passwordResetMutation = useMutation({
+    mutationFn: ({ target, password }: { target: User; password: string }) =>
+      morax.resetUserPassword(target.id, password),
+    onSuccess: async (result) => {
+      setNotice(`Success: Password reset for ${result.username}. ${result.sessions_revoked ? "Existing sessions were signed out." : ""}`.trim());
+      setPasswordResetUser(null);
+      setReplacementPassword("");
+      setReplacementPasswordConfirmation("");
+      setPasswordResetError("");
+      await refreshUsers();
+    },
+    onError: (error) =>
+      setPasswordResetError(
+        error instanceof Error ? error.message : "Could not reset the password.",
+      ),
+  });
 
   const candidates = (scopeType: string) => {
     if (scopeType === "ORGANIZATION")
@@ -256,6 +274,13 @@ export function UserAccessManager({
     },
     [scopeForm],
   );
+  const startPasswordReset = useCallback((target: User) => {
+    setNotice("");
+    setPasswordResetUser(target);
+    setReplacementPassword("");
+    setReplacementPasswordConfirmation("");
+    setPasswordResetError("");
+  }, []);
   const addScope = () => {
     const unit = scopeOptions.data?.units[0];
     scopeFields.append({
@@ -265,6 +290,15 @@ export function UserAccessManager({
     });
   };
   const addCreateScope = () => {
+    if (userType === "CONTRACTOR") {
+      const contractor = scopeOptions.data?.contractors[0];
+      createScopeFields.append({
+        role: "CONTRACTOR_MAKER",
+        scope_type: "CONTRACTOR",
+        scope_id: contractor ? String(contractor.id) : "",
+      });
+      return;
+    }
     const unit = scopeOptions.data?.units[0];
     createScopeFields.append({
       role: unit ? "UNIT_MAKER" : "VIEWER",
@@ -415,6 +449,15 @@ export function UserAccessManager({
             <button
               type="button"
               className="icon-action"
+              title="Set a new password"
+              aria-label={`Set a new password for ${row.original.name}`}
+              onClick={() => startPasswordReset(row.original)}
+            >
+              <KeyRound size={16} />
+            </button>
+            <button
+              type="button"
+              className="icon-action"
               title="Login as user"
               aria-label={`Login as ${row.original.name}`}
               disabled={
@@ -424,13 +467,13 @@ export function UserAccessManager({
               }
               onClick={() => loginAs(row.original)}
             >
-              <KeyRound size={16} />
+              <LogIn size={16} />
             </button>
           </div>
         ),
       },
     ],
-    [loginAs, page, pageSize, scopeLabel, startScopes, statusMutation, user.id],
+    [loginAs, page, pageSize, scopeLabel, startPasswordReset, startScopes, statusMutation, user.id],
   );
   const table = useTable({
     features: userTableFeatures,
@@ -471,22 +514,49 @@ export function UserAccessManager({
           className="primary-action"
           onClick={() => {
             setNotice("");
+            const contractor = scopeOptions.data?.contractors[0];
             const unit = scopeOptions.data?.units[0];
             createForm.reset({
               name: "", email: "", mobile: "", password: "", password_confirmation: "", active: true,
-              role_scopes: [{
-                role: unit ? "UNIT_MAKER" : "VIEWER",
-                scope_type: unit ? "UNIT" : "ORGANIZATION",
-                scope_id: unit ? String(unit.id) : user.organization_id,
-              }],
+              role_scopes: userType === "CONTRACTOR"
+                ? [{
+                  role: "CONTRACTOR_MAKER",
+                  scope_type: "CONTRACTOR",
+                  scope_id: contractor ? String(contractor.id) : "",
+                }]
+                : [{
+                  role: unit ? "UNIT_MAKER" : "VIEWER",
+                  scope_type: unit ? "UNIT" : "ORGANIZATION",
+                  scope_id: unit ? String(unit.id) : user.organization_id,
+                }],
               module_permissions: [],
             });
             setCreateOpen(true);
           }}
         >
-          <Plus size={17} /> Add user
+          <Plus size={17} /> Add {userType === "CONTRACTOR" ? "contractor user" : "user"}
         </button>
       </header>
+      <div className="user-access-tabs" role="tablist" aria-label="User categories">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={userType === "COMPANY"}
+          className={userType === "COMPANY" ? "active" : ""}
+          onClick={() => setUserType("COMPANY")}
+        >
+          Company users
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={userType === "CONTRACTOR"}
+          className={userType === "CONTRACTOR" ? "active" : ""}
+          onClick={() => setUserType("CONTRACTOR")}
+        >
+          Contractor users
+        </button>
+      </div>
       {notice && (
         <p
           className={`alert ${notice.includes("success") ? "success" : "error"}`}
@@ -497,7 +567,7 @@ export function UserAccessManager({
 
       <section className="panel entity-list-panel user-access-table-panel">
         <div className="user-table-heading">
-          <h2><UserRoundCog size={18} /> Company Users</h2>
+          <h2><UserRoundCog size={18} /> {userType === "CONTRACTOR" ? "Contractor Users" : "Company Users"}</h2>
           <span>{total} Users</span>
         </div>
         <div className="user-table-controls">
@@ -549,7 +619,7 @@ export function UserAccessManager({
         ) : table.getRowModel().rows.length === 0 ? (
           <EmptyState
             title="No users found"
-            description="Change the filters or create the first organization user."
+            description={userType === "CONTRACTOR" ? "Change the filters or create the first Contractor user." : "Change the filters or create the first organization user."}
           />
         ) : (
           <div className="table-wrap modern-data-table">
@@ -630,9 +700,10 @@ export function UserAccessManager({
 
       {createOpen && (
         <Drawer
-          title="Create user"
+          title={userType === "CONTRACTOR" ? "Create contractor user" : "Create user"}
           icon={<UserRoundCog size={19} />}
           onClose={() => setCreateOpen(false)}
+          pageForm
         >
           <form
             className="entity-form"
@@ -654,7 +725,7 @@ export function UserAccessManager({
                 <input type="email" {...createForm.register("email")} />
               </FormField>
               <FormField label="Mobile">
-                <input {...createForm.register("mobile")} />
+                <input inputMode="numeric" minLength={10} maxLength={10} pattern="[6-9][0-9]{9}" {...createForm.register("mobile")} />
               </FormField>
               <FormField
                 label="Password"
@@ -682,7 +753,7 @@ export function UserAccessManager({
                   <div className="scope-row" key={field.id}>
                     <FormField label="Role">
                       <select {...createForm.register(`role_scopes.${index}.role`)}>
-                        {ROLES.map((role) => <option key={role} value={role}>{roleLabel(role)}</option>)}
+                        {(userType === "CONTRACTOR" ? CONTRACTOR_ROLES : ROLES).map((role) => <option key={role} value={role}>{roleLabel(role)}</option>)}
                       </select>
                     </FormField>
                     <FormField label="Access type">
@@ -695,8 +766,8 @@ export function UserAccessManager({
                         {SCOPE_TYPES.map((type) => <option key={type} value={type}>{roleLabel(type)}</option>)}
                       </select>
                     </FormField>
-                    <FormField label="Project / site" error={createForm.formState.errors.role_scopes?.[index]?.scope_id?.message}>
-                      <select {...createForm.register(`role_scopes.${index}.scope_id`)} disabled={!choices.length}>
+                    <FormField label="Authorized entity" error={createForm.formState.errors.role_scopes?.[index]?.scope_id?.message}>
+                      <select {...createForm.register(`role_scopes.${index}.scope_id`)} disabled={!choices.length} aria-label="Searchable authorized entity list">
                         {choices.map((choice) => <option key={String(choice.id)} value={String(choice.id)}>{String(choice.name)}</option>)}
                       </select>
                     </FormField>
@@ -705,20 +776,6 @@ export function UserAccessManager({
                 );
               })}
               <button type="button" className="secondary add-scope-button" onClick={addCreateScope}><Plus size={16} /> Add role scope</button>
-            </div>
-            <div className="form-section">
-              <h3>Additional module permissions</h3>
-              <div className="form-grid">
-                {MODULE_PERMISSIONS.map((permission) => (
-                  <label className="inline" key={permission}>
-                    <input
-                      type="checkbox"
-                      checked={createPermissions.includes(permission)}
-                      onChange={(event) => createForm.setValue("module_permissions", event.target.checked ? [...createPermissions, permission] : createPermissions.filter((item) => item !== permission))}
-                    /> {permission}
-                  </label>
-                ))}
-              </div>
             </div>
             <DrawerFooter
               onCancel={() => setCreateOpen(false)}
@@ -734,6 +791,7 @@ export function UserAccessManager({
           title={`Roles & scopes — ${scopeUser.name}`}
           icon={<ShieldCheck size={19} />}
           onClose={() => setScopeUser(null)}
+          pageForm
         >
           <form
             className="entity-form"
@@ -842,6 +900,73 @@ export function UserAccessManager({
           </form>
         </Drawer>
       )}
+
+      {passwordResetUser && (
+        <Drawer
+          title={`Set new password — ${passwordResetUser.name}`}
+          icon={<KeyRound size={19} />}
+          onClose={() => {
+            if (!passwordResetMutation.isPending) {
+              setPasswordResetUser(null);
+              setReplacementPassword("");
+              setReplacementPasswordConfirmation("");
+              setPasswordResetError("");
+            }
+          }}
+        >
+          <form
+            className="entity-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (replacementPassword !== replacementPasswordConfirmation) {
+                setPasswordResetError("Passwords do not match.");
+                return;
+              }
+              passwordResetMutation.mutate({
+                target: passwordResetUser,
+                password: replacementPassword,
+              });
+            }}
+          >
+            <p className="scope-intro">
+              Login username: <b>{passwordResetUser.email}</b>. Existing passwords cannot be viewed because they are securely hashed. Set a replacement and share it directly with the user; no email, OTP, or activation link is sent.
+            </p>
+            {passwordResetError && <InlineError message={passwordResetError} />}
+            <div className="form-grid">
+              <FormField label="New password">
+                <input
+                  type="password"
+                  value={replacementPassword}
+                  onChange={(event) => setReplacementPassword(event.target.value)}
+                  autoComplete="new-password"
+                  minLength={8}
+                  required
+                />
+              </FormField>
+              <FormField label="Confirm new password">
+                <input
+                  type="password"
+                  value={replacementPasswordConfirmation}
+                  onChange={(event) => setReplacementPasswordConfirmation(event.target.value)}
+                  autoComplete="new-password"
+                  minLength={8}
+                  required
+                />
+              </FormField>
+            </div>
+            <DrawerFooter
+              onCancel={() => {
+                setPasswordResetUser(null);
+                setReplacementPassword("");
+                setReplacementPasswordConfirmation("");
+                setPasswordResetError("");
+              }}
+              busy={passwordResetMutation.isPending}
+              label="Set new password"
+            />
+          </form>
+        </Drawer>
+      )}
     </section>
   );
 }
@@ -851,22 +976,24 @@ function Drawer({
   icon,
   onClose,
   children,
+  pageForm = false,
 }: {
   title: string;
   icon: ReactNode;
   onClose: () => void;
   children: ReactNode;
+  pageForm?: boolean;
 }) {
   return (
     <div
-      className="crud-drawer-backdrop"
+      className={pageForm ? "workspace-form-backdrop" : "crud-drawer-backdrop"}
       role="presentation"
       onMouseDown={onClose}
     >
       <section
-        className="crud-drawer"
-        role="dialog"
-        aria-modal="true"
+        className={pageForm ? "workspace-form" : "crud-drawer"}
+        role={pageForm ? "region" : "dialog"}
+        aria-modal={pageForm ? undefined : true}
         aria-label={title}
         onMouseDown={(event) => event.stopPropagation()}
       >

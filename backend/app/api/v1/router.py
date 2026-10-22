@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import re
 from datetime import UTC, date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -20,14 +21,15 @@ from app.models import (
     State, Unit, User, UserActivation, UserPermissionGrant, UserRoleScope,
 )
 from app.schemas import (
-    AccountActivationInput, ActivityInput, AssignmentInput, CommentInput, ContractorInput, ContractorSiteInput, EntityUserAssignmentInput, GenerationRequest,
+    AccountActivationInput, ActivityInput, AdministratorPasswordResetInput, AssignmentInput, CommentInput, ContractorInput, ContractorSiteInput, EntityUserAssignmentInput, GenerationRequest,
     DevelopmentResetInput, LoginRequest, OrganizationInput, PlatformOrganizationInput, OrganizationStatusInput, PasswordChangeRequest, RoleScopeInput, RuleInput, UnitInput, UserCreateInput,
     WorkflowDecision, SubmissionInput, UserUpdateInput, EvidenceVerificationInput, NotApplicableInput, RuleStatusInput, DOCUMENT_TYPES,
 )
 from app.services.access import CHECKER_ROLES, MAKER_ROLES, MODULE_PERMISSION_CHOICES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, current_user, has_permission, is_org_admin, platform_master_organization_id, require_org_admin, roles_for, user_summary
 from app.services.audit import audit
-from app.services.activation import activate_account, issue_activation, send_activation_email, set_unusable_password
+from app.services.activation import activate_account
 from app.services.compliance import SUBJECTS, assert_assignment_or_admin, generate_for_subject, submit, transition
+from app.services.location_master import ensure_cities_for_state, ensure_states
 from app.services.serialization import entity_dict, instance_dict, model_dict
 from app.storage.files import delete_stored_file, file_path, save_upload
 
@@ -57,10 +59,86 @@ def organization_dict(organization: Organization) -> dict:
     return result
 
 
+def platform_organization_dict(db: Session, organization: Organization) -> dict:
+    """Add the recoverable Organization Admin login identifier for platform use.
+
+    Passwords are intentionally absent: MORAX stores only password hashes, so
+    an authorized administrator can replace a forgotten password but can never
+    retrieve it.
+    """
+    organization_admin = db.scalar(
+        select(User)
+        .join(UserRoleScope, UserRoleScope.user_id == User.id)
+        .where(
+            User.organization_id == organization.id,
+            UserRoleScope.role == "ORGANIZATION_ADMIN",
+            UserRoleScope.scope_type == "ORGANIZATION",
+            UserRoleScope.scope_id == organization.id,
+        )
+        .order_by(User.created_at, User.id)
+        .limit(1)
+    )
+    result = organization_dict(organization)
+    result["organization_admin"] = (
+        {
+            "id": organization_admin.id,
+            "name": organization_admin.name,
+            "email": organization_admin.email,
+            "active": organization_admin.active,
+        }
+        if organization_admin
+        else None
+    )
+    return result
+
+
+def reset_password_by_administrator(
+    db: Session,
+    target: User,
+    actor: User,
+    new_password: str,
+    *,
+    action: str,
+) -> int:
+    """Replace, rather than expose, a password and invalidate old sessions."""
+    target.password_hash = hash_password(new_password)
+    target.must_change_password = False
+    revoked_sessions = 0
+    now = datetime.now(UTC)
+    for session in db.scalars(
+        select(AuthSession).where(
+            AuthSession.user_id == target.id,
+            AuthSession.revoked_at.is_(None),
+        )
+    ):
+        session.revoked_at = now
+        revoked_sessions += 1
+    # A historic activation token must not remain a second password-reset
+    # path after an administrator has selected a direct password.
+    db.execute(
+        delete(UserActivation).where(
+            UserActivation.user_id == target.id,
+            UserActivation.used_at.is_(None),
+        )
+    )
+    audit(
+        db,
+        organization_id=target.organization_id,
+        actor_id=actor.id,
+        action=action,
+        module="AUTH",
+        entity_type="User",
+        entity_id=target.id,
+        new={"email": target.email, "sessions_revoked": revoked_sessions},
+    )
+    return revoked_sessions
+
+
 def apply_platform_organization(organization: Organization, payload: PlatformOrganizationInput, actor_id: str) -> None:
     values = payload.model_dump()
     organization.name = values["organization_name"].strip()
-    organization.code = values["organization_code"].strip().upper()
+    if values["organization_code"]:
+        organization.code = values["organization_code"].strip().upper()
     organization.legal_name = values["legal_name"]
     organization.registration_number = values["registration_number"]
     organization.pan = values["pan"]
@@ -75,6 +153,23 @@ def apply_platform_organization(organization: Organization, payload: PlatformOrg
     organization.compliance_start_date = values["compliance_start_date"]
     organization.status = values["status"].upper()
     organization.updated_by_id = actor_id
+
+
+def generated_code(db: Session, model, name: str, prefix: str, organization_id: str | None = None) -> str:
+    """Generate a readable, collision-free code when users do not supply one."""
+    stem = re.sub(r"[^A-Z0-9]+", "-", name.upper()).strip("-")[:28] or "RECORD"
+    base = f"{prefix}-{stem}"
+    candidate = base
+    number = 2
+    while True:
+        query = select(model.id).where(model.code == candidate)
+        if organization_id is not None:
+            query = query.where(model.organization_id == organization_id)
+        if not db.scalar(query):
+            return candidate[:50]
+        suffix = f"-{number}"
+        candidate = f"{base[:50 - len(suffix)]}{suffix}"
+        number += 1
 
 
 def require_manager(db: Session, user: User, organization_id: str) -> None:
@@ -235,6 +330,12 @@ def replace_entity_assignments(
     return new_assignments
 
 
+def require_maker_and_checker(assignments: list[EntityUserAssignmentInput]) -> None:
+    assigned_roles = {item.role for item in assignments}
+    if not {"MAKER", "CHECKER"}.issubset(assigned_roles):
+        raise HTTPException(422, "Maker and Checker assignments are required. Admin assignment is optional.")
+
+
 def validate_role_scopes(db: Session, organization_id: str, scopes: list[RoleScopeInput]) -> None:
     if not scopes:
         raise HTTPException(422, "At least one role and access scope is required")
@@ -245,7 +346,6 @@ def validate_role_scopes(db: Session, organization_id: str, scopes: list[RoleSco
         "UNIT_MAKER": "UNIT",
         "UNIT_CHECKER": "UNIT",
         "CONTRACTOR_ADMIN": "CONTRACTOR",
-        "CONTRACTOR_MAKER": "CONTRACTOR",
         "CONTRACTOR_CHECKER": "CONTRACTOR",
     }
     for item in scopes:
@@ -254,6 +354,8 @@ def validate_role_scopes(db: Session, organization_id: str, scopes: list[RoleSco
         expected = required_scope_type.get(item.role)
         if expected and item.scope_type != expected:
             raise HTTPException(422, f"{item.role} must be assigned to a {expected} scope")
+        if item.role == "CONTRACTOR_MAKER" and item.scope_type not in {"CONTRACTOR", "UNIT"}:
+            raise HTTPException(422, "CONTRACTOR_MAKER must be assigned to a Contractor or authorized Unit scope")
         key = (item.role, item.scope_type, item.scope_id)
         if key in seen_scopes:
             raise HTTPException(422, "Duplicate role scope is not allowed")
@@ -290,6 +392,25 @@ def resolve_city(db: Session, state_id: str, city_id: str | None, city: str | No
     if not record or not record.active or record.state_id != state_id:
         raise HTTPException(422, "City must be an active city configured for the selected State")
     return record.id, record.name
+
+
+def validate_organization_city(db: Session, state_id: str | None, city: str | None) -> None:
+    """Ensure an Organization's City/District belongs to its selected State."""
+    if not city:
+        return
+    if not state_id:
+        raise HTTPException(422, "Select a State before selecting a City / District")
+    state = db.get(State, state_id)
+    if not state:
+        raise HTTPException(422, "State must be a configured master value")
+    ensure_cities_for_state(db, state)
+    record = db.scalar(select(City).where(
+        City.state_id == state_id,
+        City.active.is_(True),
+        City.name.ilike(city.strip()),
+    ))
+    if not record:
+        raise HTTPException(422, "City / District must belong to the selected State")
 
 
 def principal_employer_for(db: Session, organization_id: str, unit_id: str) -> Unit:
@@ -593,7 +714,7 @@ def list_platform_organizations(q: str | None = None, status: str | None = None,
         query = query.where(or_(Organization.name.ilike(f"%{q}%"), Organization.code.ilike(f"%{q}%"), Organization.legal_name.ilike(f"%{q}%")))
     if status:
         query = query.where(Organization.status == status.upper())
-    return [organization_dict(item) for item in db.scalars(query.order_by(Organization.name))]
+    return [platform_organization_dict(db, item) for item in db.scalars(query.order_by(Organization.name))]
 
 
 @router.post("/platform/organizations")
@@ -601,7 +722,8 @@ def create_platform_organization(payload: PlatformOrganizationInput, user: User 
     require_platform_admin(user)
     if not payload.organization_admin_name or not payload.organization_admin_email or not payload.organization_admin_password:
         raise HTTPException(422, "Organization Admin name, email, and password are required")
-    code = payload.organization_code.strip().upper()
+    code = (payload.organization_code or "").strip().upper() or generated_code(db, Organization, payload.organization_name, "ORG")
+    payload.organization_code = code
     if db.scalar(select(Organization).where(Organization.code == code)):
         raise HTTPException(409, "Organization code already exists")
     admin_email = str(payload.organization_admin_email).lower()
@@ -609,8 +731,10 @@ def create_platform_organization(payload: PlatformOrganizationInput, user: User 
         raise HTTPException(409, "An account with the Organization Admin email already exists")
     if payload.state_id and not db.get(State, payload.state_id):
         raise HTTPException(422, "State must be a configured master value")
+    validate_organization_city(db, payload.state_id, payload.city)
     organization = Organization(name=payload.organization_name.strip(), code=code, created_by_id=user.id)
     apply_platform_organization(organization, payload, user.id)
+    organization.status = "ACTIVE"
     db.add(organization); db.flush()
     organization_admin = User(
         organization_id=organization.id,
@@ -631,9 +755,7 @@ def create_platform_organization(payload: PlatformOrganizationInput, user: User 
     audit(db, organization_id=organization.id, actor_id=user.id, action="CREATE_ORGANIZATION_ADMIN", module="USERS", entity_type="User", entity_id=organization_admin.id, new={"email": organization_admin.email, "role": "ORGANIZATION_ADMIN"})
     audit(db, organization_id=organization.id, actor_id=user.id, action="ORGANIZATION_ADMIN_PASSWORD_SET", module="AUTH", entity_type="User", entity_id=organization_admin.id)
     db.commit()
-    return organization_dict(organization) | {
-        "organization_admin": {"id": organization_admin.id, "name": organization_admin.name, "email": organization_admin.email},
-    }
+    return platform_organization_dict(db, organization)
 
 
 @router.get("/platform/organizations/{organization_id}")
@@ -642,7 +764,7 @@ def get_platform_organization(organization_id: str, user: User = Depends(current
     organization = db.get(Organization, organization_id)
     if not organization:
         raise HTTPException(404, "Organization not found")
-    return organization_dict(organization)
+    return platform_organization_dict(db, organization)
 
 
 @router.patch("/platform/organizations/{organization_id}")
@@ -651,17 +773,19 @@ def update_platform_organization(organization_id: str, payload: PlatformOrganiza
     organization = db.get(Organization, organization_id)
     if not organization:
         raise HTTPException(404, "Organization not found")
-    code = payload.organization_code.strip().upper()
+    code = (payload.organization_code or organization.code).strip().upper()
+    payload.organization_code = code
     other = db.scalar(select(Organization).where(Organization.code == code, Organization.id != organization.id))
     if other:
         raise HTTPException(409, "Organization code already exists")
     if payload.state_id and not db.get(State, payload.state_id):
         raise HTTPException(422, "State must be a configured master value")
+    validate_organization_city(db, payload.state_id, payload.city)
     old = {"code": organization.code, "name": organization.name, "status": organization.status}
     apply_platform_organization(organization, payload, user.id)
     audit(db, organization_id=organization.id, actor_id=user.id, action="ORGANIZATION_UPDATED", module="PLATFORM", entity_type="Organization", entity_id=organization.id, old=old, new={"code": organization.code, "name": organization.name, "status": organization.status})
     db.commit()
-    return organization_dict(organization)
+    return platform_organization_dict(db, organization)
 
 
 @router.post("/platform/organizations/{organization_id}/status")
@@ -675,33 +799,54 @@ def set_platform_organization_status(organization_id: str, payload: Organization
     action = "ORGANIZATION_ACTIVATED" if payload.status == "ACTIVE" else "ORGANIZATION_DEACTIVATED"
     audit(db, organization_id=organization.id, actor_id=user.id, action=action, module="PLATFORM", entity_type="Organization", entity_id=organization.id, old={"status": old}, new={"status": organization.status})
     db.commit()
-    return organization_dict(organization)
+    return platform_organization_dict(db, organization)
 
 
-@router.post("/platform/organizations/{organization_id}/organization-admin/resend-activation")
-def resend_organization_admin_activation(organization_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+@router.post("/platform/organizations/{organization_id}/organization-admin/reset-password")
+def reset_organization_admin_password(
+    organization_id: str,
+    payload: AdministratorPasswordResetInput,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Set a replacement password for an organization's primary Admin.
+
+    This is deliberately a direct, Product-Admin-controlled operation. It
+    neither reveals an existing password nor sends email, OTP, or activation
+    links.
+    """
     require_platform_admin(user)
     organization = db.get(Organization, organization_id)
     if not organization:
         raise HTTPException(404, "Organization not found")
-    scope = db.scalar(select(UserRoleScope).where(
-        UserRoleScope.scope_type == "ORGANIZATION",
-        UserRoleScope.scope_id == organization.id,
-        UserRoleScope.role == "ORGANIZATION_ADMIN",
-    ))
-    organization_admin = db.get(User, scope.user_id) if scope else None
+    organization_admin = db.scalar(
+        select(User)
+        .join(UserRoleScope, UserRoleScope.user_id == User.id)
+        .where(
+            User.organization_id == organization.id,
+            UserRoleScope.scope_type == "ORGANIZATION",
+            UserRoleScope.scope_id == organization.id,
+            UserRoleScope.role == "ORGANIZATION_ADMIN",
+        )
+        .order_by(User.created_at, User.id)
+        .limit(1)
+    )
     if not organization_admin:
         raise HTTPException(404, "Organization Admin account not found")
-    if not organization_admin.must_change_password:
-        raise HTTPException(409, "The Organization Admin has already activated this account")
-    _, activation_token = issue_activation(db, organization_admin, user.id)
-    audit(db, organization_id=organization.id, actor_id=user.id, action="ACTIVATION_LINK_REISSUED", module="AUTH", entity_type="User", entity_id=organization_admin.id)
+    revoked_sessions = reset_password_by_administrator(
+        db,
+        organization_admin,
+        user,
+        payload.new_password,
+        action="PRODUCT_ADMIN_RESET_ORGANIZATION_ADMIN_PASSWORD",
+    )
     db.commit()
-    try:
-        delivery = send_activation_email(organization_admin, activation_token)
-    except RuntimeError:
-        delivery = "pending"
-    return {"ok": True, "activation_delivery": delivery}
+    return {
+        "ok": True,
+        "username": organization_admin.email,
+        "sessions_revoked": revoked_sessions,
+        "message": "Organization Admin password was replaced. Share the new password directly with the administrator.",
+    }
 
 
 @router.post("/platform/organizations/{organization_id}/development-reset")
@@ -899,13 +1044,32 @@ def complete_account_activation(payload: AccountActivationInput, db: Session = D
 
 @router.get("/master-data/states")
 def states(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    try:
+        if ensure_states(db):
+            db.commit()
+    except HTTPException:
+        # A previously persisted State master is still authoritative enough to
+        # keep Create/Edit forms usable while the public service is offline.
+        if not list(db.scalars(select(State).where(State.active.is_(True)))):
+            raise
     return [model_dict(row, ["id", "name", "code", "active"]) for row in db.scalars(select(State).where(State.active.is_(True)).order_by(State.name))]
 
 
 @router.get("/master-data/cities")
 def cities(state_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    if not db.get(State, state_id):
+    state = db.get(State, state_id)
+    if not state:
         raise HTTPException(422, "State must be a configured master value")
+    try:
+        if ensure_cities_for_state(db, state):
+            db.commit()
+    except HTTPException:
+        # Existing locally cached cities remain usable if the public source is
+        # temporarily unavailable. A State with no local data returns the API
+        # failure so the UI can tell the user what happened.
+        cached = list(db.scalars(select(City).where(City.state_id == state_id, City.active.is_(True))))
+        if not cached:
+            raise
     return [model_dict(row, ["id", "state_id", "name", "active"]) for row in db.scalars(select(City).where(City.state_id == state_id, City.active.is_(True)).order_by(City.name))]
 
 
@@ -927,6 +1091,9 @@ def update_organization(payload: OrganizationInput, user: User = Depends(current
     organization_id = org_for(user)
     require_org_admin(db, user, organization_id)
     organization = db.get(Organization, organization_id)
+    if payload.state_id and not db.get(State, payload.state_id):
+        raise HTTPException(422, "State must be a configured master value")
+    validate_organization_city(db, payload.state_id, payload.city)
     old = {"name": organization.name, "status": organization.status}
     for key, value in payload.model_dump().items():
         setattr(organization, key, value)
@@ -957,13 +1124,15 @@ def get_unit(unit_id: str, user: User = Depends(current_user), db: Session = Dep
 def create_unit(payload: UnitInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     organization_id = org_for(user)
     require_permission(db, user, "entities.manage")
+    payload.code = (payload.code or "").strip().upper() or generated_code(db, Unit, payload.name, "UNIT", organization_id)
     if db.scalar(select(Unit).where(Unit.organization_id == organization_id, Unit.code == payload.code)):
         raise HTTPException(409, "A unit with this code already exists in the organization")
     if not db.get(State, payload.state_id) or not db.get(IndustryType, payload.industry_type_id):
         raise HTTPException(422, "State and industry type must be configured master values")
     payload.city_id, payload.city = resolve_city(db, payload.state_id, payload.city_id, payload.city)
     payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
-    unit = Unit(organization_id=organization_id, **payload.model_dump())
+    values = payload.model_dump(exclude={"compliance_types"})
+    unit = Unit(organization_id=organization_id, compliance_types_json=json.dumps(payload.compliance_types), **values)
     db.add(unit)
     db.flush()
     generate_for_subject(db, organization_id, "UNIT", unit.id, date.today(), user.id)
@@ -978,6 +1147,7 @@ def update_unit(unit_id: str, payload: UnitInput, user: User = Depends(current_u
     if not unit or unit.organization_id != org_for(user):
         raise HTTPException(404, "Unit not found")
     require_permission(db, user, "entities.manage")
+    payload.code = (payload.code or unit.code).strip().upper()
     if db.scalar(select(Unit).where(Unit.organization_id == unit.organization_id, Unit.code == payload.code, Unit.id != unit.id)):
         raise HTTPException(409, "A unit with this code already exists in the organization")
     if not db.get(State, payload.state_id):
@@ -985,7 +1155,9 @@ def update_unit(unit_id: str, payload: UnitInput, user: User = Depends(current_u
     payload.city_id, payload.city = resolve_city(db, payload.state_id, payload.city_id, payload.city)
     payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
     old = {"industry_type_id": unit.industry_type_id, "other_industry_name": unit.other_industry_name, "state_id": unit.state_id, "status": unit.status}
-    for key, value in payload.model_dump().items(): setattr(unit, key, value)
+    values = payload.model_dump(exclude={"compliance_types"})
+    for key, value in values.items(): setattr(unit, key, value)
+    unit.compliance_types_json = json.dumps(payload.compliance_types)
     generate_for_subject(db, unit.organization_id, "UNIT", unit.id, date.today(), user.id)
     audit(db, organization_id=unit.organization_id, actor_id=user.id, action="UPDATE_UNIT", module="ENTITIES", entity_type="Unit", entity_id=unit.id, old=old, new={"industry_type_id": unit.industry_type_id, "other_industry_name": unit.other_industry_name, "state_id": unit.state_id, "status": unit.status})
     commit_or_conflict(db, "A unit with this code already exists in the organization")
@@ -1020,6 +1192,8 @@ def list_unit_user_assignments(unit_id: str, user: User = Depends(current_user),
 def replace_unit_user_assignments(unit_id: str, payload: list[EntityUserAssignmentInput], user: User = Depends(current_user), db: Session = Depends(get_db)):
     organization_id = org_for(user)
     require_org_admin(db, user, organization_id)
+    entity_for_assignment(db, organization_id, "UNIT", unit_id)
+    require_maker_and_checker(payload)
     rows = replace_entity_assignments(db, organization_id, "UNIT", unit_id, payload, user.id)
     commit_or_conflict(db, "Unit user assignments could not be saved")
     return rows
@@ -1048,24 +1222,50 @@ def get_contractor(contractor_id: str, user: User = Depends(current_user), db: S
 @router.post("/contractors")
 def create_contractor(payload: ContractorInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user); require_permission(db, user, "entities.manage")
+    payload.code = (payload.code or "").strip().upper() or generated_code(db, Contractor, payload.name, "CONTRACTOR", org)
     if db.scalar(select(Contractor).where(Contractor.organization_id == org, Contractor.code == payload.code)):
         raise HTTPException(409, "A contractor with this code already exists in the organization")
+    maker_email = str(payload.contractor_maker_email).lower() if payload.contractor_maker_email else None
+    if not maker_email or not payload.contractor_maker_password:
+        raise HTTPException(422, "Contractor Maker email and password are required when creating a contractor")
+    if maker_email and db.scalar(select(User).where(User.email == maker_email)):
+        raise HTTPException(409, "A user with the Contractor Maker email already exists")
     principal_employer = principal_employer_for(db, org, payload.unit_id)
-    # State and city are always inherited from the Principal Employer.  The
-    # payload may not use a client-provided value to bypass this relationship.
+    # State is inherited from the Principal Employer. City/District is chosen
+    # from that State's controlled LGD list and validated below.
     payload.state_id = principal_employer.state_id
-    payload.city_id = principal_employer.city_id
-    payload.city = principal_employer.city
+    payload.city_id, payload.city = resolve_city(db, payload.state_id, payload.city_id, payload.city)
     if not payload.compliance_start_date:
         payload.compliance_start_date = payload.contract_start_date or date.today()
     validate_worker_capacity(db, principal_employer, payload.male_workers + payload.female_workers)
     payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
-    contractor = Contractor(organization_id=org, **payload.model_dump())
+    contractor = Contractor(organization_id=org, **payload.model_dump(exclude={"contractor_maker_email", "contractor_maker_password"}))
     db.add(contractor); db.flush()
+    contractor_maker: User | None = None
+    if maker_email:
+        contractor_maker = User(
+            organization_id=org,
+            name=f"{contractor.name} Maker",
+            email=maker_email,
+            password_hash=hash_password(payload.contractor_maker_password or ""),
+            mobile=payload.contact_phone,
+            active=True,
+            must_change_password=False,
+        )
+        db.add(contractor_maker); db.flush()
+        db.add(UserRoleScope(
+            user_id=contractor_maker.id,
+            role="CONTRACTOR_MAKER",
+            scope_type="CONTRACTOR",
+            scope_id=contractor.id,
+        ))
+        audit(db, organization_id=org, actor_id=user.id, action="CREATE_CONTRACTOR_MAKER", module="USERS", entity_type="User", entity_id=contractor_maker.id, new={"email": maker_email, "contractor_id": contractor.id, "role": "CONTRACTOR_MAKER"})
+        audit(db, organization_id=org, actor_id=user.id, action="USER_PASSWORD_SET", module="AUTH", entity_type="User", entity_id=contractor_maker.id)
     generate_for_subject(db, org, "CONTRACTOR", contractor.id, date.today(), user.id)
     configure_contractor_assignments(db, contractor, payload.maker_user_id, payload.checker_user_id, user.id)
     audit(db, organization_id=org, actor_id=user.id, action="CREATE_CONTRACTOR", module="ENTITIES", entity_type="Contractor", entity_id=contractor.id, new={"name": contractor.name})
-    commit_or_conflict(db, "A contractor with this code already exists in the organization"); return entity_dict(db, contractor, "CONTRACTOR")
+    commit_or_conflict(db, "Contractor and Contractor Maker could not be saved")
+    return entity_dict(db, contractor, "CONTRACTOR") | ({"contractor_maker_user_id": contractor_maker.id} if contractor_maker else {})
 
 
 @router.patch("/contractors/{contractor_id}")
@@ -1074,17 +1274,17 @@ def update_contractor(contractor_id: str, payload: ContractorInput, user: User =
     if not contractor or contractor.organization_id != org_for(user):
         raise HTTPException(404, "Contractor not found")
     require_permission(db, user, "entities.manage")
+    payload.code = (payload.code or contractor.code).strip().upper()
     if db.scalar(select(Contractor).where(Contractor.organization_id == contractor.organization_id, Contractor.code == payload.code, Contractor.id != contractor.id)):
         raise HTTPException(409, "A contractor with this code already exists in the organization")
     principal_employer = principal_employer_for(db, contractor.organization_id, payload.unit_id)
     payload.state_id = principal_employer.state_id
-    payload.city_id = principal_employer.city_id
-    payload.city = principal_employer.city
+    payload.city_id, payload.city = resolve_city(db, payload.state_id, payload.city_id, payload.city)
     if not payload.compliance_start_date:
         payload.compliance_start_date = payload.contract_start_date or contractor.compliance_start_date or date.today()
     validate_worker_capacity(db, principal_employer, payload.male_workers + payload.female_workers, contractor.id)
     payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
-    for key, value in payload.model_dump().items(): setattr(contractor, key, value)
+    for key, value in payload.model_dump(exclude={"contractor_maker_email", "contractor_maker_password"}).items(): setattr(contractor, key, value)
     generate_for_subject(db, contractor.organization_id, "CONTRACTOR", contractor.id, date.today(), user.id)
     configure_contractor_assignments(db, contractor, payload.maker_user_id, payload.checker_user_id, user.id)
     audit(db, organization_id=contractor.organization_id, actor_id=user.id, action="UPDATE_CONTRACTOR", module="ENTITIES", entity_type="Contractor", entity_id=contractor.id, new={"name": contractor.name, "status": contractor.status})
@@ -1120,12 +1320,14 @@ def list_contractor_user_assignments(contractor_id: str, user: User = Depends(cu
 def replace_contractor_user_assignments(contractor_id: str, payload: list[EntityUserAssignmentInput], user: User = Depends(current_user), db: Session = Depends(get_db)):
     organization_id = org_for(user)
     require_org_admin(db, user, organization_id)
+    entity_for_assignment(db, organization_id, "CONTRACTOR", contractor_id)
+    require_maker_and_checker(payload)
     rows = replace_entity_assignments(db, organization_id, "CONTRACTOR", contractor_id, payload, user.id)
     commit_or_conflict(db, "Contractor user assignments could not be saved")
     return rows
 
 
-CONTRACTOR_DOCUMENT_TYPES = {"WORK_ORDER", "REGISTRATION_CERTIFICATE", "PF", "ESI", "LABOUR_LICENCE"}
+CONTRACTOR_DOCUMENT_TYPES = {"WORK_ORDER", "REGISTRATION_CERTIFICATE", "PF", "ESI", "LABOUR_LICENCE", "OTHER"}
 
 
 def contractor_or_404(db: Session, user: User, contractor_id: str) -> Contractor:
@@ -1179,6 +1381,22 @@ def download_contractor_document(document_id: str, user: User = Depends(current_
         raise HTTPException(404, "Contractor document not found")
     contractor_or_404(db, user, document.contractor_id)
     return FileResponse(file_path(document.stored_filename), filename=document.original_filename, media_type=document.content_type or "application/octet-stream")
+
+
+@router.delete("/contractor-documents/{document_id}")
+def delete_contractor_document(document_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    document = db.get(ContractorDocument, document_id)
+    if not document:
+        raise HTTPException(404, "Contractor document not found")
+    contractor = contractor_or_404(db, user, document.contractor_id)
+    if not (has_permission(db, user, "documents.manage") or has_permission(db, user, "entities.manage")):
+        raise HTTPException(403, "Document management permission is required")
+    stored_name = document.stored_filename
+    audit(db, organization_id=contractor.organization_id, actor_id=user.id, action="DELETE_CONTRACTOR_DOCUMENT", module="CONTRACTORS", entity_type="ContractorDocument", entity_id=document.id, old={"filename": document.original_filename, "contractor_id": contractor.id})
+    db.delete(document)
+    db.commit()
+    delete_stored_file(stored_name)
+    return {"ok": True}
 
 
 @router.get("/contractor-sites")
@@ -1256,7 +1474,7 @@ def delete_site(site_id: str, user: User = Depends(current_user), db: Session = 
 
 
 @router.get("/users")
-def list_users(paginated: bool = False, page: int = 1, page_size: int = 50, q: str | None = None, active: bool | None = None, sort_by: str = "name", sort_dir: str = "asc", user: User = Depends(current_user), db: Session = Depends(get_db)):
+def list_users(paginated: bool = False, page: int = 1, page_size: int = 50, q: str | None = None, active: bool | None = None, user_type: str | None = None, sort_by: str = "name", sort_dir: str = "asc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user); require_org_admin(db, user, org)
     filters = [User.organization_id == org]
     if q:
@@ -1264,6 +1482,15 @@ def list_users(paginated: bool = False, page: int = 1, page_size: int = 50, q: s
         filters.append(or_(User.name.ilike(text), User.email.ilike(text)))
     if active is not None:
         filters.append(User.active.is_(active))
+    if user_type:
+        role_groups = {
+            "COMPANY": {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "UNIT_CHECKER", "VIEWER", "AUDITOR"},
+            "CONTRACTOR": {"CONTRACTOR_ADMIN", "CONTRACTOR_MAKER", "CONTRACTOR_CHECKER"},
+        }
+        roles = role_groups.get(user_type.upper())
+        if not roles:
+            raise HTTPException(422, "user_type must be COMPANY or CONTRACTOR")
+        filters.append(User.id.in_(select(UserRoleScope.user_id).where(UserRoleScope.role.in_(roles))))
     allowed_sorts = {"name", "email", "active"}
     column = getattr(User, sort_by if sort_by in allowed_sorts else "name")
     ordering = column.desc() if sort_dir.lower() == "desc" else column.asc()
@@ -1325,6 +1552,35 @@ def update_user(user_id: str, payload: UserUpdateInput, user: User = Depends(cur
     for key, value in payload.model_dump(exclude_unset=True).items(): setattr(target, key, value)
     audit(db, organization_id=org, actor_id=user.id, action="UPDATE_USER", module="USERS", entity_type="User", entity_id=target.id, old=old, new={"name": target.name, "active": target.active, "mobile": target.mobile})
     db.commit(); return user_summary(db, target) | {"active": target.active, "mobile": target.mobile}
+
+
+@router.post("/users/{user_id}/reset-password")
+def reset_user_password(
+    user_id: str,
+    payload: AdministratorPasswordResetInput,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Allow an Organization Admin to set a tenant user's new password."""
+    organization_id = org_for(user)
+    require_org_admin(db, user, organization_id)
+    target = db.get(User, user_id)
+    if not target or target.organization_id != organization_id:
+        raise HTTPException(404, "User not found")
+    revoked_sessions = reset_password_by_administrator(
+        db,
+        target,
+        user,
+        payload.new_password,
+        action="ORGANIZATION_ADMIN_RESET_USER_PASSWORD",
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "username": target.email,
+        "sessions_revoked": revoked_sessions,
+        "message": "User password was replaced. Share the new password directly with the user.",
+    }
 
 
 @router.put("/users/{user_id}/role-scopes")

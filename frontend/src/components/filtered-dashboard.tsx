@@ -180,7 +180,6 @@ export function MainDashboard() {
     <div className="modern-page dashboard-page">
       <WorkspacePageHeader
         title="Compliance dashboard"
-        description="A live, filter-aware view of obligations, compliance health, and deadlines."
         actions={
           <button
             className="button-secondary"

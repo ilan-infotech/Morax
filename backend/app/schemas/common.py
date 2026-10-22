@@ -1,4 +1,5 @@
 from datetime import date, datetime
+import re
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
@@ -16,6 +17,14 @@ DOCUMENT_TYPES = (
     "DISPLAY",
     "NOTICE",
 )
+
+UNIT_COMPLIANCE_TYPES = {
+    "Shops & Establishments",
+    "Mines",
+    "BOCW",
+    "ESI",
+    "PF",
+}
 
 
 class ORMModel(BaseModel):
@@ -45,6 +54,11 @@ class PasswordChangeRequest(BaseModel):
     new_password: str = Field(min_length=8)
 
 
+class AdministratorPasswordResetInput(BaseModel):
+    """A replacement password selected by an authorized MORAX administrator."""
+    new_password: str = Field(min_length=8, max_length=256, repr=False)
+
+
 class AccountActivationInput(BaseModel):
     token: str = Field(min_length=32, max_length=512)
     password: str = Field(min_length=8, max_length=256)
@@ -57,6 +71,7 @@ class OrganizationInput(BaseModel):
     identifiers: str | None = None
     address: str | None = None
     state_id: str | None = None
+    city: str | None = Field(default=None, max_length=100)
     contact_email: EmailStr | None = None
     contact_phone: str | None = None
     compliance_start_date: date | None = None
@@ -65,7 +80,7 @@ class OrganizationInput(BaseModel):
 
 class PlatformOrganizationInput(BaseModel):
     organization_name: str = Field(min_length=2, max_length=200)
-    organization_code: str = Field(min_length=2, max_length=50, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    organization_code: str | None = Field(default=None, max_length=50, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
     legal_name: str | None = Field(default=None, max_length=250)
     registration_number: str | None = Field(default=None, max_length=100)
     pan: str | None = Field(default=None, max_length=20)
@@ -86,6 +101,13 @@ class PlatformOrganizationInput(BaseModel):
     organization_admin_email: EmailStr | None = None
     organization_admin_password: str | None = Field(default=None, min_length=8, max_length=256, repr=False)
 
+    @field_validator("primary_contact_phone")
+    @classmethod
+    def valid_primary_contact_mobile(cls, value: str | None) -> str | None:
+        if value is not None and value.strip() and not re.fullmatch(r"[6-9]\d{9}", value.strip()):
+            raise ValueError("Contact phone must be a valid 10-digit Indian mobile number")
+        return value.strip() if value else None
+
 
 class OrganizationStatusInput(BaseModel):
     status: str = Field(pattern="^(ACTIVE|INACTIVE)$")
@@ -97,7 +119,7 @@ class DevelopmentResetInput(BaseModel):
 
 class UnitInput(BaseModel):
     name: str = Field(min_length=2, max_length=200)
-    code: str = Field(min_length=2, max_length=50)
+    code: str | None = Field(default=None, max_length=50)
     unit_type: str | None = None
     industry_type_id: str
     other_industry_name: str | None = Field(default=None, max_length=150)
@@ -115,15 +137,45 @@ class UnitInput(BaseModel):
     contact_phone: str | None = None
     worker_limit: int | None = Field(default=None, ge=0)
     applicable_regulations: str | None = None
+    compliance_types: list[str] = Field(default_factory=list)
     male_employees: int = Field(default=0, ge=0)
     female_employees: int = Field(default=0, ge=0)
     compliance_start_date: date
     status: str = "ACTIVE"
 
+    @field_validator("contact_phone")
+    @classmethod
+    def valid_mobile(cls, value: str | None) -> str | None:
+        if value is not None and value.strip() and not re.fullmatch(r"[6-9]\d{9}", value.strip()):
+            raise ValueError("Mobile number must be a valid 10-digit Indian mobile number")
+        return value.strip() if value else None
+
+    @field_validator("pan")
+    @classmethod
+    def valid_pan(cls, value: str | None) -> str | None:
+        if value is not None and value.strip() and not re.fullmatch(r"[A-Z]{5}\d{4}[A-Z]", value.strip().upper()):
+            raise ValueError("PAN must use the format ABCDE1234F")
+        return value.strip().upper() if value else None
+
+    @field_validator("gstin")
+    @classmethod
+    def valid_gstin(cls, value: str | None) -> str | None:
+        if value is not None and value.strip() and not re.fullmatch(r"\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]", value.strip().upper()):
+            raise ValueError("GSTIN must be a valid 15-character GSTIN")
+        return value.strip().upper() if value else None
+
+    @field_validator("compliance_types")
+    @classmethod
+    def valid_compliance_types(cls, values: list[str]) -> list[str]:
+        invalid = set(values) - UNIT_COMPLIANCE_TYPES
+        if invalid:
+            raise ValueError(f"Unsupported unit compliance type: {', '.join(sorted(invalid))}")
+        return list(dict.fromkeys(values))
+
 
 class ContractorInput(BaseModel):
     name: str = Field(min_length=2, max_length=200)
-    code: str = Field(min_length=2, max_length=50)
+    code: str | None = Field(default=None, max_length=50)
     unit_id: str
     contractor_type: str | None = None
     industry_type_id: str | None = None
@@ -150,15 +202,40 @@ class ContractorInput(BaseModel):
     work_order_expiry_date: date | None = None
     maker_user_id: str | None = Field(default=None, exclude=True)
     checker_user_id: str | None = Field(default=None, exclude=True)
+    contractor_maker_email: EmailStr | None = Field(default=None, exclude=True)
+    contractor_maker_password: str | None = Field(default=None, min_length=8, max_length=256, exclude=True, repr=False)
     status: str = "ACTIVE"
 
     @model_validator(mode="after")
     def contract_dates_are_in_order(self) -> "ContractorInput":
+        if bool(self.contractor_maker_email) != bool(self.contractor_maker_password):
+            raise ValueError("Contractor Maker email and password must be provided together")
         if self.contract_end_date and not self.contract_start_date:
             raise ValueError("Contract Start Date is required when Contract End Date is supplied")
         if self.contract_start_date and self.contract_end_date and self.contract_end_date < self.contract_start_date:
             raise ValueError("Contract End Date cannot be earlier than Contract Start Date")
         return self
+
+    @field_validator("contact_phone")
+    @classmethod
+    def valid_mobile(cls, value: str | None) -> str | None:
+        if value is not None and value.strip() and not re.fullmatch(r"[6-9]\d{9}", value.strip()):
+            raise ValueError("Mobile number must be a valid 10-digit Indian mobile number")
+        return value.strip() if value else None
+
+    @field_validator("pan")
+    @classmethod
+    def valid_pan(cls, value: str | None) -> str | None:
+        if value is not None and value.strip() and not re.fullmatch(r"[A-Z]{5}\d{4}[A-Z]", value.strip().upper()):
+            raise ValueError("PAN must use the format ABCDE1234F")
+        return value.strip().upper() if value else None
+
+    @field_validator("gstin")
+    @classmethod
+    def valid_gstin(cls, value: str | None) -> str | None:
+        if value is not None and value.strip() and not re.fullmatch(r"\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]", value.strip().upper()):
+            raise ValueError("GSTIN must be a valid 15-character GSTIN")
+        return value.strip().upper() if value else None
 
 
 class ContractorSiteInput(BaseModel):
@@ -190,6 +267,13 @@ class UserInput(BaseModel):
     email: EmailStr
     mobile: str | None = None
     active: bool = True
+
+    @field_validator("mobile")
+    @classmethod
+    def valid_mobile(cls, value: str | None) -> str | None:
+        if value is not None and value.strip() and not re.fullmatch(r"[6-9]\d{9}", value.strip()):
+            raise ValueError("Mobile number must be a valid 10-digit Indian mobile number")
+        return value.strip() if value else None
 
 
 class UserUpdateInput(BaseModel):

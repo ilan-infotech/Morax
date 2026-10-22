@@ -14,6 +14,9 @@ database; no production or demonstration records are modified.
 | AUTH-03 | Password security | Inspect organization-admin and normal-user accounts created through the application | Password is bcrypt/hashed, never returned by an API, and no activation token is created for the direct-password flow. | Automated |
 | AUTH-04 | First login | Sign in as the new Organization Admin using email and chosen password | Login succeeds immediately and is bound to that organization. | Automated |
 | AUTH-05 | Normal-user login | Create Unit Admin, Maker, and Checker with passwords, then sign in | Each account signs in with its own email/password and receives its assigned role only. | Automated |
+| AUTH-06 | Product Admin recovery | Product Admin lists an organization | The primary Organization Admin name and email (login username) are visible; no password is returned. | Automated |
+| AUTH-07 | Product Admin recovery | Product Admin sets a new Organization Admin password | Old password no longer works, new password works, active target sessions are revoked, and an audit event is written. No email, OTP, or activation link is used. | Automated |
+| AUTH-08 | Organization Admin recovery | Organization Admin sets a new password for a tenant user in Users & Access | Old password no longer works, new password works, active target sessions are revoked, and an audit event is written. | Automated |
 | RBAC-01 | Product ownership | Product Admin opens Compliance Master | Product Admin can list and create globally shared master rules. | Automated |
 | RBAC-02 | Product ownership | Organization Admin opens or creates Compliance Master rules | Request is rejected; the Compliance Master feature is absent from their feature list. | Automated |
 | RBAC-03 | Organization administration | Organization Admin creates Units, Contractors, users, and assignments in its tenant | Allowed. | Automated |
@@ -40,6 +43,17 @@ database; no production or demonstration records are modified.
 | UI-02 | Contractor form | Open Create/Edit Contractor | Registration identifiers and applicable regulations are not shown; user assignment supports multiple Admin/Maker/Checker entries. | Frontend build + manual smoke |
 | UI-03 | User popup | Start new-user creation while editing a Unit or Contractor | Name, email, mobile, role, password, and confirmation are required; returning from the popup preserves the entity form values. | Frontend build + manual smoke |
 | UI-04 | Master navigation | Sign in as Organization Admin | Compliance Master is not visible/available; product-admin navigation still exposes it. | Frontend build + manual smoke |
+| UI-05 | Password recovery | Open Product Admin Organizations or Organization Admin Users & Access | Login email is visible and an authorized administrator can set and share a new password; an existing password is never displayed. | Frontend build + manual smoke |
+| UI-06 | Password confirmation | Enter different New and Confirm password values in every password form | A visible validation error is shown and no password request is sent. | Frontend build + manual smoke |
+| UI-07 | State → City/District | Select a State on Organization or Unit create/edit | Only that State's LGD districts appear; changing State clears City; loading, empty, and service-failure states are visible. | Automated cache test + manual smoke |
+| UI-08 | Required entity roles | Attempt to save Unit/Contractor assignments without both Maker and Checker | Saving is stopped with a clear message; Admin remains optional. | Automated API test + manual smoke |
+| UI-09 | Unit result feedback | Save a valid Unit | A green success message is shown and the refreshed Unit list includes the record without a browser refresh. | Frontend build + manual smoke |
+| UI-10 | Standard create/edit forms | Open Organization, Unit, Contractor, or User create/edit | Form is shown as a centered, responsive workspace dialog/page rather than a right-side drawer; required controls are visually marked. | Frontend build + manual smoke |
+| UI-11 | Generated identifiers | Create Organization and Unit without entering codes | Server creates unique `ORG-*` and organization-scoped `UNIT-*` values; Organization starts Active. | Automated |
+| UI-12 | Unit compliance types | Save/edit Unit with several selected compliance types | Selections persist and reappear on edit; Product Compliance Master matching is unchanged. | Automated |
+| UI-13 | Contractor Maker | Create Contractor with Maker email/password/confirmation | Contractor and hashed Contractor Maker account are created together; user receives only Contractor Maker scope. | Automated |
+| UI-14 | Contractor Maker isolation | Contractor Maker attempts to open a Unit/company subject | Access is denied, while the assigned Contractor subject remains accessible. | Automated |
+| UI-15 | Contractor documents | Choose multiple Other Documents, save, then edit | Files upload under the Contractor, appear with metadata, download, and can be explicitly removed. | Frontend build + manual smoke |
 
 ## Automated evidence
 
@@ -54,6 +68,7 @@ The automated suite is implemented in:
 - `backend/tests/test_activation_and_entity_assignments.py`
 - `backend/tests/test_entity_management_access.py`
 - `backend/tests/test_role_matrix_and_global_compliance_master.py`
+- `backend/tests/test_location_master.py`
 
 The final UI items require a browser session because they verify visual layout
 and retained in-progress form state; the build confirms that these screens

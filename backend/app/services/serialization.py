@@ -4,7 +4,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.models import ComplianceAssignment, ComplianceEvidence, ComplianceInstance, ComplianceRule, ComplianceRuleVersion, Contractor, ContractorSite, IndustryType, State, Unit, User
+from app.models import ComplianceAssignment, ComplianceEvidence, ComplianceInstance, ComplianceRule, ComplianceRuleVersion, Contractor, ContractorSite, IndustryType, State, Unit, User, UserRoleScope
 
 
 def value(value: Any) -> Any:
@@ -23,8 +23,28 @@ def entity_dict(db: Session, entity: Any, kind: str) -> dict[str, Any]:
     result["entity_type"] = kind
     if kind == "UNIT":
         result["total_employees"] = entity.total_employees
+        try:
+            result["compliance_types"] = json.loads(entity.compliance_types_json or "[]")
+        except (TypeError, ValueError):
+            result["compliance_types"] = []
     if kind in {"CONTRACTOR", "CONTRACTOR_SITE"}:
         result["total_workers"] = entity.total_workers
+    if kind == "CONTRACTOR":
+        contractor_makers = (
+            db.query(User)
+            .join(UserRoleScope, UserRoleScope.user_id == User.id)
+            .filter(
+                UserRoleScope.role == "CONTRACTOR_MAKER",
+                UserRoleScope.scope_type == "CONTRACTOR",
+                UserRoleScope.scope_id == entity.id,
+            )
+            .order_by(User.name, User.id)
+            .all()
+        )
+        result["contractor_makers"] = [
+            {"id": maker.id, "name": maker.name, "email": maker.email, "active": maker.active}
+            for maker in contractor_makers
+        ]
     if getattr(entity, "state_id", None):
         state = db.get(State, entity.state_id)
         result["state_name"] = state.name if state else None

@@ -261,6 +261,15 @@ def can_access_subject(db: Session, user: User, organization_id: str, subject_ty
     if is_org_admin(db, user, organization_id):
         return True
     scopes = scopes_for(db, user.id)
+    # A Contractor Maker may be mapped to one or more Units so the system can
+    # locate that contractor's work there. That mapping is not Company
+    # Compliance access: only a non-contractor role can open the Unit itself.
+    contractor_maker_scopes = [scope for scope in scopes if scope.role == "CONTRACTOR_MAKER"]
+    if subject_type == "UNIT" and contractor_maker_scopes:
+        return any(
+            scope.scope_type == "UNIT" and scope.scope_id == subject_id and scope.role != "CONTRACTOR_MAKER"
+            for scope in scopes
+        )
     if any(
         scope.scope_type == "ORGANIZATION"
         and scope.scope_id == organization_id
@@ -268,15 +277,16 @@ def can_access_subject(db: Session, user: User, organization_id: str, subject_ty
         for scope in scopes
     ):
         return True
-    if any(scope.scope_type == subject_type and scope.scope_id == subject_id for scope in scopes):
+    if any(
+        scope.scope_type == subject_type and scope.scope_id == subject_id
+        and not (subject_type == "UNIT" and scope.role == "CONTRACTOR_MAKER")
+        for scope in scopes
+    ):
         return True
     if subject_type == "CONTRACTOR":
         contractor = db.get(Contractor, subject_id)
         if contractor and contractor.organization_id == organization_id:
-            return any(
-                scope.scope_type == "UNIT" and scope.scope_id == contractor.unit_id
-                for scope in scopes
-            )
+            return any(scope.scope_type == "UNIT" and scope.scope_id == contractor.unit_id for scope in scopes)
     if subject_type == "CONTRACTOR_SITE":
         site = db.get(ContractorSite, subject_id)
         if site and site.organization_id == organization_id:

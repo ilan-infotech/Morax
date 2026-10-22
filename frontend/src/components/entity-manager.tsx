@@ -6,6 +6,7 @@ import {
   useState,
 } from "react";
 import { motion } from "framer-motion";
+import { createPortal } from "react-dom";
 import type { ReactNode } from "react";
 import GradientText from "./GradientText/GradientText";
 import { useParams } from "react-router-dom";
@@ -38,6 +39,7 @@ import { EmptyState, InlineError, LoadingSkeleton } from "./workspace-ui";
 
 type Row = Record<string, unknown>;
 type EntityKind = "units" | "contractors" | "sites";
+type ContractorMakerLogin = { id: string; name: string; email: string; active: boolean };
 
 type EntityForm = {
   name: string;
@@ -61,6 +63,10 @@ type EntityForm = {
   lin: string;
   employer_name: string;
   applicable_regulations: string;
+  compliance_types: string[];
+  contractor_maker_email: string;
+  contractor_maker_password: string;
+  contractor_maker_password_confirmation: string;
   male_employees: string;
   female_employees: string;
   male_workers: string;
@@ -117,6 +123,10 @@ const blankEntity = (): EntityForm => ({
   lin: "",
   employer_name: "",
   applicable_regulations: "",
+  compliance_types: [],
+  contractor_maker_email: "",
+  contractor_maker_password: "",
+  contractor_maker_password_confirmation: "",
   male_employees: "0",
   female_employees: "0",
   male_workers: "0",
@@ -134,7 +144,7 @@ const blankEntity = (): EntityForm => ({
 
 const entitySchema = z.object({
   name: z.string().trim().min(1, "Name is required").max(200),
-  code: z.string().trim().min(1, "Code is required").max(100),
+  code: z.string().trim().max(100),
   unit_type: z.string(),
   contractor_type: z.string(),
   unit_id: z.string(),
@@ -154,6 +164,10 @@ const entitySchema = z.object({
   lin: z.string(),
   employer_name: z.string(),
   applicable_regulations: z.string(),
+  compliance_types: z.array(z.string()),
+  contractor_maker_email: z.string(),
+  contractor_maker_password: z.string(),
+  contractor_maker_password_confirmation: z.string(),
   male_employees: z.string().regex(/^\d+$/, "Use a whole number"),
   female_employees: z.string().regex(/^\d+$/, "Use a whole number"),
   male_workers: z.string().regex(/^\d+$/, "Use a whole number"),
@@ -191,12 +205,30 @@ function text(row: Row, key: string) {
   return value == null || value === "" ? "—" : String(value);
 }
 
+function contractorMakers(row: Row): ContractorMakerLogin[] {
+  const makers = row.contractor_makers;
+  if (!Array.isArray(makers)) return [];
+  return makers.flatMap((maker) => {
+    if (!maker || typeof maker !== "object") return [];
+    const record = maker as Record<string, unknown>;
+    if (!record.id || !record.email) return [];
+    return [{
+      id: String(record.id),
+      name: String(record.name ?? "Contractor Maker"),
+      email: String(record.email),
+      active: record.active !== false,
+    }];
+  });
+}
+
 function asForm(row: Row): EntityForm {
   const defaults = blankEntity();
   return Object.fromEntries(
     Object.entries(defaults).map(([key, fallback]) => [
       key,
-      row[key] == null ? fallback : String(row[key]),
+      key === "compliance_types"
+        ? (Array.isArray(row[key]) ? row[key].map(String) : fallback)
+        : row[key] == null ? fallback : String(row[key]),
     ]),
   ) as EntityForm;
 }
@@ -209,7 +241,7 @@ function requestBody(values: EntityForm, kind: EntityKind) {
   return Object.fromEntries(
     Object.entries(values).map(([key, value]) => [
       key,
-      key === "worker_limit" ? (value === "" ? null : Number(value)) : numericFields.includes(key) ? Number(value || 0) : value || null,
+      key === "worker_limit" ? (value === "" ? null : Number(value)) : numericFields.includes(key) ? Number(value || 0) : Array.isArray(value) ? value : value || null,
     ]),
   );
 }
@@ -251,9 +283,15 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
     password_confirmation: string;
     role: AssignmentRole;
   }>({ name: "", email: "", mobile: "", password: "", password_confirmation: "", role: "MAKER" });
+  const [newEntityUserError, setNewEntityUserError] = useState("");
+  const [contractorMakerPasswordTarget, setContractorMakerPasswordTarget] = useState<ContractorMakerLogin | null>(null);
+  const [contractorMakerPassword, setContractorMakerPassword] = useState("");
+  const [contractorMakerPasswordConfirmation, setContractorMakerPasswordConfirmation] = useState("");
+  const [contractorMakerPasswordError, setContractorMakerPasswordError] = useState("");
   const [contractorFiles, setContractorFiles] = useState<Record<string, File | null>>({
     WORK_ORDER: null, REGISTRATION_CERTIFICATE: null, PF: null, ESI: null, LABOUR_LICENCE: null,
   });
+  const [otherDocuments, setOtherDocuments] = useState<File[]>([]);
 
   const sort = sorting[0];
   const listFilters = useMemo(
@@ -305,6 +343,11 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
         : morax.contractorUserAssignments(String(editing?.id)),
     enabled: canManage && formOpen && Boolean(editing?.id) && kind !== "sites",
   });
+  const contractorDocumentsQuery = useQuery({
+    queryKey: ["contractor-documents", editing?.id],
+    queryFn: () => morax.contractorDocuments(String(editing?.id)),
+    enabled: kind === "contractors" && formOpen && Boolean(editing?.id),
+  });
 
   const form = useForm<EntityForm>({
     resolver: zodResolver(entitySchema),
@@ -348,8 +391,6 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
     const employer = optionsQuery.data?.units.find((unit) => String(unit.id) === selectedPrincipalEmployerId);
     if (!employer) return;
     form.setValue("state_id", String(employer.state_id ?? ""));
-    form.setValue("city_id", String(employer.city_id ?? ""));
-    form.setValue("city", String(employer.city ?? ""));
   }, [form, kind, optionsQuery.data?.units, selectedPrincipalEmployerId]);
 
   const invalidateEntities = async () => {
@@ -370,11 +411,30 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
       if ((kind === "units" || kind === "sites") && !values.industry_type_id) {
         throw new Error("Select an industry type before saving");
       }
+      if ((kind === "units" || kind === "contractors" || kind === "sites") && !values.city_id) {
+        throw new Error("Select a City / District before saving");
+      }
       if (kind === "contractors" && !values.unit_id) {
         throw new Error("Select the Principal Employer before saving");
       }
+      if (kind === "contractors" && !editing && (!values.contractor_maker_email.trim() || !values.contractor_maker_password)) {
+        throw new Error("Contractor Maker email and password are required.");
+      }
+      if (kind === "contractors" && values.contractor_maker_password !== values.contractor_maker_password_confirmation) {
+        throw new Error("Contractor Maker password and Confirm password must match.");
+      }
       if (kind === "sites" && !values.contractor_id) {
         throw new Error("Select a contractor before saving");
+      }
+      if (kind === "units" || kind === "contractors") {
+        const roles = new Set(entityAssignments.map((assignment) => assignment.role));
+        if (kind === "contractors" && values.contractor_maker_email.trim() && values.contractor_maker_password) {
+          roles.add("MAKER");
+        }
+        const missing = (["MAKER", "CHECKER"] as AssignmentRole[]).filter((role) => !roles.has(role));
+        if (missing.length) {
+          throw new Error(`Assign at least one ${missing.map((role) => role[0] + role.slice(1).toLowerCase()).join(" and ")} before saving.`);
+        }
       }
       const stagedAssignmentKeys = new Set<string>();
       for (const assignment of entityAssignments) {
@@ -411,6 +471,7 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
         for (const [documentType, file] of Object.entries(contractorFiles)) {
           if (file) uploads.push(morax.uploadContractorDocument(contractorId, documentType, file));
         }
+        for (const file of otherDocuments) uploads.push(morax.uploadContractorDocument(contractorId, "OTHER", file));
         await Promise.all(uploads);
       } else {
         return id ? morax.updateSite(id, body) : morax.createSite(body);
@@ -420,6 +481,11 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
       const assignments: EntityUserAssignment[] = [];
       const createdPendingUsers = new Map<string, string>();
       const assignmentKeys = new Set<string>();
+      const contractorMakerId = kind === "contractors" ? String(saved.contractor_maker_user_id ?? "") : "";
+      if (contractorMakerId) {
+        assignments.push({ user_id: contractorMakerId, role: "MAKER" });
+        assignmentKeys.add(`${contractorMakerId}:MAKER`);
+      }
       for (const assignment of entityAssignments) {
         let userId = assignment.user_id;
         if (assignment.pending_user) {
@@ -489,14 +555,32 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
       ),
   });
 
+  const contractorMakerPasswordMutation = useMutation({
+    mutationFn: ({ target, password }: { target: ContractorMakerLogin; password: string }) =>
+      morax.resetUserPassword(target.id, password),
+    onSuccess: async (result) => {
+      setNotice(`Password reset for ${result.username}.`);
+      setContractorMakerPasswordTarget(null);
+      setContractorMakerPassword("");
+      setContractorMakerPasswordConfirmation("");
+      setContractorMakerPasswordError("");
+      await invalidateEntities();
+    },
+    onError: (error) => setContractorMakerPasswordError(
+      error instanceof Error ? error.message : "Could not reset the Contractor Maker password.",
+    ),
+  });
+
   const openCreate = () => {
     setNotice("");
     setEditing(null);
     form.reset(blankEntity());
     setEntityAssignments([]);
     setNewUserOpen(false);
+    setNewEntityUserError("");
     setNewEntityUser({ name: "", email: "", mobile: "", password: "", password_confirmation: "", role: "MAKER" });
     setContractorFiles({ WORK_ORDER: null, REGISTRATION_CERTIFICATE: null, PF: null, ESI: null, LABOUR_LICENCE: null });
+    setOtherDocuments([]);
     setFormOpen(true);
   };
   const openEdit = useCallback(
@@ -506,7 +590,9 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
       form.reset(asForm(row));
       setEntityAssignments([]);
       setNewUserOpen(false);
+      setNewEntityUserError("");
       setContractorFiles({ WORK_ORDER: null, REGISTRATION_CERTIFICATE: null, PF: null, ESI: null, LABOUR_LICENCE: null });
+      setOtherDocuments([]);
       setFormOpen(true);
     },
     [form],
@@ -516,8 +602,10 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
     form.reset(blankEntity());
     setEntityAssignments([]);
     setNewUserOpen(false);
+    setNewEntityUserError("");
     setNewEntityUser({ name: "", email: "", mobile: "", password: "", password_confirmation: "", role: "MAKER" });
     setContractorFiles({ WORK_ORDER: null, REGISTRATION_CERTIFICATE: null, PF: null, ESI: null, LABOUR_LICENCE: null });
+    setOtherDocuments([]);
     setFormOpen(false);
   };
 
@@ -545,6 +633,35 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
         header: "Industry",
         cell: ({ row }) => text(row.original, "industry_name"),
       },
+      ...(kind === "contractors" ? [{
+        id: "contractor_maker_login",
+        header: "Contractor Maker login",
+        enableSorting: false,
+        cell: ({ row }: { row: { original: Row } }) => {
+          const makers = contractorMakers(row.original);
+          const primaryMaker = makers[0];
+          if (!primaryMaker) return <span className="muted">No Contractor Maker</span>;
+          return (
+            <div className="entity-login-cell">
+              <b>{primaryMaker.name}</b>
+              <small>{primaryMaker.email}</small>
+              {makers.length > 1 && <small>+{makers.length - 1} additional Maker{makers.length > 2 ? "s" : ""}</small>}
+              {canManage && <button
+                type="button"
+                className="text-action"
+                onClick={() => {
+                  setContractorMakerPasswordTarget(primaryMaker);
+                  setContractorMakerPassword("");
+                  setContractorMakerPasswordConfirmation("");
+                  setContractorMakerPasswordError("");
+                }}
+              >
+                Set new password
+              </button>}
+            </div>
+          );
+        },
+      }] : []),
       {
         id: "workforce",
         header: kind === "units" ? "Employees" : "Workers",
@@ -640,7 +757,13 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
         )}
       </header>
 
-      {notice && <InlineError message={notice} />}
+      {notice && (
+        /^(Created|Updated|Unit deleted|Contractor deleted|Contractor site deleted)/.test(notice) ? (
+          <div className="alert success" role="status">{notice}</div>
+        ) : (
+          <InlineError message={notice} />
+        )
+      )}
       {!canManage && (
         <InlineError message="Organization administrator permission is required to manage these entities." />
       )}
@@ -783,14 +906,13 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
 
       {canManage && formOpen && (
         <div
-          className="crud-drawer-backdrop"
+          className="workspace-form-backdrop"
           role="presentation"
           onMouseDown={closeForm}
         >
           <section
-            className="crud-drawer"
-            role="dialog"
-            aria-modal="true"
+            className="workspace-form"
+            role="region"
             aria-labelledby="entity-form-title"
             onMouseDown={(event) => event.stopPropagation()}
           >
@@ -830,22 +952,38 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                   >
                     <input {...form.register("name")} autoFocus />
                   </Field>
-                  <Field
-                    label="Code"
-                    error={form.formState.errors.code?.message}
-                  >
-                    <input {...form.register("code")} />
-                  </Field>
+                  {kind !== "units" && (
+                    <Field
+                      label="Code"
+                      error={form.formState.errors.code?.message}
+                    >
+                      <input {...form.register("code")} required />
+                    </Field>
+                  )}
                   {kind === "units" ? (
                     <Field label="Unit type">
                       <input
                         {...form.register("unit_type")}
                         placeholder="Factory, branch, office…"
+                        required
                       />
                     </Field>
                   ) : (
                     <Field label={kind === "contractors" ? "Principal Employer" : "Parent unit"}>
-                      <select {...form.register("unit_id")} required={kind === "contractors"}>
+                      <select
+                        {...form.register("unit_id", {
+                          onChange: (event) => {
+                            if (kind !== "contractors") return;
+                            const principalEmployer = optionsQuery.data?.units.find(
+                              (unit) => String(unit.id) === event.target.value,
+                            );
+                            form.setValue("state_id", String(principalEmployer?.state_id ?? ""));
+                            form.setValue("city_id", "");
+                            form.setValue("city", "");
+                          },
+                        })}
+                        required={kind === "contractors"}
+                      >
                         <option value="">{kind === "contractors" ? "Select Principal Employer" : "Not linked"}</option>
                         {optionsQuery.data?.units.map((unit) => (
                           <option key={String(unit.id)} value={String(unit.id)}>
@@ -856,8 +994,8 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                     </Field>
                   )}
                   {kind === "contractors" && (
-                    <Field label="Contractor type">
-                      <input {...form.register("contractor_type")} />
+                    <Field label="Nature of Work">
+                      <input {...form.register("contractor_type")} required />
                     </Field>
                   )}
                   {kind === "sites" && (
@@ -865,7 +1003,7 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                       label="Contractor"
                       error={form.formState.errors.contractor_id?.message}
                     >
-                      <select {...form.register("contractor_id")}>
+                      <select {...form.register("contractor_id")} required>
                         <option value="">Select contractor</option>
                         {optionsQuery.data?.contractors.map((contractor) => (
                           <option
@@ -879,6 +1017,7 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                     </Field>
                   )}
                 </div>
+                {kind === "units" && !editing && <p className="muted">A unique Unit Code will be generated automatically when saved.</p>}
               </div>
 
               <div className="form-section">
@@ -888,7 +1027,18 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                     label="State"
                     error={form.formState.errors.state_id?.message}
                   >
-                    <select {...form.register("state_id")} disabled={kind === "contractors"}>
+                    <select
+                      {...form.register("state_id", {
+                        onChange: () => {
+                          if (kind !== "contractors") {
+                            form.setValue("city_id", "");
+                            form.setValue("city", "");
+                          }
+                        },
+                      })}
+                      disabled={kind === "contractors"}
+                      required={kind !== "contractors"}
+                    >
                       <option value="">
                         {kind === "contractors"
                           ? "Not configured"
@@ -901,16 +1051,12 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                       ))}
                     </select>
                   </Field>
-                  <Field
+                  {kind !== "contractors" && <Field
                     label="Industry type"
                     error={form.formState.errors.industry_type_id?.message}
                   >
-                    <select {...form.register("industry_type_id")}>
-                      <option value="">
-                        {kind === "contractors"
-                          ? "Not configured"
-                          : "Select industry"}
-                      </option>
+                    <select {...form.register("industry_type_id")} required>
+                      <option value="">Select industry</option>
                       {optionsQuery.data?.industries.map((industry: Master) => (
                         <option key={industry.id} value={industry.id}>
                           {industry.code.toUpperCase() === "OTHER"
@@ -919,12 +1065,13 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                         </option>
                       ))}
                     </select>
-                  </Field>
-                  {isOtherIndustry && (
+                  </Field>}
+                  {kind !== "contractors" && isOtherIndustry && (
                     <Field label="Other industry name">
                       <input
                         {...form.register("other_industry_name")}
                         placeholder="Enter industry name"
+                        required
                       />
                     </Field>
                   )}
@@ -932,8 +1079,28 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                     <input
                       type="date"
                       {...form.register("compliance_start_date")}
+                      required
                     />
                   </Field>
+                  {kind === "units" && (
+                    <Field label="Unit Compliance Type" wide>
+                      <div className="checkbox-group" role="group" aria-label="Unit Compliance Type">
+                        {["Shops & Establishments", "Mines", "BOCW", "ESI", "PF"].map((type) => (
+                          <label className="inline" key={type}>
+                            <input
+                              type="checkbox"
+                              checked={form.watch("compliance_types").includes(type)}
+                              onChange={(event) => {
+                                const selected = form.getValues("compliance_types");
+                                form.setValue("compliance_types", event.target.checked ? [...selected, type] : selected.filter((value) => value !== type), { shouldDirty: true });
+                              }}
+                            />
+                            {type}
+                          </label>
+                        ))}
+                      </div>
+                    </Field>
+                  )}
                   {kind === "sites" && (
                     <Field label="Status">
                       <select {...form.register("status")}>
@@ -1000,45 +1167,56 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
               <div className="form-section">
                 <h3>Contact and registration</h3>
                 <div className="form-grid">
-                  <Field label="City">
-                    <select {...form.register("city_id")} disabled={!selectedStateId || kind === "contractors"}>
-                      <option value="">{selectedStateId ? "Select city" : "Select State first"}</option>
+                  <Field label="City / District">
+                    <select {...form.register("city_id")} disabled={!selectedStateId} required>
+                      <option value="">
+                        {!selectedStateId
+                          ? "Select State first"
+                          : citiesQuery.isLoading
+                            ? "Loading districts…"
+                            : citiesQuery.isError
+                              ? "Districts could not be loaded"
+                              : citiesQuery.data?.length
+                                ? "Select City / District"
+                                : "No districts available"}
+                      </option>
                       {citiesQuery.data?.map((city: Master) => <option key={city.id} value={city.id}>{city.name}</option>)}
                     </select>
+                    {citiesQuery.isError && <small className="field-error">Could not load districts for this State. Please retry.</small>}
                   </Field>
                   <Field label="Pincode">
-                    <input {...form.register("pincode")} />
+                    <input {...form.register("pincode")} required />
                   </Field>
                   <Field label="Contact email">
-                    <input type="email" {...form.register("contact_email")} />
+                    <input type="email" {...form.register("contact_email")} required />
                   </Field>
                   <Field label="Contact phone">
-                    <input {...form.register("contact_phone")} />
+                    <input {...form.register("contact_phone")} inputMode="numeric" pattern="[6-9][0-9]{9}" minLength={10} maxLength={10} title="Enter a valid 10-digit Indian mobile number" required />
                   </Field>
                   <Field label="GSTIN">
-                    <input {...form.register("gstin")} />
+                    <input {...form.register("gstin")} maxLength={15} pattern="[0-9A-Za-z]{15}" title="Enter a valid 15-character GSTIN" />
                   </Field>
                   <Field label="PAN">
-                    <input {...form.register("pan")} />
+                    <input {...form.register("pan")} maxLength={10} pattern="[A-Za-z]{5}[0-9]{4}[A-Za-z]" title="Enter PAN in ABCDE1234F format" />
                   </Field>
                   <Field label="LIN">
-                    <input {...form.register("lin")} />
+                    <input {...form.register("lin")} maxLength={30} />
                   </Field>
                   <Field label="Employer name">
-                    <input {...form.register("employer_name")} />
+                    <input {...form.register("employer_name")} maxLength={250} required={kind !== "contractors"} />
                   </Field>
                   <Field label="Effective date">
-                    <input type="date" {...form.register("effective_date")} />
+                    <input type="date" {...form.register("effective_date")} required />
                   </Field>
                   {kind === "contractors" && (
                     <>
-                      <Field label="Contract start date"><input type="date" {...form.register("contract_start_date")} /></Field>
-                      <Field label="Contract end date"><input type="date" {...form.register("contract_end_date")} /></Field>
-                      <Field label="Work order expiry"><input type="date" {...form.register("work_order_expiry_date")} /></Field>
+                      <Field label="Contract start date"><input type="date" {...form.register("contract_start_date")} required /></Field>
+                      <Field label="Contract end date"><input type="date" {...form.register("contract_end_date")} required /></Field>
+                      <Field label="Work order expiry"><input type="date" {...form.register("work_order_expiry_date")} required /></Field>
                     </>
                   )}
                   <Field label="Address" wide>
-                    <textarea rows={3} {...form.register("address")} />
+                    <textarea rows={3} {...form.register("address")} required />
                   </Field>
                   {kind === "sites" && (
                     <>
@@ -1081,12 +1259,14 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                         className="secondary"
                         onClick={() => {
                           setNewEntityUser({ name: "", email: "", mobile: "", password: "", password_confirmation: "", role: "MAKER" });
+                          setNewEntityUserError("");
                           setNewUserOpen(true);
                         }}
                       >
                         Create new user
                       </button>
                   </div>
+                  <p className="muted">Maker and Checker assignments are required. Admin assignment is optional.</p>
                   {entityAssignments.length === 0 ? (
                     <p className="muted">No users are assigned yet.</p>
                   ) : (
@@ -1139,6 +1319,23 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                   )}
                 </div>
               )}
+              {kind === "contractors" && !editing && (
+                <div className="form-section">
+                  <h3>Contractor Maker login</h3>
+                  <p className="muted">A restricted Contractor Maker account is required for every new Contractor.</p>
+                  <div className="form-grid">
+                    <Field label="Contractor Maker Email">
+                      <input type="email" required {...form.register("contractor_maker_email")} />
+                    </Field>
+                    <Field label="Contractor Maker Password">
+                      <input type="password" minLength={8} autoComplete="new-password" required {...form.register("contractor_maker_password")} />
+                    </Field>
+                    <Field label="Confirm Contractor Maker Password">
+                      <input type="password" minLength={8} autoComplete="new-password" required {...form.register("contractor_maker_password_confirmation")} />
+                    </Field>
+                  </div>
+                </div>
+              )}
               {kind === "contractors" && (
                 <div className="form-section">
                   <h3>Contractor documents</h3>
@@ -1154,7 +1351,47 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                         <input type="file" accept=".pdf,.png,.jpg,.jpeg,.xlsx,.xls,.doc,.docx" onChange={(event) => setContractorFiles((current) => ({ ...current, [type]: event.target.files?.[0] ?? null }))} />
                       </Field>
                     ))}
+                    <Field label="Other Documents" wide>
+                      <input
+                        type="file"
+                        multiple
+                        accept=".pdf,.png,.jpg,.jpeg,.xlsx,.xls,.doc,.docx"
+                        onChange={(event) => setOtherDocuments(Array.from(event.target.files ?? []))}
+                      />
+                      {otherDocuments.length > 0 && (
+                        <div className="selected-file-list">
+                          {otherDocuments.map((file, index) => (
+                            <span key={`${file.name}-${index}`}>
+                              {file.name} ({file.type || "file"})
+                              <button type="button" className="icon-action danger" aria-label={`Remove ${file.name}`} onClick={() => setOtherDocuments((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={14} /></button>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </Field>
                   </div>
+                  {editing && contractorDocumentsQuery.data && (
+                    <div className="existing-document-list">
+                      <b>Uploaded documents</b>
+                      {contractorDocumentsQuery.data.length ? contractorDocumentsQuery.data.map((document) => (
+                        <span className="selected-file-list" key={String(document.id)}>
+                          <button type="button" className="secondary" onClick={() => morax.downloadContractorDocument(String(document.id), String(document.original_filename))}>
+                            {String(document.original_filename)} · {String(document.content_type ?? "file")}
+                          </button>
+                          <button type="button" className="icon-action danger" aria-label={`Remove ${String(document.original_filename)}`} onClick={async () => {
+                            if (!window.confirm(`Remove ${String(document.original_filename)}?`)) return;
+                            try {
+                              await morax.deleteContractorDocument(String(document.id));
+                              await queryClient.invalidateQueries({ queryKey: ["contractor-documents", editing?.id] });
+                              setNotice("Contractor document removed successfully.");
+                            } catch (error) {
+                              setNotice(error instanceof Error ? error.message : "Could not remove the document.");
+                            }
+                          }}><Trash2 size={14} /></button>
+                        </span>
+                      )) : <span className="muted">No documents uploaded yet.</span>}
+                    </div>
+                  )}
                 </div>
               )}
               <footer className="drawer-footer">
@@ -1174,9 +1411,9 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                 </button>
               </footer>
             </form>
-            {newUserOpen && kind !== "sites" && (
+            {newUserOpen && kind !== "sites" && createPortal(
               <div
-                className="crud-drawer-backdrop"
+                className="assignment-user-backdrop"
                 role="presentation"
                 onMouseDown={() => setNewUserOpen(false)}
               >
@@ -1202,9 +1439,10 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                     onSubmit={(event) => {
                       event.preventDefault();
                       if (newEntityUser.password !== newEntityUser.password_confirmation) {
-                        setNotice("User passwords do not match.");
+                        setNewEntityUserError("Password and Confirm password must match.");
                         return;
                       }
+                      setNewEntityUserError("");
                       setEntityAssignments((current) => [
                         ...current,
                         {
@@ -1222,6 +1460,7 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                     }}
                   >
                     <div className="form-grid">
+                      {newEntityUserError && <div className="wide"><InlineError message={newEntityUserError} /></div>}
                       <Field label="Name">
                         <input value={newEntityUser.name} onChange={(event) => setNewEntityUser((current) => ({ ...current, name: event.target.value }))} required autoFocus />
                       </Field>
@@ -1252,9 +1491,88 @@ function EntityManager({ user, kind }: { user: User; kind: EntityKind }) {
                   </form>
                 </section>
               </div>
-            )}
+            , document.body)}
           </section>
         </div>
+      )}
+      {contractorMakerPasswordTarget && createPortal(
+        <div
+          className="assignment-user-backdrop"
+          role="presentation"
+          onMouseDown={() => !contractorMakerPasswordMutation.isPending && setContractorMakerPasswordTarget(null)}
+        >
+          <section
+            className="crud-drawer assignment-user-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="contractor-maker-password-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="drawer-heading">
+              <div>
+                <span className="drawer-icon"><UsersRound size={19} /></span>
+                <div>
+                  <h2 id="contractor-maker-password-title">Set Contractor Maker password</h2>
+                  <p>{contractorMakerPasswordTarget.name} · {contractorMakerPasswordTarget.email}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="icon-action"
+                disabled={contractorMakerPasswordMutation.isPending}
+                onClick={() => setContractorMakerPasswordTarget(null)}
+                aria-label="Close password form"
+              ><X size={18} /></button>
+            </div>
+            <form
+              className="entity-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (contractorMakerPassword !== contractorMakerPasswordConfirmation) {
+                  setContractorMakerPasswordError("Password and Confirm password must match.");
+                  return;
+                }
+                setContractorMakerPasswordError("");
+                contractorMakerPasswordMutation.mutate({
+                  target: contractorMakerPasswordTarget,
+                  password: contractorMakerPassword,
+                });
+              }}
+            >
+              <div className="form-grid">
+                {contractorMakerPasswordError && <div className="wide"><InlineError message={contractorMakerPasswordError} /></div>}
+                <Field label="New password">
+                  <input
+                    type="password"
+                    minLength={8}
+                    autoComplete="new-password"
+                    value={contractorMakerPassword}
+                    onChange={(event) => setContractorMakerPassword(event.target.value)}
+                    required
+                    autoFocus
+                  />
+                </Field>
+                <Field label="Confirm new password">
+                  <input
+                    type="password"
+                    minLength={8}
+                    autoComplete="new-password"
+                    value={contractorMakerPasswordConfirmation}
+                    onChange={(event) => setContractorMakerPasswordConfirmation(event.target.value)}
+                    required
+                  />
+                </Field>
+              </div>
+              <footer className="drawer-footer">
+                <button type="button" className="secondary" disabled={contractorMakerPasswordMutation.isPending} onClick={() => setContractorMakerPasswordTarget(null)}>Cancel</button>
+                <button type="submit" className="primary-action" disabled={contractorMakerPasswordMutation.isPending}>
+                  {contractorMakerPasswordMutation.isPending ? "Saving…" : "Set new password"}
+                </button>
+              </footer>
+            </form>
+          </section>
+        </div>,
+        document.body,
       )}
     </section>
   );

@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = True
     smtp_use_ssl: bool = False
     mail_from: str = "no-reply@morax.local"
+    india_lgd_api_base_url: str = "https://india-lgd-index-api.vercel.app"
+    india_lgd_api_timeout_seconds: int = 10
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

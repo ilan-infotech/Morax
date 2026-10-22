@@ -180,6 +180,8 @@ def test_product_master_and_full_tenant_role_matrix(db):
             unit_id=matching_unit["id"],
             industry_type_id=industry.id,
             compliance_start_date=date(2020, 1, 1),
+                contractor_maker_email="factory.contractor.maker@mrf-test.example.com",
+                contractor_maker_password="Factory-Contractor-Maker-Password-1",
         ),
         mrf_admin,
         db,

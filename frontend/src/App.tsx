@@ -499,7 +499,8 @@ function hasFeature(user: User, feature: WorkspaceFeature) {
 
 function workspaceLinks(user: User) {
   const features = featureSet(user);
-  return links.filter((link) => features.has(link.feature));
+  const contractorMakerOnly = user.roles.includes("CONTRACTOR_MAKER") && !user.roles.some((role) => ["ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "UNIT_CHECKER", "CONTRACTOR_ADMIN"].includes(role));
+  return links.filter((link) => features.has(link.feature) && (!contractorMakerOnly || !["compliances/company", "compliances/one-time"].includes(link.path)));
 }
 
 function defaultWorkspacePath(user: User) {
@@ -525,6 +526,10 @@ function FeatureGate({
 
 function ComplianceRoute({ user }: { user: User }) {
   const { kind } = useParams();
+  const contractorMakerOnly = user.roles.includes("CONTRACTOR_MAKER") && !user.roles.some((role) => ["ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "UNIT_CHECKER", "CONTRACTOR_ADMIN"].includes(role));
+  if (kind === "company" && contractorMakerOnly) {
+    return <Panel>Contractor Maker access is limited to authorized Contractor Compliance.</Panel>;
+  }
   return (
     <FeatureGate
       user={user}
@@ -741,6 +746,7 @@ function Organizations({ user }: { user: User }) {
     pan: "",
     gstin: "",
     registered_address: "",
+    state_id: "",
     city: "",
     pincode: "",
     primary_contact_name: "",
@@ -1115,8 +1121,16 @@ function OrganizationLanding({ user }: { user: User }) {
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState("");
   const [resetTarget, setResetTarget] = useState<Row | null>(null);
+  const [adminPasswordTarget, setAdminPasswordTarget] = useState<Row | null>(null);
   const [resetCode, setResetCode] = useState("");
   const [resetting, setResetting] = useState(false);
+  const [adminReplacementPassword, setAdminReplacementPassword] = useState("");
+  const [adminReplacementPasswordConfirmation, setAdminReplacementPasswordConfirmation] = useState("");
+  const [adminPasswordResetting, setAdminPasswordResetting] = useState(false);
+  const [locationStates, setLocationStates] = useState<Master[]>([]);
+  const [locationCities, setLocationCities] = useState<Master[]>([]);
+  const [locationCitiesLoading, setLocationCitiesLoading] = useState(false);
+  const [locationCitiesError, setLocationCitiesError] = useState("");
   const [filters, setFilters] = useState({ q: "", status: "" });
   const deferredSearch = useDeferredValue(filters.q);
   const blank = {
@@ -1127,6 +1141,7 @@ function OrganizationLanding({ user }: { user: User }) {
     pan: "",
     gstin: "",
     registered_address: "",
+    state_id: "",
     city: "",
     pincode: "",
     primary_contact_name: "",
@@ -1140,6 +1155,7 @@ function OrganizationLanding({ user }: { user: User }) {
     status: "ACTIVE",
   };
   const [form, setForm] = useState(blank);
+  const selectedOrganizationStateId = form.state_id;
   const load = () =>
     morax
       .platformOrganizations(filters)
@@ -1156,6 +1172,36 @@ function OrganizationLanding({ user }: { user: User }) {
       .then(setRows)
       .catch((err) => setError(message(err)));
   }, [deferredSearch, filters.status, user.platform_role]);
+  useEffect(() => {
+    if (user.platform_role !== "MORAX_ADMIN") return;
+    morax.states().then(setLocationStates).catch((err) => setError(message(err, "Could not load States.")));
+  }, [user.platform_role]);
+  useEffect(() => {
+    if (!selectedOrganizationStateId) {
+      setLocationCities([]);
+      setLocationCitiesError("");
+      return;
+    }
+    let active = true;
+    setLocationCitiesLoading(true);
+    setLocationCitiesError("");
+    morax.cities(selectedOrganizationStateId)
+      .then((cities) => {
+        if (active) setLocationCities(cities);
+      })
+      .catch((err) => {
+        if (active) {
+          setLocationCities([]);
+          setLocationCitiesError(message(err, "Could not load City / District options."));
+        }
+      })
+      .finally(() => {
+        if (active) setLocationCitiesLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedOrganizationStateId]);
   if (user.platform_role !== "MORAX_ADMIN")
     return <Panel>Platform administrator permission is required.</Panel>;
 
@@ -1215,6 +1261,31 @@ function OrganizationLanding({ user }: { user: User }) {
       setError(message(err));
     } finally {
       setResetting(false);
+    }
+  }
+
+  async function resetOrganizationAdminPassword(event: FormEvent) {
+    event.preventDefault();
+    if (!adminPasswordTarget) return;
+    if (adminReplacementPassword !== adminReplacementPasswordConfirmation) {
+      setError("Organization Admin passwords do not match");
+      return;
+    }
+    setAdminPasswordResetting(true);
+    try {
+      const result = await morax.resetOrganizationAdminPassword(
+        String(adminPasswordTarget.id),
+        adminReplacementPassword,
+      );
+      setError(`Success: ${result.message}`);
+      setAdminPasswordTarget(null);
+      setAdminReplacementPassword("");
+      setAdminReplacementPasswordConfirmation("");
+      load();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setAdminPasswordResetting(false);
     }
   }
 
@@ -1294,15 +1365,64 @@ function OrganizationLanding({ user }: { user: User }) {
           </form>
         </Panel>
       )}
+      {adminPasswordTarget && (
+        <Panel>
+          <div className="split">
+            <div>
+              <h2>Set Organization Admin password</h2>
+              <p className="muted">
+                Login username: <b>{String((adminPasswordTarget.organization_admin as Row | null)?.email ?? "Not available")}</b>. Existing passwords cannot be viewed because MORAX stores only secure hashes. Set a new password and share it directly; no email, OTP, or activation link is sent.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="secondary"
+              disabled={adminPasswordResetting}
+              onClick={() => {
+                setAdminPasswordTarget(null);
+                setAdminReplacementPassword("");
+                setAdminReplacementPasswordConfirmation("");
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+          <form className="form-grid" onSubmit={resetOrganizationAdminPassword}>
+            <label>
+              New password
+              <input
+                type="password"
+                value={adminReplacementPassword}
+                onChange={(event) => setAdminReplacementPassword(event.target.value)}
+                autoComplete="new-password"
+                minLength={8}
+                required
+              />
+            </label>
+            <label>
+              Confirm new password
+              <input
+                type="password"
+                value={adminReplacementPasswordConfirmation}
+                onChange={(event) => setAdminReplacementPasswordConfirmation(event.target.value)}
+                autoComplete="new-password"
+                minLength={8}
+                required
+              />
+            </label>
+            <div className="action-row">
+              <button disabled={adminPasswordResetting}>
+                {adminPasswordResetting ? "Saving password…" : "Set new password"}
+              </button>
+            </div>
+          </form>
+        </Panel>
+      )}
       {showForm && (
         <Panel>
           <div className="split">
             <div>
               <h2>{editing ? "Edit organization" : "Create organization"}</h2>
-              <p className="muted">
-                Create a separate tenant workspace. Organization code cannot be
-                changed to a duplicate value.
-              </p>
             </div>
             <button className="secondary" onClick={closeForm}>
               Cancel
@@ -1319,16 +1439,12 @@ function OrganizationLanding({ user }: { user: User }) {
                 required
               />
             </label>
-            <label>
-              Organization code
-              <input
-                value={form.organization_code}
-                onChange={(e) =>
-                  setForm({ ...form, organization_code: e.target.value })
-                }
-                required
-              />
-            </label>
+            {editing ? (
+              <label>
+                Organization code
+                <input value={form.organization_code} readOnly />
+              </label>
+            ) : null}
             {!editing && (
               <>
                 <label>
@@ -1413,17 +1529,49 @@ function OrganizationLanding({ user }: { user: User }) {
               />
             </label>
             <label>
-              City
-              <input
+              State
+              <select
+                value={form.state_id}
+                onChange={(e) => setForm({ ...form, state_id: e.target.value, city: "" })}
+                required
+              >
+                <option value="">Select State</option>
+                {locationStates.map((state) => (
+                  <option key={state.id} value={state.id}>{state.name}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              City / District
+              <select
                 value={form.city}
                 onChange={(e) => setForm({ ...form, city: e.target.value })}
-              />
+                disabled={!form.state_id || locationCitiesLoading}
+                required
+              >
+                <option value="">
+                  {!form.state_id
+                    ? "Select State first"
+                    : locationCitiesLoading
+                      ? "Loading districts…"
+                      : locationCitiesError
+                        ? "Districts could not be loaded"
+                        : locationCities.length
+                          ? "Select City / District"
+                          : "No districts available"}
+                </option>
+                {locationCities.map((city) => (
+                  <option key={city.id} value={city.name}>{city.name}</option>
+                ))}
+              </select>
+              {locationCitiesError && <small className="field-error">{locationCitiesError}</small>}
             </label>
             <label>
               Pincode
               <input
                 value={form.pincode}
                 onChange={(e) => setForm({ ...form, pincode: e.target.value })}
+                required
               />
             </label>
             <label>
@@ -1434,6 +1582,7 @@ function OrganizationLanding({ user }: { user: User }) {
                 onChange={(e) =>
                   setForm({ ...form, compliance_start_date: e.target.value })
                 }
+                required
               />
             </label>
             <label>
@@ -1443,6 +1592,7 @@ function OrganizationLanding({ user }: { user: User }) {
                 onChange={(e) =>
                   setForm({ ...form, primary_contact_name: e.target.value })
                 }
+                required
               />
             </label>
             <label>
@@ -1453,6 +1603,7 @@ function OrganizationLanding({ user }: { user: User }) {
                 onChange={(e) =>
                   setForm({ ...form, primary_contact_email: e.target.value })
                 }
+                required
               />
             </label>
             <label>
@@ -1462,9 +1613,15 @@ function OrganizationLanding({ user }: { user: User }) {
                 onChange={(e) =>
                   setForm({ ...form, primary_contact_phone: e.target.value })
                 }
+                inputMode="numeric"
+                pattern="[6-9][0-9]{9}"
+                minLength={10}
+                maxLength={10}
+                title="Enter a valid 10-digit Indian mobile number"
+                required
               />
             </label>
-            <label>
+            {editing && <label>
               Status
               <select
                 value={form.status}
@@ -1473,7 +1630,7 @@ function OrganizationLanding({ user }: { user: User }) {
                 <option>ACTIVE</option>
                 <option>INACTIVE</option>
               </select>
-            </label>
+            </label>}
             <label className="wide">
               Registered address
               <textarea
@@ -1481,6 +1638,7 @@ function OrganizationLanding({ user }: { user: User }) {
                 onChange={(e) =>
                   setForm({ ...form, registered_address: e.target.value })
                 }
+                required
               />
             </label>
             <div className="action-row">
@@ -1537,6 +1695,7 @@ function OrganizationLanding({ user }: { user: User }) {
               <th>Organization</th>
               <th>Code</th>
               <th>Status</th>
+              <th>Organization Admin login</th>
               <th>Contact</th>
               <th>Actions</th>
             </tr>
@@ -1553,6 +1712,17 @@ function OrganizationLanding({ user }: { user: User }) {
                 <td>
                   <Badge text={String(row.status)} />
                 </td>
+                <td>
+                  {row.organization_admin ? (
+                    <>
+                      <b>{String((row.organization_admin as Row).name)}</b>
+                      <br />
+                      <small>{String((row.organization_admin as Row).email)}</small>
+                    </>
+                  ) : (
+                    <span className="muted">No Organization Admin</span>
+                  )}
+                </td>
                 <td>{String(row.primary_contact_email ?? "—")}</td>
                 <td>
                   <div className="action-row">
@@ -1561,6 +1731,19 @@ function OrganizationLanding({ user }: { user: User }) {
                     </button>
                     <button onClick={() => enter(String(row.id))}>
                       Manage
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={!row.organization_admin}
+                      onClick={() => {
+                        setAdminPasswordTarget(row);
+                        setAdminReplacementPassword("");
+                        setAdminReplacementPasswordConfirmation("");
+                        window.scrollTo({ top: 0, behavior: "smooth" });
+                      }}
+                    >
+                      Set Admin password
                     </button>
                     <button
                       type="button"
@@ -4071,6 +4254,7 @@ function Audit() {
 function Settings({ user }: { user: User }) {
   const [org, setOrg] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
+  const [passwordConfirmation, setPasswordConfirmation] = useState("");
   const [passwords, setPasswords] = useState({
     current_password: "",
     new_password: "",
@@ -4191,9 +4375,14 @@ function Settings({ user }: { user: User }) {
           className="form-grid compact"
           onSubmit={async (e) => {
             e.preventDefault();
+            if (passwords.new_password !== passwordConfirmation) {
+              setError("New password and Confirm password must match.");
+              return;
+            }
             try {
               await morax.changePassword(passwords);
               setPasswords({ current_password: "", new_password: "" });
+              setPasswordConfirmation("");
               setError("Success: Password changed");
             } catch (err) {
               setError(message(err));
@@ -4224,6 +4413,17 @@ function Settings({ user }: { user: User }) {
               minLength={8}
             />
           </label>
+          <label>
+            Confirm password
+            <input
+              type="password"
+              value={passwordConfirmation}
+              onChange={(e) => setPasswordConfirmation(e.target.value)}
+              required
+              minLength={8}
+              autoComplete="new-password"
+            />
+          </label>
           <button>Change password</button>
         </form>
       </Panel>
@@ -4237,6 +4437,7 @@ function OrganizationSettings({ user }: { user: User }) {
   const base = organizationId ? "/app/organizations/" + organizationId : "/app";
   const [organization, setOrganization] = useState<Row>();
   const [error, setError] = useState("");
+  const [passwordConfirmation, setPasswordConfirmation] = useState("");
   const [passwords, setPasswords] = useState({
     current_password: "",
     new_password: "",
@@ -4311,9 +4512,14 @@ function OrganizationSettings({ user }: { user: User }) {
           className="form-grid compact"
           onSubmit={async (e) => {
             e.preventDefault();
+            if (passwords.new_password !== passwordConfirmation) {
+              setError("New password and Confirm password must match.");
+              return;
+            }
             try {
               await morax.changePassword(passwords);
               setPasswords({ current_password: "", new_password: "" });
+              setPasswordConfirmation("");
               setError("Success: Password changed");
             } catch (err) {
               setError(message(err));
@@ -4342,6 +4548,17 @@ function OrganizationSettings({ user }: { user: User }) {
               }
               required
               minLength={8}
+            />
+          </label>
+          <label>
+            Confirm password
+            <input
+              type="password"
+              value={passwordConfirmation}
+              onChange={(e) => setPasswordConfirmation(e.target.value)}
+              required
+              minLength={8}
+              autoComplete="new-password"
             />
           </label>
           <button>Change password</button>
@@ -4458,6 +4675,7 @@ function AccountActivation() {
 
 function AppRoutes() {
   const location = useLocation();
+  const navigate = useNavigate();
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -4470,7 +4688,10 @@ function AppRoutes() {
   }, []);
   if (!ready) return <div className="loading">Loading MORAX…</div>;
   if (location.pathname === "/activate") return <AccountActivation />;
-  if (!user) return <Login done={setUser} />;
+  if (!user) return <Login done={(signedIn) => {
+    setUser(signedIn);
+    navigate(signedIn.platform_role === "MORAX_ADMIN" ? "/app/organizations" : `/app/${defaultWorkspacePath(signedIn)}`, { replace: true });
+  }} />;
   const impersonate = async (userId: string) => {
     const response = await morax.impersonate(userId);
     setToken(response.access_token);

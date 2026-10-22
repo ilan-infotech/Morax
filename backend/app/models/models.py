@@ -95,6 +95,9 @@ class Unit(Timestamped, Base):
     contact_phone: Mapped[str | None] = mapped_column(String(50))
     worker_limit: Mapped[int | None] = mapped_column(Integer)
     applicable_regulations: Mapped[str | None] = mapped_column(Text)
+    # JSON list selected in the Unit form.  This is descriptive metadata and
+    # deliberately does not replace Product-owned Compliance Master matching.
+    compliance_types_json: Mapped[str | None] = mapped_column(Text)
     male_employees: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     female_employees: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     compliance_start_date: Mapped[date] = mapped_column(Date, nullable=False)

@@ -6,10 +6,11 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 import app.api.v1.router as api
+import app.services.access as access
 from app.core.security import hash_password, verify_password
 from app.db.base import Base
 from app.models import AuditLog, Contractor, IndustryType, Organization, State, Unit, User, UserActivation, UserRoleScope
-from app.schemas import EntityUserAssignmentInput, LoginRequest, PlatformOrganizationInput, RoleScopeInput, UnitInput, UserCreateInput
+from app.schemas import AdministratorPasswordResetInput, ContractorInput, EntityUserAssignmentInput, LoginRequest, PlatformOrganizationInput, RoleScopeInput, UnitInput, UserCreateInput
 
 
 @pytest.fixture()
@@ -21,7 +22,7 @@ def db():
     engine.dispose()
 
 
-def test_platform_organization_provisions_admin_password(db, monkeypatch):
+def test_platform_organization_provisions_admin_password(db):
     platform_admin = User(
         name="MORAX Admin",
         email="platform@example.test",
@@ -32,14 +33,6 @@ def test_platform_organization_provisions_admin_password(db, monkeypatch):
     db.add(platform_admin)
     db.flush()
 
-    delivered: dict[str, str] = {}
-
-    def capture_delivery(user: User, token: str) -> str:
-        delivered["email"] = user.email
-        delivered["token"] = token
-        return "test"
-
-    monkeypatch.setattr(api, "send_activation_email", capture_delivery)
     created = api.create_platform_organization(
         PlatformOrganizationInput(
             organization_name="Acme Compliance",
@@ -54,8 +47,7 @@ def test_platform_organization_provisions_admin_password(db, monkeypatch):
 
     organization_id = created["id"]
     admin = db.scalar(select(User).where(User.email == "admin@acme.example.com"))
-    assert "activation_delivery" not in created
-    assert delivered == {}
+    assert created["organization_admin"]["email"] == "admin@acme.example.com"
     assert admin.organization_id == organization_id
     assert admin.must_change_password is False
     assert verify_password("Acme-Admin-Password-1", admin.password_hash)
@@ -65,6 +57,22 @@ def test_platform_organization_provisions_admin_password(db, monkeypatch):
         UserRoleScope.role == "ORGANIZATION_ADMIN",
         UserRoleScope.scope_id == organization_id,
     )) is not None
+
+    # Product Admin sees the Organization Admin username but never a password;
+    # they can set a direct replacement without SMTP, OTP, or activation links.
+    listed = api.list_platform_organizations(user=platform_admin, db=db)
+    assert listed[0]["organization_admin"]["email"] == admin.email
+    reset = api.reset_organization_admin_password(
+        organization_id,
+        AdministratorPasswordResetInput(new_password="Acme-Admin-Replacement-1"),
+        platform_admin,
+        db,
+    )
+    assert reset["username"] == admin.email
+    assert verify_password("Acme-Admin-Replacement-1", admin.password_hash)
+    with pytest.raises(HTTPException, match="Invalid email or password"):
+        api.login(LoginRequest(email=admin.email, password="Acme-Admin-Password-1"), db)
+    assert api.login(LoginRequest(email=admin.email, password="Acme-Admin-Replacement-1"), db)["user"]["id"] == admin.id
 
     # The centralized User Access endpoint provisions the same immediately
     # usable, password-based user records used by the Unit/Contractor popup.
@@ -80,14 +88,25 @@ def test_platform_organization_provisions_admin_password(db, monkeypatch):
         admin,
         db,
     )
-    assert delivered == {}
     assert db.get(User, created_user["id"]).must_change_password is False
     assert verify_password("Shared-Access-Password-1", db.get(User, created_user["id"]).password_hash)
     assert db.scalar(select(UserActivation).where(UserActivation.user_id == created_user["id"])) is None
     assert any(row["id"] == created_user["id"] for row in api.list_users(user=admin, db=db))
 
+    user_reset = api.reset_user_password(
+        created_user["id"],
+        AdministratorPasswordResetInput(new_password="Shared-Access-Replacement-1"),
+        admin,
+        db,
+    )
+    assert user_reset["username"] == "shared@acme.example.com"
+    assert verify_password("Shared-Access-Replacement-1", db.get(User, created_user["id"]).password_hash)
+    with pytest.raises(HTTPException, match="Invalid email or password"):
+        api.login(LoginRequest(email="shared@acme.example.com", password="Shared-Access-Password-1"), db)
+    assert api.login(LoginRequest(email="shared@acme.example.com", password="Shared-Access-Replacement-1"), db)["user"]["id"] == created_user["id"]
+
     actions = set(db.scalars(select(AuditLog.action).where(AuditLog.organization_id == organization_id)))
-    assert {"ORGANIZATION_CREATED", "CREATE_ORGANIZATION_ADMIN", "ORGANIZATION_ADMIN_PASSWORD_SET", "CREATE_USER", "USER_PASSWORD_SET"} <= actions
+    assert {"ORGANIZATION_CREATED", "CREATE_ORGANIZATION_ADMIN", "ORGANIZATION_ADMIN_PASSWORD_SET", "CREATE_USER", "USER_PASSWORD_SET", "PRODUCT_ADMIN_RESET_ORGANIZATION_ADMIN_PASSWORD", "ORGANIZATION_ADMIN_RESET_USER_PASSWORD"} <= actions
 
 
 def test_mrf_onboarding_login_unit_and_assigned_user_logins(db):
@@ -179,12 +198,55 @@ def test_mrf_onboarding_login_unit_and_assigned_user_logins(db):
         (created_ids["MAKER"], "MAKER"),
         (created_ids["CHECKER"], "CHECKER"),
     }
+    with pytest.raises(HTTPException, match="Maker and Checker assignments are required"):
+        api.replace_unit_user_assignments(
+            unit["id"],
+            [EntityUserAssignmentInput(user_id=created_ids["MAKER"], role="MAKER")],
+            organization_admin,
+            db,
+        )
 
     for assignment_role, (email, password, scope_role) in assigned_users.items():
         signed_in = api.login(LoginRequest(email=email, password=password), db)
         assert signed_in["user"]["organization_id"] == organization_id
         assert scope_role in signed_in["user"]["roles"]
         assert db.scalar(select(UserActivation).where(UserActivation.user_id == created_ids[assignment_role])) is None
+
+
+def test_generated_codes_unit_types_and_contractor_maker_scope(db):
+    organization = Organization(name="Scope Org", code="SCOPE", status="ACTIVE")
+    state = State(name="Kerala", code="KL")
+    industry = IndustryType(name="Manufacturing", code="MFG")
+    db.add_all([organization, state, industry])
+    db.flush()
+    admin = User(organization_id=organization.id, name="Admin", email="scope.admin@example.test", password_hash=hash_password("Admin-Password-1"), active=True, platform_role="MORAX_ADMIN")
+    db.add(admin)
+    db.flush()
+    db.add(UserRoleScope(user_id=admin.id, role="ORGANIZATION_ADMIN", scope_type="ORGANIZATION", scope_id=organization.id))
+    db.commit()
+
+    unit = api.create_unit(UnitInput(
+        name="Kerala Plant",
+        industry_type_id=industry.id,
+        state_id=state.id,
+        compliance_start_date=date(2026, 10, 22),
+        compliance_types=["PF", "ESI"],
+    ), admin, db)
+    assert unit["code"].startswith("UNIT-KERALA-PLANT")
+    assert unit["compliance_types"] == ["PF", "ESI"]
+
+    contractor = api.create_contractor(ContractorInput(
+        name="Scope Labour Services",
+        unit_id=unit["id"],
+        contractor_maker_email="maker@scope.example.com",
+        contractor_maker_password="Maker-Password-1",
+    ), admin, db)
+    maker = db.scalar(select(User).where(User.email == "maker@scope.example.com"))
+    assert contractor["contractor_maker_user_id"] == maker.id
+    assert contractor["code"].startswith("CONTRACTOR-SCOPE-LABOUR-SERVICES")
+    assert access.can_access_subject(db, maker, organization.id, "CONTRACTOR", contractor["id"])
+    assert not access.can_access_subject(db, maker, organization.id, "UNIT", unit["id"])
+    assert verify_password("Maker-Password-1", maker.password_hash)
 
 
 def test_entity_assignments_are_centralized_multi_role_and_tenant_scoped(db):
@@ -304,6 +366,13 @@ def test_entity_assignments_are_centralized_multi_role_and_tenant_scoped(db):
         api.replace_unit_user_assignments(
             unit_b.id,
             [EntityUserAssignmentInput(user_id=member_a.id, role="MAKER")],
+            organization_admin,
+            db,
+        )
+    with pytest.raises(HTTPException, match="User not found"):
+        api.reset_user_password(
+            member_b.id,
+            AdministratorPasswordResetInput(new_password="Other-Tenant-Password-1"),
             organization_admin,
             db,
         )

@@ -2895,17 +2895,136 @@ textarea:focus-visible {
   z-index: 60;
   inset: 0;
   display: flex;
-  justify-content: flex-end;
+  align-items: flex-start;
+  justify-content: center;
+  overflow-y: auto;
+  padding: 2rem 1rem;
   background: rgb(15 23 42 / 42%);
 }
 
-.crud-drawer {
+.assignment-user-backdrop {
+  position: fixed;
+  z-index: 200;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow-y: auto;
+  padding: 1.5rem;
+  background: rgb(15 23 42 / 42%);
+}
+
+.assignment-user-drawer {
   width: min(100%, 720px);
-  height: 100%;
+  max-height: calc(100vh - 3rem);
+}
+
+.entity-login-cell {
+  display: grid;
+  gap: 0.18rem;
+  min-width: 180px;
+}
+
+.entity-login-cell small {
+  color: #64748b;
+}
+
+.entity-login-cell .text-action {
+  width: fit-content;
+  margin-top: 0.3rem;
+  padding: 0;
+}
+
+/* Primary create/edit forms use the same workspace canvas as Organization
+   creation. Secondary confirmations and the small "create and assign" dialog
+   retain the compact modal treatment. */
+.workspace-form-backdrop {
+  position: fixed;
+  z-index: 60;
+  top: 72px;
+  right: 0;
+  bottom: 0;
+  left: 264px;
+  overflow-y: auto;
+  padding: 1.75rem 2rem 2.5rem;
+  background: var(--app-background, #f7f7f2);
+}
+
+.app-shell.sidebar-collapsed .workspace-form-backdrop {
+  left: 72px;
+}
+
+.workspace-form {
+  width: min(100%, 1680px);
+  min-height: 100%;
+  margin: 0 auto;
+  overflow: visible;
+  color: #334155;
+  background: #fff;
+  border: 1px solid #dbe5d5;
+  border-radius: 1rem;
+  box-shadow: none;
+}
+
+.workspace-form .drawer-heading {
+  padding: 1.35rem 1.45rem;
+}
+
+.workspace-form .drawer-icon,
+.workspace-form .drawer-heading p {
+  display: none;
+}
+
+.workspace-form .drawer-heading > div {
+  gap: 0;
+}
+
+.workspace-form .drawer-heading h2 {
+  color: #1f2937;
+  font-size: 1rem;
+  font-weight: 650;
+}
+
+.workspace-form .entity-form {
+  padding: 1.5rem 1.45rem 0;
+}
+
+.workspace-form .drawer-footer {
+  margin: 0 -1.45rem;
+  padding: 1rem 1.45rem;
+}
+
+.user-access-tabs {
+  display: flex;
+  gap: 0.35rem;
+  margin: -0.25rem 0 1.1rem;
+  border-bottom: 1px solid var(--border, #dbe5d5);
+}
+
+.user-access-tabs button {
+  padding: 0.65rem 0.9rem;
+  color: #64748b;
+  font-weight: 700;
+  background: transparent;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  border-radius: 0;
+}
+
+.user-access-tabs button.active {
+  color: var(--primary-green, #424b35);
+  border-bottom-color: var(--primary-green, #424b35);
+}
+
+.crud-drawer {
+  width: min(100%, 1120px);
+  max-height: calc(100vh - 4rem);
   overflow-y: auto;
   color: #334155;
   background: #fff;
-  box-shadow: -18px 0 48px rgb(15 23 42 / 22%);
+  border: 1px solid #dbe5d5;
+  border-radius: 0.9rem;
+  box-shadow: 0 18px 48px rgb(15 23 42 / 28%);
 }
 
 .drawer-heading {
@@ -2913,7 +3032,7 @@ textarea:focus-visible {
   align-items: flex-start;
   justify-content: space-between;
   gap: 1rem;
-  padding: 1.25rem 1.35rem;
+  padding: 1.35rem 1.6rem;
   border-bottom: 1px solid #e2e8f0;
 }
 
@@ -2948,7 +3067,7 @@ textarea:focus-visible {
 .entity-form {
   display: grid;
   gap: 1.25rem;
-  padding: 1.25rem 1.35rem 0;
+  padding: 1.5rem 1.6rem 0;
 }
 
 .form-section {
@@ -2971,6 +3090,18 @@ textarea:focus-visible {
   font-weight: 750;
 }
 
+/* Required inputs are visually distinct before submit, while native browser
+   validation continues to provide the accessible field-specific message. */
+.entity-form :is(input, select, textarea):required,
+.form-grid :is(input, select, textarea):required {
+  border-left: 3px solid #b45309;
+}
+
+.entity-form label:has(:required) > span:first-child::after {
+  content: " *";
+  color: #b91c1c;
+}
+
 .field-error {
   color: #b91c1c;
   font-size: 0.68rem;
@@ -2987,6 +3118,30 @@ textarea:focus-visible {
   background: rgb(255 255 255 / 96%);
   border-top: 1px solid #e2e8f0;
   backdrop-filter: blur(8px);
+}
+
+.checkbox-group,
+.selected-file-list,
+.existing-document-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  align-items: center;
+}
+
+.checkbox-group .inline,
+.selected-file-list > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.45rem 0.65rem;
+  border: 1px solid #dbe5d5;
+  border-radius: 0.45rem;
+  background: #f8fbf6;
+}
+
+.existing-document-list {
+  margin-top: 0.85rem;
 }
 
 @media (max-width: 1280px) {
@@ -3047,6 +3202,12 @@ textarea:focus-visible {
 
   .content {
     padding: 0 1.25rem 2rem;
+  }
+
+  .workspace-form-backdrop {
+    top: 0;
+    left: 0;
+    padding: 1.25rem;
   }
 
   .app-topbar {
@@ -3254,6 +3415,7 @@ textarea:focus-visible {
 
   .crud-drawer {
     width: 100%;
+    max-height: none;
   }
 
   .drawer-footer {
