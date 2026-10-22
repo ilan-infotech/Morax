@@ -907,7 +907,7 @@ def seed_qa_demo_workspace(
             category="QA_SUPPORTING_DOCUMENT",
             filename=f"QA-Evidence-{index:02d}.txt",
             verification_state=("VERIFIED" if index <= 3 else ("REJECTED" if index == 4 else "PENDING")),
-            verifier=unit_checker if index <= 3 else (contractor_checker if index == 4 else None),
+            verifier=unit_checker if index <= 3 else (principal_employer_checker if index == 4 else None),
         )
 
     db.add(

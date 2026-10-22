@@ -338,9 +338,29 @@ app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allo
 app.include_router(router, prefix=settings.api_v1_prefix)
 
 
+def apply_db_migrations() -> None:
+    """Ensure database schema is up-to-date with Alembic before running startup seeds."""
+    from pathlib import Path
+    import logging
+    from alembic.config import Config
+    from alembic import command
+
+    logger = logging.getLogger("uvicorn.info")
+    backend_dir = Path(__file__).resolve().parent.parent
+    ini_path = backend_dir / "alembic.ini"
+    alembic_dir = backend_dir / "alembic"
+    if ini_path.exists() and alembic_dir.exists():
+        logger.info("Checking and applying pending database migrations...")
+        cfg = Config(str(ini_path))
+        cfg.set_main_option("script_location", str(alembic_dir))
+        command.upgrade(cfg, "head")
+        logger.info("Database migrations up-to-date.")
+
+
 @app.on_event("startup")
 def startup() -> None:
     settings.upload_path.mkdir(parents=True, exist_ok=True)
+    apply_db_migrations()
     seed_baseline()
 
 
