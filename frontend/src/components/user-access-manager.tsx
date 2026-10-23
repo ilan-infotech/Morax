@@ -7,7 +7,6 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import GradientText from "./GradientText/GradientText";
-import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   rowSortingFeature,
@@ -116,7 +115,6 @@ export function UserAccessManager({
   onImpersonate: (userId: string) => Promise<void>;
 }) {
   const queryClient = useQueryClient();
-  const navigate = useNavigate();
   const canManage = isOrgAdmin(user);
   const [search, setSearch] = useState("");
   const deferredSearch = useDeferredValue(search);
@@ -309,13 +307,8 @@ export function UserAccessManager({
   };
   const loginAs = useCallback(
     async (target: User) => {
-      if (
-        !window.confirm(`Start an audited temporary session as ${target.name}?`)
-      )
-        return;
       try {
         await onImpersonate(target.id);
-        navigate("/app/dashboard");
       } catch (error) {
         setNotice(
           error instanceof Error
@@ -324,7 +317,7 @@ export function UserAccessManager({
         );
       }
     },
-    [navigate, onImpersonate],
+    [onImpersonate],
   );
   const scopeNameByKey = useMemo(() => {
     const map = new Map<string, string>();

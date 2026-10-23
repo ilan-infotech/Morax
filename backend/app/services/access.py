@@ -2,12 +2,12 @@ from datetime import timezone, datetime
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.security import decode_access_token
 from app.db.session import get_db
-from app.models import AuthSession, Contractor, ContractorSite, Unit, User, UserPermissionGrant, UserRoleScope
+from app.models import AuthSession, Contractor, ContractorSite, Organization, Unit, User, UserPermissionGrant, UserRoleScope
 
 bearer = HTTPBearer(auto_error=False)
 PLATFORM_ADMIN_ROLE = "MORAX_ADMIN"
@@ -15,6 +15,8 @@ ADMIN_ROLES = {"ORGANIZATION_ADMIN"}
 MANAGER_ROLES = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "CONTRACTOR_ADMIN"}
 MAKER_ROLES = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "CONTRACTOR_ADMIN", "CONTRACTOR_MAKER"}
 CHECKER_ROLES = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_CHECKER", "CONTRACTOR_ADMIN", "CONTRACTOR_CHECKER"}
+CONTRACTOR_ROLES = {"CONTRACTOR_ADMIN", "CONTRACTOR_MAKER", "CONTRACTOR_CHECKER"}
+BROADER_TENANT_ROLES = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "UNIT_CHECKER", "VIEWER", "AUDITOR"}
 
 ROLE_PERMISSIONS = {
     "MORAX_ADMIN": {
@@ -179,6 +181,8 @@ def current_user(
     setattr(user, "_morax_session_id", session.id)
     setattr(user, "_morax_impersonated_by_id", session.impersonated_by_id)
     setattr(user, "_morax_impersonated_by_session_id", session.impersonated_by_session_id)
+    contractor_context = contractor_context_for_user(db, user, active_org, session.active_contractor_id)
+    setattr(user, "_morax_active_contractor_id", contractor_context["active_contractor_id"])
     return user
 
 
@@ -188,6 +192,66 @@ def scopes_for(db: Session, user_id: str) -> list[UserRoleScope]:
 
 def roles_for(db: Session, user_id: str) -> set[str]:
     return {scope.role for scope in scopes_for(db, user_id)}
+
+
+def contractor_context_for_user(
+    db: Session,
+    user: User,
+    organization_id: str,
+    active_contractor_id: str | None = None,
+) -> dict:
+    """Return the authorized, session-selectable contractor context.
+
+    Only contractor-only accounts use this context. Mixed organization/unit
+    administrators continue to use their normal broader access.
+    """
+    scopes = scopes_for(db, user.id)
+    scope_roles = {scope.role for scope in scopes}
+    enabled = bool(scope_roles & CONTRACTOR_ROLES) and not bool(scope_roles & BROADER_TENANT_ROLES)
+    if not enabled:
+        return {
+            "enabled": False,
+            "selection_required": False,
+            "active_contractor_id": None,
+            "active_contractor_name": None,
+            "options": [],
+        }
+
+    contractor_ids = {
+        scope.scope_id
+        for scope in scopes
+        if scope.role in CONTRACTOR_ROLES and scope.scope_type == "CONTRACTOR"
+    }
+    unit_ids = {
+        scope.scope_id
+        for scope in scopes
+        if scope.role in CONTRACTOR_ROLES and scope.scope_type == "UNIT"
+    }
+    query = select(Contractor).where(
+        Contractor.organization_id == organization_id,
+        Contractor.status == "ACTIVE",
+    )
+    filters = []
+    if contractor_ids:
+        filters.append(Contractor.id.in_(contractor_ids))
+    if unit_ids:
+        filters.append(Contractor.unit_id.in_(unit_ids))
+    contractors = list(db.scalars(query.where(or_(*filters)).order_by(Contractor.name, Contractor.id))) if filters else []
+    authorized_ids = {contractor.id for contractor in contractors}
+    selected_id = active_contractor_id if active_contractor_id in authorized_ids else None
+    if selected_id is None and len(contractors) == 1:
+        selected_id = contractors[0].id
+    selected = next((contractor for contractor in contractors if contractor.id == selected_id), None)
+    return {
+        "enabled": True,
+        "selection_required": selected is None,
+        "active_contractor_id": selected.id if selected else None,
+        "active_contractor_name": selected.name if selected else None,
+        "options": [
+            {"id": contractor.id, "name": contractor.name, "code": contractor.code}
+            for contractor in contractors
+        ],
+    }
 
 
 def permission_grants_for(db: Session, user_id: str) -> set[str]:
@@ -201,12 +265,17 @@ def platform_master_organization_id(db: Session) -> str:
     compatibility, but the rows are now owned only by the bootstrap MORAX
     platform organization and are applied to every tenant.
     """
-    organization_id = db.scalar(
-        select(User.organization_id)
-        .where(User.platform_role == PLATFORM_ADMIN_ROLE, User.organization_id.is_not(None))
-        .order_by(User.created_at, User.id)
-        .limit(1)
-    )
+    organization_id = db.scalar(select(Organization.id).where(Organization.is_system.is_(True)).order_by(Organization.created_at, Organization.id).limit(1))
+    if not organization_id:
+        # Compatibility for a database that has not yet been opened after the
+        # system-tenant migration/seed. Startup will mark this tenant on its
+        # next normal run.
+        organization_id = db.scalar(
+            select(User.organization_id)
+            .where(User.platform_role == PLATFORM_ADMIN_ROLE, User.organization_id.is_not(None))
+            .order_by(User.created_at, User.id)
+            .limit(1)
+        )
     if not organization_id:
         raise HTTPException(409, "A MORAX platform master organization is not configured")
     return organization_id
@@ -269,6 +338,26 @@ def can_access_subject(db: Session, user: User, organization_id: str, subject_ty
     if is_org_admin(db, user, organization_id):
         return True
     scopes = scopes_for(db, user.id)
+    scope_roles = {scope.role for scope in scopes}
+    contractor_only = bool(scope_roles & CONTRACTOR_ROLES) and not bool(scope_roles & BROADER_TENANT_ROLES)
+    # Session context is authoritative for an authenticated contractor-only
+    # user. Users inspected by an administrator outside their own session do
+    # not carry this attribute and retain their complete configured scope.
+    if contractor_only and hasattr(user, "_morax_active_contractor_id"):
+        active_contractor_id = getattr(user, "_morax_active_contractor_id", None)
+        if not active_contractor_id:
+            return False
+        if subject_type == "CONTRACTOR":
+            return subject_id == active_contractor_id
+        if subject_type == "CONTRACTOR_SITE":
+            site = db.get(ContractorSite, subject_id)
+            return bool(
+                site
+                and site.organization_id == organization_id
+                and site.contractor_id == active_contractor_id
+            )
+        if subject_type == "UNIT":
+            return False
     # A Contractor Maker may be mapped to one or more Units so the system can
     # locate that contractor's work there. That mapping is not Company
     # Compliance access: only a non-contractor role can open the Unit itself.
@@ -329,6 +418,21 @@ def accessible_subject_ids(db: Session, user: User, organization_id: str, subjec
     if is_org_admin(db, user, organization_id):
         return None
     scopes = scopes_for(db, user.id)
+    scope_roles = {scope.role for scope in scopes}
+    contractor_only = bool(scope_roles & CONTRACTOR_ROLES) and not bool(scope_roles & BROADER_TENANT_ROLES)
+    if contractor_only and hasattr(user, "_morax_active_contractor_id"):
+        active_contractor_id = getattr(user, "_morax_active_contractor_id", None)
+        if not active_contractor_id:
+            return set()
+        if subject_type == "CONTRACTOR":
+            return {active_contractor_id}
+        if subject_type == "CONTRACTOR_SITE":
+            return set(db.scalars(select(ContractorSite.id).where(
+                ContractorSite.organization_id == organization_id,
+                ContractorSite.contractor_id == active_contractor_id,
+            )))
+        if subject_type == "UNIT":
+            return set()
     if any(
         scope.scope_type == "ORGANIZATION"
         and scope.scope_id == organization_id
@@ -368,11 +472,26 @@ def user_summary(db: Session, user: User) -> dict:
     grants = permission_grants_for(db, user.id)
     impersonator_id = getattr(user, "_morax_impersonated_by_id", None)
     impersonator = db.get(User, impersonator_id) if impersonator_id else None
+    active_organization_id = getattr(user, "_morax_active_organization_id", user.organization_id)
+    active_organization = db.get(Organization, active_organization_id) if active_organization_id else None
+    contractor_context = contractor_context_for_user(
+        db,
+        user,
+        active_organization_id,
+        getattr(user, "_morax_active_contractor_id", None),
+    ) if active_organization_id else {
+        "enabled": False,
+        "selection_required": False,
+        "active_contractor_id": None,
+        "active_contractor_name": None,
+        "options": [],
+    }
     return {
         "id": user.id,
         "name": user.name,
         "email": user.email,
-        "organization_id": getattr(user, "_morax_active_organization_id", user.organization_id),
+        "organization_id": active_organization_id,
+        "organization_name": active_organization.name if active_organization else None,
         "home_organization_id": user.organization_id,
         "platform_role": user.platform_role,
         "mobile": user.mobile,
@@ -383,6 +502,7 @@ def user_summary(db: Session, user: User) -> dict:
         "scopes": [{"role": scope.role, "scope_type": scope.scope_type, "scope_id": scope.scope_id} for scope in scopes],
         "features": features_for(user, scopes, grants),
         "permissions": sorted(permissions_for(user, scopes, grants)),
+        "contractor_context": contractor_context,
         "impersonation": {
             "active": bool(impersonator_id),
             "impersonator_id": impersonator_id,

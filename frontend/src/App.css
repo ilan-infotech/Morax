@@ -1151,6 +1151,66 @@ button:disabled {
   place-items: center;
 }
 
+.impersonation-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+  padding: 0.8rem 1rem;
+  color: #5f4300;
+  background: #fff3cd;
+  border: 1px solid #e6b800;
+  border-radius: 0.6rem;
+}
+
+.contractor-context-dialog {
+  width: min(100%, 620px);
+}
+
+.contractor-context-options {
+  display: grid;
+  gap: 0.65rem;
+  max-height: min(46vh, 420px);
+  margin: 1rem 0;
+  overflow-y: auto;
+}
+
+.contractor-context-options label {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  min-height: 64px;
+  padding: 0.8rem 0.95rem;
+  cursor: pointer;
+  background: #fff;
+  border: 1px solid #d7ddcf;
+  border-radius: 0.65rem;
+  transition: border-color 150ms ease, box-shadow 150ms ease, background 150ms ease;
+}
+
+.contractor-context-options label:hover,
+.contractor-context-options label.selected {
+  background: #f7f9f3;
+  border-color: #566044;
+  box-shadow: 0 0 0 2px rgb(86 96 68 / 12%);
+}
+
+.contractor-context-options label span {
+  display: grid;
+  gap: 0.18rem;
+}
+
+.contractor-context-options label small {
+  color: #64748b;
+}
+
+.contractor-context-options input {
+  width: 17px;
+  height: 17px;
+  accent-color: #424b35;
+}
+
 .compliance-dialog {
   width: min(100%, 650px);
   padding: 1.35rem;

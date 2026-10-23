@@ -10,7 +10,7 @@ import app.services.access as access
 from app.core.security import hash_password, verify_password
 from app.db.base import Base
 from app.models import AuditLog, AuthSession, Contractor, IndustryType, Organization, State, Unit, User, UserActivation, UserRoleScope
-from app.schemas import AdministratorPasswordResetInput, ContractorInput, EntityUserAssignmentInput, LoginRequest, OrganizationDeleteInput, PlatformOrganizationInput, RoleScopeInput, UnitInput, UserCreateInput
+from app.schemas import AdministratorPasswordResetInput, ContractorContextInput, ContractorInput, EntityUserAssignmentInput, LoginRequest, OrganizationDeleteInput, PlatformOrganizationInput, RoleScopeInput, UnitInput, UserCreateInput
 
 
 @pytest.fixture()
@@ -141,6 +141,58 @@ def test_product_admin_can_start_and_end_an_audited_organization_session(db):
     assert switched_session.impersonated_by_id == platform_admin.id
     assert switched_session.impersonated_by_session_id == originating_session.id
     assert "PLATFORM_ORGANIZATION_LOGIN_STARTED" in set(db.scalars(select(AuditLog.action)))
+
+
+def test_product_admin_can_switch_from_organization_to_contractor_and_return(db):
+    platform_admin = User(
+        name="MORAX Admin", email="platform-switch@example.test", password_hash="not-a-real-password",
+        active=True, platform_role="MORAX_ADMIN",
+    )
+    db.add(platform_admin)
+    db.flush()
+    created = api.create_platform_organization(
+        PlatformOrganizationInput(
+            organization_name="Contractor Switch Test", organization_code="CON-SWITCH",
+            organization_admin_name="Organization Admin", organization_admin_email="switch-org@morax.example.com",
+            organization_admin_password="Organization-Admin-Password-1",
+        ),
+        platform_admin,
+        db,
+    )
+    organization_admin = db.scalar(select(User).where(User.email == "switch-org@morax.example.com"))
+    contractor_maker = User(
+        organization_id=created["id"], name="Contractor Maker", email="switch-contractor@morax.example.com",
+        password_hash="not-a-real-password", active=True,
+    )
+    db.add(contractor_maker)
+    db.flush()
+    db.add(UserRoleScope(
+        user_id=contractor_maker.id, role="CONTRACTOR_MAKER", scope_type="CONTRACTOR", scope_id="contractor-switch-test",
+    ))
+    originating_session = AuthSession(user_id=platform_admin.id, expires_at=datetime.now(UTC) + timedelta(minutes=30))
+    db.add(originating_session)
+    db.commit()
+    setattr(platform_admin, "_morax_session_id", originating_session.id)
+
+    api.login_as_organization(created["id"], platform_admin, db)
+    organization_session = db.scalar(select(AuthSession).where(AuthSession.user_id == organization_admin.id))
+    setattr(organization_admin, "_morax_active_organization_id", created["id"])
+    setattr(organization_admin, "_morax_session_id", organization_session.id)
+    setattr(organization_admin, "_morax_impersonated_by_id", platform_admin.id)
+    setattr(organization_admin, "_morax_impersonated_by_session_id", originating_session.id)
+
+    switched = api.start_impersonation(contractor_maker.id, organization_admin, db)
+    contractor_session = db.scalar(select(AuthSession).where(AuthSession.user_id == contractor_maker.id))
+    assert switched["user"]["id"] == contractor_maker.id
+    assert switched["user"]["organization_name"] == "Contractor Switch Test"
+    assert db.get(AuthSession, organization_session.id).revoked_at is not None
+    assert contractor_session.impersonated_by_id == platform_admin.id
+    assert contractor_session.impersonated_by_session_id == originating_session.id
+    assert "IMPERSONATION_SWITCHED" in set(db.scalars(select(AuditLog.action)))
+
+    returned = api.end_impersonation(contractor_maker, db)
+    assert returned["user"]["id"] == platform_admin.id
+    assert db.get(AuthSession, contractor_session.id).revoked_at is not None
 
 
 def test_mrf_onboarding_login_unit_and_assigned_user_logins(db):
@@ -281,6 +333,56 @@ def test_generated_codes_unit_types_and_contractor_maker_scope(db):
     assert access.can_access_subject(db, maker, organization.id, "CONTRACTOR", contractor["id"])
     assert not access.can_access_subject(db, maker, organization.id, "UNIT", unit["id"])
     assert verify_password("Maker-Password-1", maker.password_hash)
+
+    single_login = api.login(LoginRequest(email=maker.email, password="Maker-Password-1"), db)
+    assert single_login["user"]["contractor_context"]["selection_required"] is False
+    assert single_login["user"]["contractor_context"]["active_contractor_id"] == contractor["id"]
+
+    second_contractor = Contractor(
+        organization_id=organization.id,
+        unit_id=unit["id"],
+        name="Second Labour Services",
+        code="CONTRACTOR-SECOND-LABOUR",
+        status="ACTIVE",
+    )
+    db.add(second_contractor)
+    db.flush()
+    db.add(UserRoleScope(
+        user_id=maker.id,
+        role="CONTRACTOR_MAKER",
+        scope_type="CONTRACTOR",
+        scope_id=second_contractor.id,
+    ))
+    db.commit()
+
+    multiple_login = api.login(LoginRequest(email=maker.email, password="Maker-Password-1"), db)
+    context = multiple_login["user"]["contractor_context"]
+    assert context["selection_required"] is True
+    assert context["active_contractor_id"] is None
+    assert {option["id"] for option in context["options"]} == {contractor["id"], second_contractor.id}
+    assert not access.can_access_subject(db, maker, organization.id, "CONTRACTOR", contractor["id"])
+    assert not access.can_access_subject(db, maker, organization.id, "CONTRACTOR", second_contractor.id)
+
+    selected = api.select_contractor_context(
+        ContractorContextInput(contractor_id=second_contractor.id),
+        maker,
+        db,
+    )
+    assert selected["contractor_context"]["active_contractor_id"] == second_contractor.id
+    assert selected["contractor_context"]["active_contractor_name"] == "Second Labour Services"
+    assert not access.can_access_subject(db, maker, organization.id, "CONTRACTOR", contractor["id"])
+    assert access.can_access_subject(db, maker, organization.id, "CONTRACTOR", second_contractor.id)
+    switched_context = api.select_contractor_context(
+        ContractorContextInput(contractor_id=contractor["id"]),
+        maker,
+        db,
+    )
+    assert switched_context["contractor_context"]["active_contractor_id"] == contractor["id"]
+    assert access.can_access_subject(db, maker, organization.id, "CONTRACTOR", contractor["id"])
+    assert not access.can_access_subject(db, maker, organization.id, "CONTRACTOR", second_contractor.id)
+    with pytest.raises(HTTPException, match="not authorized"):
+        api.select_contractor_context(ContractorContextInput(contractor_id="unauthorized-contractor"), maker, db)
+    assert "CONTRACTOR_CONTEXT_SELECTED" in set(db.scalars(select(AuditLog.action)))
 
 
 def test_entity_assignments_are_centralized_multi_role_and_tenant_scoped(db):
@@ -423,7 +525,7 @@ def test_entity_assignments_are_centralized_multi_role_and_tenant_scoped(db):
 
 
 def test_product_admin_can_permanently_delete_only_a_tenant_and_its_data(db):
-    master = Organization(name="MORAX Master", code="MORAX-MASTER", status="ACTIVE")
+    master = Organization(name="MORAX Platform System", code="MORAX-MASTER", status="ACTIVE", is_system=True)
     tenant = Organization(name="Delete Me", code="DELETE-ME", status="ACTIVE")
     state = State(name="Tamil Nadu", code="TN")
     industry = IndustryType(name="Factory", code="FACTORY")
@@ -440,6 +542,11 @@ def test_product_admin_can_permanently_delete_only_a_tenant_and_its_data(db):
     db.commit()
     tenant_id, tenant_user_id, unit_id, contractor_id, master_id = tenant.id, tenant_user.id, unit.id, contractor.id, master.id
 
+    listed = api.list_platform_organizations(user=product_admin, db=db)
+    assert [item["id"] for item in listed] == [tenant_id]
+    with pytest.raises(HTTPException, match="Organization not found"):
+        api.get_platform_organization(master_id, product_admin, db)
+
     result = api.delete_platform_organization(tenant_id, OrganizationDeleteInput(confirmation_code="DELETE-ME"), product_admin, db)
 
     assert result["ok"] is True
@@ -449,4 +556,4 @@ def test_product_admin_can_permanently_delete_only_a_tenant_and_its_data(db):
     assert db.get(Contractor, contractor_id) is None
     assert db.get(Organization, master_id) is not None
     with pytest.raises(HTTPException, match="cannot be deleted"):
-        api.delete_platform_organization(master.id, OrganizationDeleteInput(confirmation_code="MORAX-MASTER"), product_admin, db)
+        api.delete_platform_organization(master_id, OrganizationDeleteInput(confirmation_code="MORAX-MASTER"), product_admin, db)

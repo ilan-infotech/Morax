@@ -3,7 +3,9 @@ import { api, download, upload } from './client'
 export type RoleScope = { role: string; scope_type: string; scope_id: string }
 export type EntityUserAssignment = { user_id: string; name?: string; email?: string; mobile?: string | null; active?: boolean; role: 'ADMIN' | 'MAKER' | 'CHECKER'; scope_role?: string }
 export type Impersonation = { active: boolean; impersonator_id?: string | null; impersonator_name?: string | null }
-export type User = { id: string; name: string; email: string; organization_id: string; home_organization_id?: string | null; platform_role?: string | null; must_change_password: boolean; roles: string[]; scopes: RoleScope[]; features?: string[]; impersonation?: Impersonation; active?: boolean; mobile?: string | null; created_at?: string | null }
+export type ContractorContextOption = { id: string; name: string; code: string }
+export type ContractorContext = { enabled: boolean; selection_required: boolean; active_contractor_id?: string | null; active_contractor_name?: string | null; options: ContractorContextOption[] }
+export type User = { id: string; name: string; email: string; organization_id: string; organization_name?: string | null; home_organization_id?: string | null; platform_role?: string | null; must_change_password: boolean; roles: string[]; scopes: RoleScope[]; features?: string[]; impersonation?: Impersonation; contractor_context?: ContractorContext; active?: boolean; mobile?: string | null; created_at?: string | null }
 export type AuthResult = { access_token: string; token_type: string; user: User }
 export type Master = { id: string; name: string; code: string; state_id?: string }
 export type Evidence = { id: string; category: string; original_filename: string; version: number; created_at: string; verification_state?: string; verification_reason?: string | null; size_bytes?: number; checksum_sha256?: string; verified_at?: string | null }
@@ -35,6 +37,7 @@ export const morax = {
   login: (email: string, password: string) => api<AuthResult>('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
   impersonate: (userId: string) => api<AuthResult>('/auth/impersonate/' + userId, { method: 'POST' }),
   endImpersonation: () => api<AuthResult>('/auth/end-impersonation', { method: 'POST' }),
+  selectContractorContext: (contractorId: string) => api<User>('/auth/contractor-context', { method: 'POST', body: JSON.stringify({ contractor_id: contractorId }) }),
   logout: () => api('/auth/logout', { method: 'POST' }), me: () => api<User>('/auth/me'),
   changePassword: (body: { current_password: string; new_password: string }) => api('/auth/change-password', { method: 'POST', body: JSON.stringify(body) }),
   activateAccount: (token: string, password: string) => api<{ ok: boolean; message: string }>('/auth/activate', { method: 'POST', body: JSON.stringify({ token, password }) }),

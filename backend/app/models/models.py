@@ -29,6 +29,9 @@ class Organization(Timestamped, Base):
     contact_phone: Mapped[str | None] = mapped_column(String(50))
     compliance_start_date: Mapped[date | None] = mapped_column(Date)
     status: Mapped[str] = mapped_column(String(30), default="DRAFT", nullable=False)
+    # Internal platform storage for Product Admin and globally-owned compliance
+    # rules. System tenants are never shown as customer organizations.
+    is_system: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False, index=True)
     registration_number: Mapped[str | None] = mapped_column(String(100))
     pan: Mapped[str | None] = mapped_column(String(20))
     gstin: Mapped[str | None] = mapped_column(String(30))
@@ -233,6 +236,10 @@ class AuthSession(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     active_organization_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id"), index=True)
+    # Contractor-only users can be authorized for several contractors. The
+    # selected contractor is session-specific so parallel logins cannot change
+    # each other's working context.
+    active_contractor_id: Mapped[str | None] = mapped_column(ForeignKey("contractors.id"), index=True)
     # An impersonation is a separate, short-lived session.  Keeping the
     # originating session server-side makes "Return to admin" auditable and
     # prevents the browser from needing to retain an administrator token.

@@ -525,6 +525,12 @@ function isContractorOnlyUser(user: User) {
 
 function workspaceLinks(user: User) {
   const features = featureSet(user);
+  if (user.platform_role === "MORAX_ADMIN") {
+    // Product administrators manage customer tenants and Product-owned
+    // masters. Tenant operational pages are entered only through Login as
+    // Organization, keeping the platform experience unambiguous.
+    return links.filter((link) => ["compliance_master", "notifications", "audit"].includes(link.feature));
+  }
   if (isContractorOnlyUser(user)) {
     return links.filter((link) => ["compliances/contractor", "notifications"].includes(link.path));
   }
@@ -544,6 +550,16 @@ function FeatureGate({
   feature: WorkspaceFeature;
   children: ReactNode;
 }) {
+  if (
+    user.platform_role === "MORAX_ADMIN" &&
+    !["platform.organizations", "compliance_master", "notifications", "audit"].includes(feature)
+  ) {
+    return (
+      <Panel>
+        Product administration is separate from an organization workspace. Open a customer from Organizations to manage its operational data.
+      </Panel>
+    );
+  }
   if (isContractorOnlyUser(user) && !["compliances.recurring", "notifications"].includes(feature)) {
     return <Panel>Contractor access is limited to authorized Contractor Compliance.</Panel>;
   }
@@ -588,11 +604,17 @@ function EntityRoute({ user, onImpersonate }: { user: User; onImpersonate: (user
 function ImpersonationBanner({
   user,
   endImpersonation,
+  onChangeContractor,
 }: {
   user: User;
   endImpersonation: () => Promise<void>;
+  onChangeContractor?: () => void;
 }) {
   const [error, setError] = useState("");
+  const contractorContext = user.contractor_context;
+  const roleLabel = user.roles
+    .map((role) => role.split("_").map((word) => word[0] + word.slice(1).toLowerCase()).join(" "))
+    .join(" · ");
   if (!user.impersonation?.active) return null;
   return (
     <div
@@ -612,7 +634,9 @@ function ImpersonationBanner({
       }}
     >
       <div>
-        <b>Viewing as: {user.name}</b>
+        <b>Viewing as: {user.name}{roleLabel ? ` · ${roleLabel}` : ""}</b>
+        <div>Organization: {user.organization_name ?? "Current organization"}</div>
+        {contractorContext?.active_contractor_name && <div>Contractor: {contractorContext.active_contractor_name}</div>}
         <span>
           {" "}
           You are using this user’s role and organization scope. Actions are
@@ -620,6 +644,9 @@ function ImpersonationBanner({
         </span>
       </div>
       <div className="action-row">
+        {(contractorContext?.options.length ?? 0) > 1 && onChangeContractor && (
+          <button className="secondary" type="button" onClick={onChangeContractor}>Change contractor</button>
+        )}
         <button
           className="secondary"
           onClick={async () => {
@@ -638,16 +665,125 @@ function ImpersonationBanner({
   );
 }
 
+function ContractorWorkspaceBanner({ user, onChangeContractor }: { user: User; onChangeContractor: () => void }) {
+  const context = user.contractor_context;
+  if (user.impersonation?.active || !context?.active_contractor_id) return null;
+  const roleLabel = user.roles
+    .map((role) => role.split("_").map((word) => word[0] + word.slice(1).toLowerCase()).join(" "))
+    .join(" / ");
+  return (
+    <div className="impersonation-banner" role="status">
+      <div>
+        <b>Contractor workspace: {context.active_contractor_name}</b>
+        <div>{user.organization_name ?? "Current organization"} · {roleLabel || "Contractor user"}</div>
+      </div>
+      {context.options.length > 1 && (
+        <button className="secondary" type="button" onClick={onChangeContractor}>Change contractor</button>
+      )}
+    </div>
+  );
+}
+
+function ContractorContextDialog({
+  user,
+  open,
+  selecting,
+  onSelect,
+  onClose,
+}: {
+  user: User;
+  open: boolean;
+  selecting: boolean;
+  onSelect: (contractorId: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  const context = user.contractor_context;
+  const [selected, setSelected] = useState("");
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (!open) return;
+    setSelected(context?.active_contractor_id ?? (context?.options.length === 1 ? context.options[0].id : ""));
+    setError("");
+  }, [open, context?.active_contractor_id, context?.options]);
+  if (!open || !context?.enabled) return null;
+  const selectionRequired = context.selection_required;
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={() => !selectionRequired && !selecting && onClose()}>
+      <section
+        className="compliance-dialog contractor-context-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="contractor-context-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="dialog-header">
+          <div>
+            <p className="eyebrow">CONTRACTOR ACCESS</p>
+            <h2 id="contractor-context-title">Select contractor workspace</h2>
+            <p>Choose the contractor you want to manage in this session.</p>
+          </div>
+          {!selectionRequired && (
+            <button className="icon-button" type="button" onClick={onClose} disabled={selecting} aria-label="Close contractor selection">
+              <X size={18} />
+            </button>
+          )}
+        </div>
+        {context.options.length ? (
+          <div className="contractor-context-options" role="radiogroup" aria-label="Authorized contractors">
+            {context.options.map((contractor) => (
+              <label key={contractor.id} className={selected === contractor.id ? "selected" : ""}>
+                <input
+                  type="radio"
+                  name="active-contractor"
+                  value={contractor.id}
+                  checked={selected === contractor.id}
+                  onChange={() => setSelected(contractor.id)}
+                  disabled={selecting}
+                />
+                <span><b>{contractor.name}</b><small>{contractor.code}</small></span>
+              </label>
+            ))}
+          </div>
+        ) : (
+          <p className="alert error">No active contractor is assigned to this user. Contact the Organization Admin.</p>
+        )}
+        {error && <p className="alert error">{error}</p>}
+        <div className="dialog-footer">
+          {!selectionRequired && <button className="secondary" type="button" onClick={onClose} disabled={selecting}>Cancel</button>}
+          <button
+            className="primary-action"
+            type="button"
+            disabled={!selected || selecting}
+            onClick={async () => {
+              setError("");
+              try {
+                await onSelect(selected);
+              } catch (selectionError) {
+                setError(message(selectionError, "Could not open the selected contractor."));
+              }
+            }}
+          >
+            {selecting ? "Opening..." : "Open contractor"}
+          </button>
+        </div>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
 function Layout({
   user,
   logout,
   onImpersonate,
   endImpersonation,
+  onChangeContractor,
 }: {
   user: User;
   logout: () => void;
   onImpersonate: (userId: string) => Promise<void>;
   endImpersonation: () => Promise<void>;
+  onChangeContractor: () => void;
 }) {
   const { organizationId } = useParams();
   const [organizationName, setOrganizationName] = useState("");
@@ -681,7 +817,8 @@ function Layout({
           <UserProfileDropdown user={user} logout={logout} organizationName={organizationName || (organizationId ? "Organization workspace" : undefined)} />
         </div>
       </header>
-      <ImpersonationBanner user={user} endImpersonation={endImpersonation} />
+      <ImpersonationBanner user={user} endImpersonation={endImpersonation} onChangeContractor={onChangeContractor} />
+      <ContractorWorkspaceBanner user={user} onChangeContractor={onChangeContractor} />
       <Routes>
         <Route
           path="dashboard"
@@ -3142,7 +3279,6 @@ function Users({
   user: User;
   onImpersonate: (userId: string) => Promise<void>;
 }) {
-  const navigate = useNavigate();
   const [users, setUsers] = useState<User[]>([]);
   const [units, setUnits] = useState<Row[]>([]);
   const [contractors, setContractors] = useState<Row[]>([]);
@@ -3209,17 +3345,8 @@ function Users({
     }
   }
   async function loginAs(target: User) {
-    if (
-      !window.confirm(
-        "Start a temporary session as " +
-        target.name +
-        "? All actions will be audited.",
-      )
-    )
-      return;
     try {
       await onImpersonate(target.id);
-      navigate("/app/dashboard");
     } catch (err) {
       setError(message(err, "Could not start impersonation"));
     }
@@ -4808,6 +4935,8 @@ function AppRoutes() {
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [contractorPickerOpen, setContractorPickerOpen] = useState(false);
+  const [selectingContractor, setSelectingContractor] = useState(false);
   useEffect(() => {
     morax
       .me()
@@ -4815,6 +4944,9 @@ function AppRoutes() {
       .catch(() => setToken(null))
       .finally(() => setReady(true));
   }, []);
+  useEffect(() => {
+    if (user?.contractor_context?.selection_required) setContractorPickerOpen(true);
+  }, [user?.id, user?.contractor_context?.selection_required]);
   if (!ready) return <div className="loading">Loading MORAX…</div>;
   if (location.pathname === "/activate") return <AccountActivation />;
   const resetTenantWorkspace = () => queryClient.clear();
@@ -4828,6 +4960,7 @@ function AppRoutes() {
     resetTenantWorkspace();
     setToken(response.access_token);
     setUser(response.user);
+    navigate(`/app/${defaultWorkspacePath(response.user)}`, { replace: true });
   };
   const loginAsOrganization = async (organizationId: string) => {
     const response = await morax.loginAsOrganization(organizationId);
@@ -4847,6 +4980,18 @@ function AppRoutes() {
         : `/app/${defaultWorkspacePath(response.user)}`,
       { replace: true },
     );
+  };
+  const selectContractor = async (contractorId: string) => {
+    setSelectingContractor(true);
+    try {
+      const selectedUser = await morax.selectContractorContext(contractorId);
+      resetTenantWorkspace();
+      setUser(selectedUser);
+      setContractorPickerOpen(false);
+      navigate("/app/compliances/contractor", { replace: true });
+    } finally {
+      setSelectingContractor(false);
+    }
   };
   const logout = async () => {
     try {
@@ -4906,11 +5051,12 @@ function AppRoutes() {
           path="/app/organizations/:organizationId/*"
           element={
             <Layout
-              key={`workspace-${user.id}-${user.organization_id}`}
+              key={`workspace-${user.id}-${user.organization_id}-${user.contractor_context?.active_contractor_id ?? "none"}`}
               user={user}
               logout={logout}
               onImpersonate={impersonate}
               endImpersonation={endImpersonation}
+              onChangeContractor={() => setContractorPickerOpen(true)}
             />
           }
         />
@@ -4918,16 +5064,24 @@ function AppRoutes() {
           path="/app/*"
           element={
             <Layout
-              key={`workspace-${user.id}-${user.organization_id}`}
+              key={`workspace-${user.id}-${user.organization_id}-${user.contractor_context?.active_contractor_id ?? "none"}`}
               user={user}
               logout={logout}
               onImpersonate={impersonate}
               endImpersonation={endImpersonation}
+              onChangeContractor={() => setContractorPickerOpen(true)}
             />
           }
         />
         <Route path="*" element={<Navigate to={home} replace />} />
       </Routes>
+      <ContractorContextDialog
+        user={user}
+        open={contractorPickerOpen}
+        selecting={selectingContractor}
+        onSelect={selectContractor}
+        onClose={() => setContractorPickerOpen(false)}
+      />
     </div>
   );
 }

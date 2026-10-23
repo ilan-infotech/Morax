@@ -43,6 +43,10 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=8)
 
 
+class ContractorContextInput(BaseModel):
+    contractor_id: str = Field(min_length=1, max_length=36)
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"

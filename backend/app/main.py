@@ -274,6 +274,9 @@ def seed_dashboard_demo_data(db, organization: Organization) -> None:
 def seed_baseline() -> None:
     db = SessionLocal()
     try:
+        # Databases upgraded by the runtime schema helper can initially have a
+        # NULL flag; only the explicit system tenant must ever be hidden.
+        db.query(Organization).filter(Organization.is_system.is_(None)).update({Organization.is_system: False})
         for name, code in [
             ("Tamil Nadu", "TN"),
             ("Karnataka", "KA"),
@@ -306,8 +309,10 @@ def seed_baseline() -> None:
         db.flush()
         organization = db.scalar(select(Organization).where(Organization.code == "MORAX-DEMO"))
         if not organization:
-            organization = Organization(name="MORAX Demo Company", legal_name="MORAX Demo Company", code="MORAX-DEMO", compliance_start_date=date.today(), status="CONFIGURED")
+            organization = Organization(name="MORAX Platform System", legal_name="MORAX Platform System", code="MORAX-DEMO", compliance_start_date=date.today(), status="CONFIGURED", is_system=True)
             db.add(organization); db.flush()
+        else:
+            organization.is_system = True
         user = db.scalar(select(User).where(User.email == settings.bootstrap_admin_email.lower()))
         # Seamlessly repair the development account created by pre-release
         # builds that used a reserved `.local` address rejected by EmailStr.
@@ -321,6 +326,13 @@ def seed_baseline() -> None:
         # The configured bootstrap account is the only initial platform user.
         # Tenant administrators are represented separately as ORGANIZATION_ADMIN.
         user.platform_role = "MORAX_ADMIN"
+        # Older deployments may have renamed the original bootstrap tenant.
+        # Its association with the Product Admin is authoritative, so keep it
+        # internal rather than showing it alongside customer organizations.
+        if user.organization_id:
+            platform_organization = db.get(Organization, user.organization_id)
+            if platform_organization:
+                platform_organization.is_system = True
         if not db.scalar(select(UserRoleScope).where(UserRoleScope.user_id == user.id, UserRoleScope.role == "ORGANIZATION_ADMIN", UserRoleScope.scope_id == organization.id)):
             db.add(UserRoleScope(user_id=user.id, role="ORGANIZATION_ADMIN", scope_type="ORGANIZATION", scope_id=organization.id))
         # Normal startup is idempotent. A platform-admin development reset
@@ -372,6 +384,18 @@ def ensure_database_schema() -> None:
         except Exception:
             pass
 
+        # The application supports runtime schema repair for existing local
+        # installs as well as Alembic-managed production deployments.
+        try:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_organizations_is_system ON organizations (is_system)"))
+        except Exception:
+            pass
+
+        try:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_auth_sessions_active_contractor_id ON auth_sessions (active_contractor_id)"))
+        except Exception:
+            pass
+
         # Synchronize alembic_version table to latest head
         try:
             conn.execute(
@@ -382,7 +406,7 @@ def ensure_database_schema() -> None:
             )
             conn.execute(text("DELETE FROM alembic_version"))
             conn.execute(
-                text("INSERT INTO alembic_version (version_num) VALUES ('0012_unit_compliance_types')")
+                text("INSERT INTO alembic_version (version_num) VALUES ('0014_active_contractor_context')")
             )
         except Exception as e:
             logger.warning(f"Could not synchronize alembic_version: {e}")

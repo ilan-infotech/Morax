@@ -21,11 +21,11 @@ from app.models import (
     State, Unit, User, UserActivation, UserPermissionGrant, UserRoleScope,
 )
 from app.schemas import (
-    AccountActivationInput, ActivityInput, AdministratorPasswordResetInput, AssignmentInput, CommentInput, ContractorInput, ContractorSiteInput, EntityUserAssignmentInput, GenerationRequest,
+    AccountActivationInput, ActivityInput, AdministratorPasswordResetInput, AssignmentInput, CommentInput, ContractorContextInput, ContractorInput, ContractorSiteInput, EntityUserAssignmentInput, GenerationRequest,
     DevelopmentResetInput, LoginRequest, OrganizationDeleteInput, OrganizationInput, PlatformOrganizationInput, OrganizationStatusInput, PasswordChangeRequest, RoleScopeInput, RuleInput, UnitInput, UserCreateInput,
     WorkflowDecision, SubmissionInput, UserUpdateInput, EvidenceVerificationInput, NotApplicableInput, RuleStatusInput, DOCUMENT_TYPES,
 )
-from app.services.access import CHECKER_ROLES, MAKER_ROLES, MODULE_PERMISSION_CHOICES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, current_user, has_permission, is_org_admin, platform_master_organization_id, require_org_admin, roles_for, scopes_for, user_summary
+from app.services.access import CHECKER_ROLES, MAKER_ROLES, MODULE_PERMISSION_CHOICES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, contractor_context_for_user, current_user, has_permission, is_org_admin, platform_master_organization_id, require_org_admin, roles_for, scopes_for, user_summary
 from app.services.audit import audit
 from app.services.activation import activate_account
 from app.services.compliance import SUBJECTS, assert_assignment_or_admin, generate_for_subject, submit, transition
@@ -41,6 +41,13 @@ def org_for(user: User) -> str:
     if not organization_id:
         raise HTTPException(409, "User is not assigned to an organization")
     return organization_id
+
+
+def customer_organization_or_404(db: Session, organization_id: str) -> Organization:
+    organization = db.get(Organization, organization_id)
+    if not organization or organization.is_system:
+        raise HTTPException(404, "Organization not found")
+    return organization
 
 
 def require_platform_admin(user: User) -> None:
@@ -610,20 +617,71 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     organization = db.get(Organization, user.organization_id) if user.organization_id else None
     if user.platform_role != PLATFORM_ADMIN_ROLE and (not organization or organization.status == "INACTIVE"):
         raise HTTPException(403, "Your organization is inactive")
-    session = AuthSession(user_id=user.id, active_organization_id=user.organization_id, expires_at=datetime.now(UTC) + timedelta(minutes=480))
+    contractor_context = contractor_context_for_user(db, user, user.organization_id, None) if user.organization_id else None
+    active_contractor_id = contractor_context["active_contractor_id"] if contractor_context else None
+    session = AuthSession(
+        user_id=user.id,
+        active_organization_id=user.organization_id,
+        active_contractor_id=active_contractor_id,
+        expires_at=datetime.now(UTC) + timedelta(minutes=480),
+    )
     db.add(session)
     audit(db, organization_id=user.organization_id, actor_id=user.id, action="LOGIN", module="AUTH", entity_type="User", entity_id=user.id)
     db.commit()
+    setattr(user, "_morax_active_organization_id", user.organization_id)
+    setattr(user, "_morax_active_contractor_id", active_contractor_id)
+    setattr(user, "_morax_session_id", session.id)
     return {"access_token": create_access_token(user.id, session.id), "token_type": "bearer", "user": user_summary(db, user)}
+
+
+@router.post("/auth/contractor-context")
+def select_contractor_context(
+    payload: ContractorContextInput,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Select one authorized contractor for the current authenticated session."""
+    organization_id = org_for(user)
+    context = contractor_context_for_user(db, user, organization_id, None)
+    if not context["enabled"]:
+        raise HTTPException(403, "Contractor context is available only to contractor users")
+    authorized_ids = {item["id"] for item in context["options"]}
+    if payload.contractor_id not in authorized_ids:
+        raise HTTPException(403, "You are not authorized for the selected contractor")
+    session = db.get(AuthSession, getattr(user, "_morax_session_id", None))
+    if not session or session.user_id != user.id or session.revoked_at:
+        raise HTTPException(401, "Session is no longer active")
+    previous_contractor_id = session.active_contractor_id
+    session.active_contractor_id = payload.contractor_id
+    audit(
+        db,
+        organization_id=organization_id,
+        actor_id=user.id,
+        action="CONTRACTOR_CONTEXT_SELECTED",
+        module="AUTH",
+        entity_type="Contractor",
+        entity_id=payload.contractor_id,
+        old={"active_contractor_id": previous_contractor_id},
+        new={"active_contractor_id": payload.contractor_id},
+    )
+    db.commit()
+    setattr(user, "_morax_active_contractor_id", payload.contractor_id)
+    return user_summary(db, user)
 
 
 @router.post("/auth/impersonate/{user_id}")
 def start_impersonation(user_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    """Create a temporary, server-linked session to validate a tenant user's access."""
+    """Create or safely switch a temporary, server-linked tenant session.
+
+    A Product Admin can first enter an Organization Admin workspace and then
+    open a Contractor user.  That is a session replacement, not a nested
+    impersonation: the new session remains linked directly to the original
+    Product Admin session, and the temporary Organization Admin session is
+    revoked.  This preserves a single secure return path and a complete audit
+    trail.
+    """
     organization_id = org_for(user)
     require_org_admin(db, user, organization_id)
-    if getattr(user, "_morax_impersonated_by_id", None):
-        raise HTTPException(409, "End the current impersonation before starting another one")
     target = db.get(User, user_id)
     if not target or target.organization_id != organization_id:
         raise HTTPException(404, "User not found")
@@ -634,32 +692,58 @@ def start_impersonation(user_id: str, user: User = Depends(current_user), db: Se
     if target.id == user.id:
         raise HTTPException(422, "You are already signed in as this user")
 
-    originating_session_id = getattr(user, "_morax_session_id", None)
-    originating_session = db.get(AuthSession, originating_session_id)
-    if not originating_session or originating_session.user_id != user.id:
+    current_session = db.get(AuthSession, getattr(user, "_morax_session_id", None))
+    if not current_session or current_session.user_id != user.id:
         raise HTTPException(401, "Your administrator session is no longer available")
+
+    originating_session = current_session
+    originating_user = user
+    switching_from_impersonation = bool(getattr(user, "_morax_impersonated_by_id", None))
+    if switching_from_impersonation:
+        originating_session = db.get(AuthSession, getattr(user, "_morax_impersonated_by_session_id", None))
+        originating_user = db.get(User, getattr(user, "_morax_impersonated_by_id", None))
+        if (
+            not originating_session
+            or originating_session.revoked_at
+            or not originating_user
+            or not originating_user.active
+            or originating_user.platform_role != PLATFORM_ADMIN_ROLE
+            or originating_session.user_id != originating_user.id
+        ):
+            raise HTTPException(401, "Your Product Admin session is no longer available")
+
+    contractor_context = contractor_context_for_user(db, target, organization_id, None)
+    active_contractor_id = contractor_context["active_contractor_id"]
     session = AuthSession(
         user_id=target.id,
         active_organization_id=organization_id,
+        active_contractor_id=active_contractor_id,
         impersonated_by_session_id=originating_session.id,
-        impersonated_by_id=user.id,
+        impersonated_by_id=originating_user.id,
         expires_at=datetime.now(UTC) + timedelta(minutes=30),
     )
     db.add(session)
+    if switching_from_impersonation:
+        current_session.revoked_at = datetime.now(UTC)
     audit(
         db,
         organization_id=organization_id,
-        actor_id=user.id,
-        action="IMPERSONATION_STARTED",
+        actor_id=originating_user.id,
+        action="IMPERSONATION_SWITCHED" if switching_from_impersonation else "IMPERSONATION_STARTED",
         module="AUTH",
         entity_type="User",
         entity_id=target.id,
-        new={"target_email": target.email, "target_roles": sorted(roles_for(db, target.id))},
+        new={
+            "target_email": target.email,
+            "target_roles": sorted(roles_for(db, target.id)),
+            "replaced_session_user_id": user.id if switching_from_impersonation else None,
+        },
     )
     db.commit()
     setattr(target, "_morax_active_organization_id", organization_id)
+    setattr(target, "_morax_active_contractor_id", active_contractor_id)
     setattr(target, "_morax_session_id", session.id)
-    setattr(target, "_morax_impersonated_by_id", user.id)
+    setattr(target, "_morax_impersonated_by_id", originating_user.id)
     setattr(target, "_morax_impersonated_by_session_id", originating_session.id)
     return {
         "access_token": create_access_token(target.id, session.id),
@@ -725,7 +809,7 @@ def me(user: User = Depends(current_user), db: Session = Depends(get_db)):
 @router.get("/platform/organizations")
 def list_platform_organizations(q: str | None = None, status: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
     require_platform_admin(user)
-    query = select(Organization)
+    query = select(Organization).where(or_(Organization.is_system.is_(False), Organization.is_system.is_(None)))
     if q:
         query = query.where(or_(Organization.name.ilike(f"%{q}%"), Organization.code.ilike(f"%{q}%"), Organization.legal_name.ilike(f"%{q}%")))
     if status:
@@ -788,9 +872,7 @@ def create_platform_organization(payload: PlatformOrganizationInput, user: User 
 @router.get("/platform/organizations/{organization_id}")
 def get_platform_organization(organization_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     require_platform_admin(user)
-    organization = db.get(Organization, organization_id)
-    if not organization:
-        raise HTTPException(404, "Organization not found")
+    organization = customer_organization_or_404(db, organization_id)
     return platform_organization_dict(db, organization)
 
 
@@ -809,9 +891,7 @@ def login_as_organization(
     require_platform_admin(user)
     if getattr(user, "_morax_impersonated_by_id", None):
         raise HTTPException(409, "End the current impersonation before starting another one")
-    organization = db.get(Organization, organization_id)
-    if not organization:
-        raise HTTPException(404, "Organization not found")
+    organization = customer_organization_or_404(db, organization_id)
     if organization.status != "ACTIVE":
         raise HTTPException(422, "Inactive organizations cannot be opened")
     organization_admin = db.scalar(
@@ -865,9 +945,7 @@ def login_as_organization(
 @router.patch("/platform/organizations/{organization_id}")
 def update_platform_organization(organization_id: str, payload: PlatformOrganizationInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     require_platform_admin(user)
-    organization = db.get(Organization, organization_id)
-    if not organization:
-        raise HTTPException(404, "Organization not found")
+    organization = customer_organization_or_404(db, organization_id)
     code = (payload.organization_code or organization.code).strip().upper()
     payload.organization_code = code
     other = db.scalar(select(Organization).where(Organization.code == code, Organization.id != organization.id))
@@ -886,9 +964,7 @@ def update_platform_organization(organization_id: str, payload: PlatformOrganiza
 @router.post("/platform/organizations/{organization_id}/status")
 def set_platform_organization_status(organization_id: str, payload: OrganizationStatusInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     require_platform_admin(user)
-    organization = db.get(Organization, organization_id)
-    if not organization:
-        raise HTTPException(404, "Organization not found")
+    organization = customer_organization_or_404(db, organization_id)
     old = organization.status; organization.status = payload.status
     organization.updated_by_id = user.id
     action = "ORGANIZATION_ACTIVATED" if payload.status == "ACTIVE" else "ORGANIZATION_DEACTIVATED"
@@ -911,9 +987,7 @@ def reset_organization_admin_password(
     links.
     """
     require_platform_admin(user)
-    organization = db.get(Organization, organization_id)
-    if not organization:
-        raise HTTPException(404, "Organization not found")
+    organization = customer_organization_or_404(db, organization_id)
     organization_admin = db.scalar(
         select(User)
         .join(UserRoleScope, UserRoleScope.user_id == User.id)
@@ -961,8 +1035,8 @@ def delete_platform_organization(
     organization = db.get(Organization, organization_id)
     if not organization:
         raise HTTPException(404, "Organization not found")
-    if organization.id == platform_master_organization_id(db):
-        raise HTTPException(422, "The MORAX platform master organization cannot be deleted")
+    if organization.is_system or organization.id == platform_master_organization_id(db):
+        raise HTTPException(422, "The MORAX platform system tenant cannot be deleted")
     if payload.confirmation_code.strip().upper() != organization.code.upper():
         raise HTTPException(422, "Confirmation code does not match the organization code")
 
@@ -1030,6 +1104,8 @@ def delete_platform_organization(
                 session_filters.append(AuthSession.impersonated_by_session_id.in_(tenant_session_ids))
             deleted["sessions"] = remove(delete(AuthSession).where(or_(*session_filters)))
         db.execute(update(AuthSession).where(AuthSession.active_organization_id == organization.id).values(active_organization_id=None))
+        if contractor_ids:
+            db.execute(update(AuthSession).where(AuthSession.active_contractor_id.in_(contractor_ids)).values(active_contractor_id=None))
 
         deleted["audit_logs"] = remove(delete(AuditLog).where(or_(AuditLog.organization_id == organization.id, AuditLog.actor_id.in_(tenant_user_ids) if tenant_user_ids else False)))
         if site_ids:
@@ -1072,9 +1148,7 @@ def reset_platform_organization_development_data(
     if db.get_bind().dialect.name != "sqlite" or not settings.database_url.lower().startswith("sqlite"):
         raise HTTPException(403, "Development reset is available only for the local SQLite database")
 
-    organization = db.get(Organization, organization_id)
-    if not organization:
-        raise HTTPException(404, "Organization not found")
+    organization = customer_organization_or_404(db, organization_id)
     if payload.confirmation_code.strip().upper() != organization.code.upper():
         raise HTTPException(422, "Confirmation code does not match the organization code")
 
@@ -1142,6 +1216,7 @@ def reset_platform_organization_development_data(
             deleted["site_scopes"] = remove(delete(UserRoleScope).where(UserRoleScope.scope_type == "CONTRACTOR_SITE", UserRoleScope.scope_id.in_(site_ids)))
             deleted["sites"] = remove(delete(ContractorSite).where(ContractorSite.id.in_(site_ids)))
         if contractor_ids:
+            db.execute(update(AuthSession).where(AuthSession.active_contractor_id.in_(contractor_ids)).values(active_contractor_id=None))
             deleted["contractor_scopes"] = remove(delete(UserRoleScope).where(UserRoleScope.scope_type == "CONTRACTOR", UserRoleScope.scope_id.in_(contractor_ids)))
             deleted["contractors"] = remove(delete(Contractor).where(Contractor.id.in_(contractor_ids)))
         if unit_ids:
@@ -1204,9 +1279,7 @@ def reset_platform_organization_development_data(
 @router.post("/platform/organizations/{organization_id}/enter")
 def enter_platform_organization(organization_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     require_platform_admin(user)
-    organization = db.get(Organization, organization_id)
-    if not organization:
-        raise HTTPException(404, "Organization not found")
+    organization = customer_organization_or_404(db, organization_id)
     session = db.get(AuthSession, getattr(user, "_morax_session_id", None))
     if not session:
         raise HTTPException(401, "Session is no longer active")
