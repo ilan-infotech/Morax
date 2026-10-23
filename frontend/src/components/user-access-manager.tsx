@@ -34,6 +34,7 @@ import {
 import { morax } from "../api/morax";
 import type { User } from "../api/morax";
 import { EmptyState, InlineError, LoadingSkeleton } from "./workspace-ui";
+import { PasswordInput } from "./password-input";
 
 const userTableFeatures = tableFeatures({ rowSortingFeature });
 const EMPTY_USERS: User[] = [];
@@ -734,14 +735,14 @@ export function UserAccessManager({
                 required
                 error={createForm.formState.errors.password?.message}
               >
-                <input type="password" autoComplete="new-password" minLength={8} required {...createForm.register("password")} />
+                <PasswordInput autoComplete="new-password" minLength={8} required {...createForm.register("password")} />
               </FormField>
               <FormField
                 label="Confirm password"
                 required
                 error={createForm.formState.errors.password_confirmation?.message}
               >
-                <input type="password" autoComplete="new-password" minLength={8} required {...createForm.register("password_confirmation")} />
+                <PasswordInput autoComplete="new-password" minLength={8} required {...createForm.register("password_confirmation")} />
               </FormField>
             </div>
             <div className="form-section">
@@ -934,8 +935,7 @@ export function UserAccessManager({
             {passwordResetError && <InlineError message={passwordResetError} />}
             <div className="form-grid">
               <FormField label="New password">
-                <input
-                  type="password"
+                <PasswordInput
                   value={replacementPassword}
                   onChange={(event) => setReplacementPassword(event.target.value)}
                   autoComplete="new-password"
@@ -944,8 +944,7 @@ export function UserAccessManager({
                 />
               </FormField>
               <FormField label="Confirm new password">
-                <input
-                  type="password"
+                <PasswordInput
                   value={replacementPasswordConfirmation}
                   onChange={(event) => setReplacementPasswordConfirmation(event.target.value)}
                   autoComplete="new-password"

@@ -117,6 +117,11 @@ class DevelopmentResetInput(BaseModel):
     confirmation_code: str = Field(min_length=2, max_length=50)
 
 
+class OrganizationDeleteInput(BaseModel):
+    """Explicit confirmation required before permanently deleting a tenant."""
+    confirmation_code: str = Field(min_length=2, max_length=50)
+
+
 class UnitInput(BaseModel):
     name: str = Field(min_length=2, max_length=200)
     code: str | None = Field(default=None, max_length=50)
@@ -180,7 +185,7 @@ class ContractorInput(BaseModel):
     contractor_type: str | None = None
     industry_type_id: str | None = None
     other_industry_name: str | None = Field(default=None, max_length=150)
-    # Location is copied from the selected Principal Employer by the server.
+    # Contractors may operate in a different State from their Principal Employer.
     state_id: str | None = None
     city_id: str | None = None
     contact_email: EmailStr | None = None

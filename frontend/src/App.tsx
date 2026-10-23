@@ -52,6 +52,8 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   X,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { setToken } from "./api/client";
@@ -63,6 +65,7 @@ import { ModernEntities } from "./components/entity-manager";
 import { UserAccessManager } from "./components/user-access-manager";
 import { ComplianceMasterManager } from "./components/compliance-master-manager";
 import { DocumentLibrary } from "./components/document-library";
+import { PasswordInput } from "./components/password-input";
 import "./App.css";
 
 type Row = Record<string, unknown>;
@@ -295,6 +298,7 @@ export function UserProfileDropdown({ user, logout, organizationName }: { user: 
 function Login({ done }: { done: (user: User) => void }) {
   const [email, setEmail] = useState("admin@morax.example.com");
   const [password, setPassword] = useState("Admin@123");
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -340,11 +344,22 @@ function Login({ done }: { done: (user: User) => void }) {
         </label>
         <label>
           Password
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
+          <span className="password-input">
+            <input
+              type={showPassword ? "text" : "password"}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+            <button
+              type="button"
+              className="password-visibility-toggle"
+              onClick={() => setShowPassword((visible) => !visible)}
+              aria-label={showPassword ? "Hide password" : "Show password"}
+              title={showPassword ? "Hide password" : "Show password"}
+            >
+              {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+            </button>
+          </span>
         </label>
         <ErrorBox text={error} />
         <button>Sign in</button>
@@ -501,10 +516,19 @@ function hasFeature(user: User, feature: WorkspaceFeature) {
   return featureSet(user).has(feature);
 }
 
+function isContractorOnlyUser(user: User) {
+  const contractorRoles = ["CONTRACTOR_ADMIN", "CONTRACTOR_MAKER", "CONTRACTOR_CHECKER"];
+  const broaderRoles = ["ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "UNIT_CHECKER"];
+  return user.roles.some((role) => contractorRoles.includes(role)) &&
+    !user.roles.some((role) => broaderRoles.includes(role));
+}
+
 function workspaceLinks(user: User) {
   const features = featureSet(user);
-  const contractorMakerOnly = user.roles.includes("CONTRACTOR_MAKER") && !user.roles.some((role) => ["ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "UNIT_CHECKER", "CONTRACTOR_ADMIN"].includes(role));
-  return links.filter((link) => features.has(link.feature) && (!contractorMakerOnly || !["compliances/company", "compliances/one-time"].includes(link.path)));
+  if (isContractorOnlyUser(user)) {
+    return links.filter((link) => ["compliances/contractor", "notifications"].includes(link.path));
+  }
+  return links.filter((link) => features.has(link.feature));
 }
 
 function defaultWorkspacePath(user: User) {
@@ -520,6 +544,9 @@ function FeatureGate({
   feature: WorkspaceFeature;
   children: ReactNode;
 }) {
+  if (isContractorOnlyUser(user) && !["compliances.recurring", "notifications"].includes(feature)) {
+    return <Panel>Contractor access is limited to authorized Contractor Compliance.</Panel>;
+  }
   if (hasFeature(user, feature)) return <>{children}</>;
   return (
     <Panel>
@@ -530,9 +557,8 @@ function FeatureGate({
 
 function ComplianceRoute({ user }: { user: User }) {
   const { kind } = useParams();
-  const contractorMakerOnly = user.roles.includes("CONTRACTOR_MAKER") && !user.roles.some((role) => ["ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "UNIT_CHECKER", "CONTRACTOR_ADMIN"].includes(role));
-  if (kind === "company" && contractorMakerOnly) {
-    return <Panel>Contractor Maker access is limited to authorized Contractor Compliance.</Panel>;
+  if (isContractorOnlyUser(user) && kind !== "contractor") {
+    return <Panel>Contractor access is limited to authorized Contractor Compliance.</Panel>;
   }
   return (
     <FeatureGate
@@ -1131,9 +1157,12 @@ function OrganizationLanding({
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState("");
   const [resetTarget, setResetTarget] = useState<Row | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Row | null>(null);
   const [adminPasswordTarget, setAdminPasswordTarget] = useState<Row | null>(null);
   const [resetCode, setResetCode] = useState("");
+  const [deleteCode, setDeleteCode] = useState("");
   const [resetting, setResetting] = useState(false);
+  const [deletingOrganization, setDeletingOrganization] = useState(false);
   const [adminReplacementPassword, setAdminReplacementPassword] = useState("");
   const [adminReplacementPasswordConfirmation, setAdminReplacementPasswordConfirmation] = useState("");
   const [adminPasswordError, setAdminPasswordError] = useState("");
@@ -1168,26 +1197,6 @@ function OrganizationLanding({
   const [form, setForm] = useState(blank);
   const organizationAdminPasswordMismatch = !editing && Boolean(form.organization_admin_password_confirmation) && form.organization_admin_password !== form.organization_admin_password_confirmation;
   const selectedOrganizationStateId = form.state_id;
-  useEffect(() => {
-    if (editing || !form.organization_name.trim()) {
-      if (!editing && form.organization_code) setForm((current) => ({ ...current, organization_code: "" }));
-      return;
-    }
-    let active = true;
-    const timer = window.setTimeout(() => {
-      morax.previewPlatformOrganizationCode(form.organization_name.trim())
-        .then(({ code }) => {
-          if (active) setForm((current) => current.organization_name.trim() === form.organization_name.trim() ? { ...current, organization_code: code } : current);
-        })
-        .catch((err) => {
-          if (active) setError(message(err, "Could not generate the Organization Code."));
-        });
-    }, 250);
-    return () => {
-      active = false;
-      window.clearTimeout(timer);
-    };
-  }, [editing, form.organization_name]);
   const load = () =>
     morax
       .platformOrganizations(filters)
@@ -1295,6 +1304,23 @@ function OrganizationLanding({
     }
   }
 
+  async function deleteOrganization(event: FormEvent) {
+    event.preventDefault();
+    if (!deleteTarget) return;
+    setDeletingOrganization(true);
+    try {
+      const result = await morax.deletePlatformOrganization(String(deleteTarget.id), deleteCode);
+      setError(`Success: ${result.message}`);
+      setDeleteTarget(null);
+      setDeleteCode("");
+      load();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setDeletingOrganization(false);
+    }
+  }
+
   async function resetOrganizationAdminPassword(event: FormEvent) {
     event.preventDefault();
     if (!adminPasswordTarget) return;
@@ -1347,14 +1373,14 @@ function OrganizationLanding({
         <Panel>
           <div className="split">
             <div>
-              <h2>Development master delete</h2>
+              <h2>Reset organization data</h2>
               <p className="muted">
                 This permanently clears all operational data for{" "}
                 <b>{String(resetTarget.organization_name)}</b>: users, entities,
                 rules, compliance history, imports, notifications, and uploaded
-                files. The organization shell and your platform administrator
-                login are retained. It is available only on the local SQLite
-                development database.
+                files. The organization and its Product Admin setup are
+                retained so you can start testing again. This action is
+                available only on the local development database.
               </p>
             </div>
             <button
@@ -1380,7 +1406,7 @@ function OrganizationLanding({
             </label>
             <div className="action-row">
               <button className="danger" disabled={resetting}>
-                {resetting ? "Deleting development data…" : "Master delete data"}
+                {resetting ? "Resetting data…" : "Reset data"}
               </button>
               <button
                 type="button"
@@ -1393,6 +1419,31 @@ function OrganizationLanding({
               >
                 Cancel
               </button>
+            </div>
+          </form>
+        </Panel>
+      )}
+      {deleteTarget && (
+        <Panel>
+          <div className="split">
+            <div>
+              <h2>Delete organization permanently</h2>
+              <p className="muted">
+                This permanently deletes <b>{String(deleteTarget.organization_name)}</b>, including all users, units, contractors, compliance records, documents, notifications, audit history, and stored files. This cannot be undone.
+              </p>
+            </div>
+            <button type="button" className="secondary" disabled={deletingOrganization} onClick={() => { setDeleteTarget(null); setDeleteCode(""); }}>Cancel</button>
+          </div>
+          <form className="form-grid" onSubmit={deleteOrganization}>
+            <label>
+              Type organization code <code>{String(deleteTarget.organization_code)}</code> to permanently delete
+              <input value={deleteCode} onChange={(e) => setDeleteCode(e.target.value)} autoComplete="off" required autoFocus />
+            </label>
+            <div className="action-row">
+              <button className="danger" disabled={deletingOrganization}>
+                {deletingOrganization ? "Deleting organization…" : "Delete organization permanently"}
+              </button>
+              <button type="button" className="secondary" disabled={deletingOrganization} onClick={() => { setDeleteTarget(null); setDeleteCode(""); }}>Cancel</button>
             </div>
           </form>
         </Panel>
@@ -1432,8 +1483,7 @@ function OrganizationLanding({
             <div className="form-grid">
             <label>
               New password
-              <input
-                type="password"
+              <PasswordInput
                 value={adminReplacementPassword}
                 onChange={(event) => setAdminReplacementPassword(event.target.value)}
                 autoComplete="new-password"
@@ -1443,8 +1493,7 @@ function OrganizationLanding({
             </label>
             <label>
               Confirm new password
-              <input
-                type="password"
+              <PasswordInput
                 value={adminReplacementPasswordConfirmation}
                 onChange={(event) => setAdminReplacementPasswordConfirmation(event.target.value)}
                 autoComplete="new-password"
@@ -1497,7 +1546,7 @@ function OrganizationLanding({
                 required
               />
             </label>
-            {editing ? (
+            {false && (editing ? (
               <label>
                 Organization code
                 <input value={form.organization_code} readOnly />
@@ -1507,7 +1556,7 @@ function OrganizationLanding({
                 Organization code
                 <input value={form.organization_code || "Generating code…"} readOnly aria-label="Organization code" />
               </label>
-            )}
+            ))}
             {!editing && (
               <>
                 <label>
@@ -1533,8 +1582,7 @@ function OrganizationLanding({
                 </label>
                 <label>
                   Organization Admin password
-                  <input
-                    type="password"
+                  <PasswordInput
                     value={form.organization_admin_password}
                     onChange={(e) =>
                       setForm({ ...form, organization_admin_password: e.target.value })
@@ -1546,8 +1594,7 @@ function OrganizationLanding({
                 </label>
                 <label>
                   Confirm Organization Admin password
-                  <input
-                    type="password"
+                  <PasswordInput
                     value={form.organization_admin_password_confirmation}
                     onChange={(e) =>
                       setForm({ ...form, organization_admin_password_confirmation: e.target.value })
@@ -1831,7 +1878,18 @@ function OrganizationLanding({
                         window.scrollTo({ top: 0, behavior: "smooth" });
                       }}
                     >
-                      Reset dev data
+                      Reset data
+                    </button>
+                    <button
+                      type="button"
+                      className="danger"
+                      onClick={() => {
+                        setDeleteTarget(row);
+                        setDeleteCode("");
+                        window.scrollTo({ top: 0, behavior: "smooth" });
+                      }}
+                    >
+                      Delete organization
                     </button>
                     <button
                       className={
@@ -3205,8 +3263,7 @@ function Users({
           </label>
           <label>
             Password
-            <input
-              type="password"
+            <PasswordInput
               value={form.password}
               onChange={(event) =>
                 setForm({ ...form, password: event.target.value })
@@ -4468,8 +4525,7 @@ function Settings({ user }: { user: User }) {
         >
           <label>
             Current password
-            <input
-              type="password"
+            <PasswordInput
               value={passwords.current_password}
               onChange={(e) =>
                 setPasswords({ ...passwords, current_password: e.target.value })
@@ -4480,8 +4536,7 @@ function Settings({ user }: { user: User }) {
           </label>
           <label>
             New password
-            <input
-              type="password"
+            <PasswordInput
               value={passwords.new_password}
               onChange={(e) =>
                 setPasswords({ ...passwords, new_password: e.target.value })
@@ -4492,8 +4547,7 @@ function Settings({ user }: { user: User }) {
           </label>
           <label>
             Confirm password
-            <input
-              type="password"
+            <PasswordInput
               value={passwordConfirmation}
               onChange={(e) => setPasswordConfirmation(e.target.value)}
               required
@@ -4605,8 +4659,7 @@ function OrganizationSettings({ user }: { user: User }) {
         >
           <label>
             Current password
-            <input
-              type="password"
+            <PasswordInput
               value={passwords.current_password}
               onChange={(e) =>
                 setPasswords({ ...passwords, current_password: e.target.value })
@@ -4617,8 +4670,7 @@ function OrganizationSettings({ user }: { user: User }) {
           </label>
           <label>
             New password
-            <input
-              type="password"
+            <PasswordInput
               value={passwords.new_password}
               onChange={(e) =>
                 setPasswords({ ...passwords, new_password: e.target.value })
@@ -4629,8 +4681,7 @@ function OrganizationSettings({ user }: { user: User }) {
           </label>
           <label>
             Confirm password
-            <input
-              type="password"
+            <PasswordInput
               value={passwordConfirmation}
               onChange={(e) => setPasswordConfirmation(e.target.value)}
               required
@@ -4733,11 +4784,11 @@ function AccountActivation() {
           >
             <label>
               New password
-              <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={8} autoComplete="new-password" required />
+              <PasswordInput value={password} onChange={(event) => setPassword(event.target.value)} minLength={8} autoComplete="new-password" required />
             </label>
             <label>
               Confirm password
-              <input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} minLength={8} autoComplete="new-password" required />
+              <PasswordInput value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} minLength={8} autoComplete="new-password" required />
             </label>
             <div className="action-row">
               <button disabled={submitting}>{submitting ? "Activating…" : "Activate account"}</button>

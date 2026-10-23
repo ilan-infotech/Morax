@@ -7,7 +7,7 @@ from datetime import UTC, date, datetime, timedelta
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from openpyxl import Workbook, load_workbook
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -22,10 +22,10 @@ from app.models import (
 )
 from app.schemas import (
     AccountActivationInput, ActivityInput, AdministratorPasswordResetInput, AssignmentInput, CommentInput, ContractorInput, ContractorSiteInput, EntityUserAssignmentInput, GenerationRequest,
-    DevelopmentResetInput, LoginRequest, OrganizationInput, PlatformOrganizationInput, OrganizationStatusInput, PasswordChangeRequest, RoleScopeInput, RuleInput, UnitInput, UserCreateInput,
+    DevelopmentResetInput, LoginRequest, OrganizationDeleteInput, OrganizationInput, PlatformOrganizationInput, OrganizationStatusInput, PasswordChangeRequest, RoleScopeInput, RuleInput, UnitInput, UserCreateInput,
     WorkflowDecision, SubmissionInput, UserUpdateInput, EvidenceVerificationInput, NotApplicableInput, RuleStatusInput, DOCUMENT_TYPES,
 )
-from app.services.access import CHECKER_ROLES, MAKER_ROLES, MODULE_PERMISSION_CHOICES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, current_user, has_permission, is_org_admin, platform_master_organization_id, require_org_admin, roles_for, user_summary
+from app.services.access import CHECKER_ROLES, MAKER_ROLES, MODULE_PERMISSION_CHOICES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, current_user, has_permission, is_org_admin, platform_master_organization_id, require_org_admin, roles_for, scopes_for, user_summary
 from app.services.audit import audit
 from app.services.activation import activate_account
 from app.services.compliance import SUBJECTS, assert_assignment_or_admin, generate_for_subject, submit, transition
@@ -169,6 +169,22 @@ def generated_code(db: Session, model, name: str, prefix: str, organization_id: 
             return candidate[:50]
         suffix = f"-{number}"
         candidate = f"{base[:50 - len(suffix)]}{suffix}"
+        number += 1
+
+
+def generated_short_code(db: Session, model, name: str, prefix: str, organization_id: str | None = None) -> str:
+    """Generate the compact codes used by the hidden Organization/Contractor forms."""
+    parts = re.findall(r"[A-Z0-9]+", name.upper())
+    stem = "-".join(part[:3] for part in parts[:3]) or "REC"
+    base = f"{prefix[:3]}-{stem}"
+    number = 1
+    while True:
+        candidate = f"{base[:46]}-{number:03d}"
+        query = select(model.id).where(model.code == candidate)
+        if organization_id is not None:
+            query = query.where(model.organization_id == organization_id)
+        if not db.scalar(query):
+            return candidate
         number += 1
 
 
@@ -733,7 +749,7 @@ def create_platform_organization(payload: PlatformOrganizationInput, user: User 
     require_platform_admin(user)
     if not payload.organization_admin_name or not payload.organization_admin_email or not payload.organization_admin_password:
         raise HTTPException(422, "Organization Admin name, email, and password are required")
-    code = (payload.organization_code or "").strip().upper() or generated_code(db, Organization, payload.organization_name, "ORG")
+    code = (payload.organization_code or "").strip().upper() or generated_short_code(db, Organization, payload.organization_name, "ORG")
     payload.organization_code = code
     if db.scalar(select(Organization).where(Organization.code == code)):
         raise HTTPException(409, "Organization code already exists")
@@ -926,6 +942,116 @@ def reset_organization_admin_password(
         "sessions_revoked": revoked_sessions,
         "message": "Organization Admin password was replaced. Share the new password directly with the administrator.",
     }
+
+
+@router.delete("/platform/organizations/{organization_id}")
+def delete_platform_organization(
+    organization_id: str,
+    payload: OrganizationDeleteInput,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Permanently delete one tenant and every tenant-owned record.
+
+    This is intentionally available only to MORAX Product Admins.  The
+    confirmation code, master-tenant guard, explicit dependency order, and
+    transaction prevent accidental or partial cross-tenant deletion.
+    """
+    require_platform_admin(user)
+    organization = db.get(Organization, organization_id)
+    if not organization:
+        raise HTTPException(404, "Organization not found")
+    if organization.id == platform_master_organization_id(db):
+        raise HTTPException(422, "The MORAX platform master organization cannot be deleted")
+    if payload.confirmation_code.strip().upper() != organization.code.upper():
+        raise HTTPException(422, "Confirmation code does not match the organization code")
+
+    instance_ids = list(db.scalars(select(ComplianceInstance.id).where(ComplianceInstance.organization_id == organization.id)))
+    contractor_ids = list(db.scalars(select(Contractor.id).where(Contractor.organization_id == organization.id)))
+    unit_ids = list(db.scalars(select(Unit.id).where(Unit.organization_id == organization.id)))
+    site_ids = list(db.scalars(select(ContractorSite.id).where(ContractorSite.organization_id == organization.id)))
+    rule_ids = list(db.scalars(select(ComplianceRule.id).where(ComplianceRule.organization_id == organization.id)))
+    rule_version_ids = list(db.scalars(select(ComplianceRuleVersion.id).where(ComplianceRuleVersion.rule_id.in_(rule_ids)))) if rule_ids else []
+    import_ids = list(db.scalars(select(ComplianceImport.id).where(ComplianceImport.organization_id == organization.id)))
+    import_row_ids = list(db.scalars(select(ComplianceImportRow.id).where(ComplianceImportRow.import_id.in_(import_ids)))) if import_ids else []
+    tenant_user_ids = list(db.scalars(select(User.id).where(User.organization_id == organization.id)))
+    tenant_session_ids = list(db.scalars(select(AuthSession.id).where(AuthSession.user_id.in_(tenant_user_ids)))) if tenant_user_ids else []
+    evidence_files = list(db.scalars(select(ComplianceEvidence.stored_filename).join(ComplianceInstance, ComplianceEvidence.instance_id == ComplianceInstance.id).where(ComplianceInstance.organization_id == organization.id)))
+    contractor_document_files = list(db.scalars(select(ContractorDocument.stored_filename).join(Contractor, ContractorDocument.contractor_id == Contractor.id).where(Contractor.organization_id == organization.id)))
+
+    def remove(statement) -> int:
+        return max(db.execute(statement).rowcount or 0, 0)
+
+    deleted: dict[str, int] = {}
+    try:
+        if instance_ids:
+            deleted["evidence"] = remove(delete(ComplianceEvidence).where(ComplianceEvidence.instance_id.in_(instance_ids)))
+            deleted["comments"] = remove(delete(ComplianceComment).where(ComplianceComment.instance_id.in_(instance_ids)))
+            deleted["workflow_history"] = remove(delete(ComplianceWorkflowHistory).where(ComplianceWorkflowHistory.instance_id.in_(instance_ids)))
+            deleted["submissions"] = remove(delete(ComplianceSubmission).where(ComplianceSubmission.instance_id.in_(instance_ids)))
+            deleted["assignments"] = remove(delete(ComplianceAssignment).where(ComplianceAssignment.instance_id.in_(instance_ids)))
+        deleted["applicability_evaluations"] = remove(delete(ApplicabilityEvaluation).where(ApplicabilityEvaluation.organization_id == organization.id))
+        deleted["instances"] = remove(delete(ComplianceInstance).where(ComplianceInstance.organization_id == organization.id))
+
+        if contractor_ids:
+            deleted["contractor_documents"] = remove(delete(ContractorDocument).where(ContractorDocument.contractor_id.in_(contractor_ids)))
+        if import_row_ids:
+            deleted["import_errors"] = remove(delete(ComplianceImportError).where(ComplianceImportError.import_row_id.in_(import_row_ids)))
+        if import_ids:
+            deleted["import_rows"] = remove(delete(ComplianceImportRow).where(ComplianceImportRow.import_id.in_(import_ids)))
+            deleted["imports"] = remove(delete(ComplianceImport).where(ComplianceImport.id.in_(import_ids)))
+        if rule_version_ids:
+            deleted["rule_criteria"] = remove(delete(RuleApplicabilityCriteria).where(RuleApplicabilityCriteria.rule_version_id.in_(rule_version_ids)))
+            deleted["rule_versions"] = remove(delete(ComplianceRuleVersion).where(ComplianceRuleVersion.id.in_(rule_version_ids)))
+        if rule_ids:
+            deleted["rules"] = remove(delete(ComplianceRule).where(ComplianceRule.id.in_(rule_ids)))
+
+        deleted["notifications"] = remove(delete(InAppNotification).where(InAppNotification.organization_id == organization.id))
+        if tenant_user_ids:
+            deleted["user_notifications"] = remove(delete(InAppNotification).where(InAppNotification.recipient_id.in_(tenant_user_ids)))
+            deleted["activations"] = remove(delete(UserActivation).where(or_(UserActivation.user_id.in_(tenant_user_ids), UserActivation.created_by_id.in_(tenant_user_ids))))
+            deleted["user_scopes"] = remove(delete(UserRoleScope).where(UserRoleScope.user_id.in_(tenant_user_ids)))
+            deleted["user_permissions"] = remove(delete(UserPermissionGrant).where(UserPermissionGrant.user_id.in_(tenant_user_ids)))
+        if site_ids:
+            deleted["site_scopes"] = remove(delete(UserRoleScope).where(UserRoleScope.scope_type == "CONTRACTOR_SITE", UserRoleScope.scope_id.in_(site_ids)))
+        if contractor_ids:
+            deleted["contractor_scopes"] = remove(delete(UserRoleScope).where(UserRoleScope.scope_type == "CONTRACTOR", UserRoleScope.scope_id.in_(contractor_ids)))
+        if unit_ids:
+            deleted["unit_scopes"] = remove(delete(UserRoleScope).where(UserRoleScope.scope_type == "UNIT", UserRoleScope.scope_id.in_(unit_ids)))
+        deleted["organization_scopes"] = remove(delete(UserRoleScope).where(UserRoleScope.scope_type == "ORGANIZATION", UserRoleScope.scope_id == organization.id))
+
+        # Revoke tenant sessions and remove a deleted tenant from any Product
+        # Admin session that was currently switched into this organization.
+        if tenant_user_ids or tenant_session_ids:
+            session_filters = []
+            if tenant_user_ids:
+                session_filters.extend([AuthSession.user_id.in_(tenant_user_ids), AuthSession.impersonated_by_id.in_(tenant_user_ids)])
+            if tenant_session_ids:
+                session_filters.append(AuthSession.impersonated_by_session_id.in_(tenant_session_ids))
+            deleted["sessions"] = remove(delete(AuthSession).where(or_(*session_filters)))
+        db.execute(update(AuthSession).where(AuthSession.active_organization_id == organization.id).values(active_organization_id=None))
+
+        deleted["audit_logs"] = remove(delete(AuditLog).where(or_(AuditLog.organization_id == organization.id, AuditLog.actor_id.in_(tenant_user_ids) if tenant_user_ids else False)))
+        if site_ids:
+            deleted["sites"] = remove(delete(ContractorSite).where(ContractorSite.id.in_(site_ids)))
+        if contractor_ids:
+            deleted["contractors"] = remove(delete(Contractor).where(Contractor.id.in_(contractor_ids)))
+        if unit_ids:
+            deleted["units"] = remove(delete(Unit).where(Unit.id.in_(unit_ids)))
+        if tenant_user_ids:
+            organization.created_by_id = user.id
+            organization.updated_by_id = user.id
+            deleted["users"] = remove(delete(User).where(User.id.in_(tenant_user_ids)))
+        deleted["organizations"] = remove(delete(Organization).where(Organization.id == organization.id))
+        audit(db, organization_id=None, actor_id=user.id, action="DELETE_ORGANIZATION", module="PLATFORM", entity_type="Organization", entity_id=organization_id, old={"name": organization.name, "code": organization.code}, reason="Permanent Product Admin tenant deletion")
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    for stored_filename in {*evidence_files, *contractor_document_files}:
+        delete_stored_file(stored_filename)
+    return {"ok": True, "message": "Organization and all related data were permanently deleted.", "deleted": deleted, "files_deleted": len(set(evidence_files) | set(contractor_document_files))}
 
 
 @router.post("/platform/organizations/{organization_id}/development-reset")
@@ -1281,7 +1407,12 @@ def replace_unit_user_assignments(unit_id: str, payload: list[EntityUserAssignme
 @router.get("/contractors")
 def list_contractors(paginated: bool = False, page: int = 1, page_size: int = 50, q: str | None = None, status: str | None = None, sort_by: str = "name", sort_dir: str = "asc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
-    require_permission(db, user, "entities.read")
+    if not has_permission(db, user, "entities.read") and not any(
+        scope.role in {"CONTRACTOR_ADMIN", "CONTRACTOR_MAKER", "CONTRACTOR_CHECKER"}
+        and scope.scope_type == "CONTRACTOR"
+        for scope in scopes_for(db, user.id)
+    ):
+        require_permission(db, user, "entities.read")
     if paginated:
         return entity_page(db, user, Contractor, "CONTRACTOR", org, page, page_size, q, status, sort_by, sort_dir)
     return [entity_dict(db, row, "CONTRACTOR") for row in db.scalars(select(Contractor).where(Contractor.organization_id == org).order_by(Contractor.name)) if can_access_subject(db, user, org, "CONTRACTOR", row.id)]
@@ -1292,27 +1423,36 @@ def get_contractor(contractor_id: str, user: User = Depends(current_user), db: S
     contractor = db.get(Contractor, contractor_id)
     if not contractor or contractor.organization_id != org_for(user):
         raise HTTPException(404, "Contractor not found")
-    require_permission(db, user, "entities.read")
     if not can_access_subject(db, user, contractor.organization_id, "CONTRACTOR", contractor.id):
         raise HTTPException(404, "Contractor not found")
+    # Contractor-only sessions may read only the details of their assigned
+    # contractor. They deliberately do not receive general entity-list access.
+    if not has_permission(db, user, "entities.read") and not any(
+        scope.scope_type == "CONTRACTOR" and scope.scope_id == contractor.id
+        for scope in scopes_for(db, user.id)
+    ):
+        raise HTTPException(403, "You do not have permission to access this product area")
     return entity_dict(db, contractor, "CONTRACTOR")
 
 
 @router.post("/contractors")
 def create_contractor(payload: ContractorInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user); require_permission(db, user, "entities.manage")
-    payload.code = (payload.code or "").strip().upper() or generated_code(db, Contractor, payload.name, "CONTRACTOR", org)
+    state_was_supplied = bool(payload.state_id)
+    payload.code = (payload.code or "").strip().upper() or (
+        generated_short_code(db, Contractor, payload.name, "CONTRACTOR", org)
+        if state_was_supplied else generated_code(db, Contractor, payload.name, "CONTRACTOR", org)
+    )
     if db.scalar(select(Contractor).where(Contractor.organization_id == org, Contractor.code == payload.code)):
         raise HTTPException(409, "A contractor with this code already exists in the organization")
     maker_email = str(payload.contractor_maker_email).lower() if payload.contractor_maker_email else None
     if not maker_email or not payload.contractor_maker_password:
         raise HTTPException(422, "Contractor Maker email and password are required when creating a contractor")
-    if maker_email and db.scalar(select(User).where(User.email == maker_email)):
-        raise HTTPException(409, "A user with the Contractor Maker email already exists")
     principal_employer = principal_employer_for(db, org, payload.unit_id)
-    # State is inherited from the Principal Employer. City/District is chosen
-    # from that State's controlled LGD list and validated below.
-    payload.state_id = principal_employer.state_id
+    if not payload.state_id:
+        payload.state_id = principal_employer.state_id
+    if not payload.state_id or not db.get(State, payload.state_id):
+        raise HTTPException(422, "Select a valid State for the Contractor")
     payload.city_id, payload.city = resolve_city(db, payload.state_id, payload.city_id, payload.city)
     if not payload.compliance_start_date:
         payload.compliance_start_date = payload.contract_start_date or date.today()
@@ -1320,8 +1460,13 @@ def create_contractor(payload: ContractorInput, user: User = Depends(current_use
     payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
     contractor = Contractor(organization_id=org, **payload.model_dump(exclude={"contractor_maker_email", "contractor_maker_password"}))
     db.add(contractor); db.flush()
-    contractor_maker: User | None = None
-    if maker_email:
+    contractor_maker = db.scalar(select(User).where(User.email == maker_email)) if maker_email else None
+    reusing_contractor_maker = contractor_maker is not None
+    if contractor_maker and contractor_maker.organization_id != org:
+        raise HTTPException(409, "The Contractor Maker email belongs to another organization")
+    if contractor_maker and not contractor_maker.active:
+        raise HTTPException(422, "The existing Contractor Maker account is inactive")
+    if not contractor_maker and maker_email:
         contractor_maker = User(
             organization_id=org,
             name=f"{contractor.name} Maker",
@@ -1332,14 +1477,17 @@ def create_contractor(payload: ContractorInput, user: User = Depends(current_use
             must_change_password=False,
         )
         db.add(contractor_maker); db.flush()
-        db.add(UserRoleScope(
-            user_id=contractor_maker.id,
-            role="CONTRACTOR_MAKER",
-            scope_type="CONTRACTOR",
-            scope_id=contractor.id,
-        ))
         audit(db, organization_id=org, actor_id=user.id, action="CREATE_CONTRACTOR_MAKER", module="USERS", entity_type="User", entity_id=contractor_maker.id, new={"email": maker_email, "contractor_id": contractor.id, "role": "CONTRACTOR_MAKER"})
         audit(db, organization_id=org, actor_id=user.id, action="USER_PASSWORD_SET", module="AUTH", entity_type="User", entity_id=contractor_maker.id)
+    if contractor_maker and not db.scalar(select(UserRoleScope.id).where(
+        UserRoleScope.user_id == contractor_maker.id,
+        UserRoleScope.role == "CONTRACTOR_MAKER",
+        UserRoleScope.scope_type == "CONTRACTOR",
+        UserRoleScope.scope_id == contractor.id,
+    )):
+        db.add(UserRoleScope(user_id=contractor_maker.id, role="CONTRACTOR_MAKER", scope_type="CONTRACTOR", scope_id=contractor.id))
+        if reusing_contractor_maker:
+            audit(db, organization_id=org, actor_id=user.id, action="REUSE_CONTRACTOR_MAKER", module="USERS", entity_type="User", entity_id=contractor_maker.id, new={"email": maker_email, "contractor_id": contractor.id, "role": "CONTRACTOR_MAKER"})
     generate_for_subject(db, org, "CONTRACTOR", contractor.id, date.today(), user.id)
     configure_contractor_assignments(db, contractor, payload.maker_user_id, payload.checker_user_id, user.id)
     audit(db, organization_id=org, actor_id=user.id, action="CREATE_CONTRACTOR", module="ENTITIES", entity_type="Contractor", entity_id=contractor.id, new={"name": contractor.name})
@@ -1357,7 +1505,10 @@ def update_contractor(contractor_id: str, payload: ContractorInput, user: User =
     if db.scalar(select(Contractor).where(Contractor.organization_id == contractor.organization_id, Contractor.code == payload.code, Contractor.id != contractor.id)):
         raise HTTPException(409, "A contractor with this code already exists in the organization")
     principal_employer = principal_employer_for(db, contractor.organization_id, payload.unit_id)
-    payload.state_id = principal_employer.state_id
+    if not payload.state_id:
+        payload.state_id = principal_employer.state_id
+    if not payload.state_id or not db.get(State, payload.state_id):
+        raise HTTPException(422, "Select a valid State for the Contractor")
     payload.city_id, payload.city = resolve_city(db, payload.state_id, payload.city_id, payload.city)
     if not payload.compliance_start_date:
         payload.compliance_start_date = payload.contract_start_date or contractor.compliance_start_date or date.today()

@@ -10,7 +10,7 @@ import app.services.access as access
 from app.core.security import hash_password, verify_password
 from app.db.base import Base
 from app.models import AuditLog, AuthSession, Contractor, IndustryType, Organization, State, Unit, User, UserActivation, UserRoleScope
-from app.schemas import AdministratorPasswordResetInput, ContractorInput, EntityUserAssignmentInput, LoginRequest, PlatformOrganizationInput, RoleScopeInput, UnitInput, UserCreateInput
+from app.schemas import AdministratorPasswordResetInput, ContractorInput, EntityUserAssignmentInput, LoginRequest, OrganizationDeleteInput, PlatformOrganizationInput, RoleScopeInput, UnitInput, UserCreateInput
 
 
 @pytest.fixture()
@@ -420,3 +420,33 @@ def test_entity_assignments_are_centralized_multi_role_and_tenant_scoped(db):
         UserRoleScope.scope_type == "CONTRACTOR",
         UserRoleScope.scope_id == contractor.id,
     )) is not None
+
+
+def test_product_admin_can_permanently_delete_only_a_tenant_and_its_data(db):
+    master = Organization(name="MORAX Master", code="MORAX-MASTER", status="ACTIVE")
+    tenant = Organization(name="Delete Me", code="DELETE-ME", status="ACTIVE")
+    state = State(name="Tamil Nadu", code="TN")
+    industry = IndustryType(name="Factory", code="FACTORY")
+    db.add_all([master, tenant, state, industry])
+    db.flush()
+    product_admin = User(organization_id=master.id, name="Product Admin", email="delete.product@example.test", password_hash=hash_password("Product-Password-1"), active=True, platform_role="MORAX_ADMIN")
+    tenant_user = User(organization_id=tenant.id, name="Tenant User", email="delete.tenant@example.test", password_hash=hash_password("Tenant-Password-1"), active=True)
+    unit = Unit(organization_id=tenant.id, name="Delete Unit", code="DEL-UNIT", industry_type_id=industry.id, state_id=state.id, compliance_start_date=date.today())
+    db.add_all([product_admin, tenant_user, unit])
+    db.flush()
+    contractor = Contractor(organization_id=tenant.id, unit_id=unit.id, name="Delete Contractor", code="DEL-CONTRACTOR")
+    db.add(contractor)
+    db.add(UserRoleScope(user_id=tenant_user.id, role="UNIT_MAKER", scope_type="UNIT", scope_id=unit.id))
+    db.commit()
+    tenant_id, tenant_user_id, unit_id, contractor_id, master_id = tenant.id, tenant_user.id, unit.id, contractor.id, master.id
+
+    result = api.delete_platform_organization(tenant_id, OrganizationDeleteInput(confirmation_code="DELETE-ME"), product_admin, db)
+
+    assert result["ok"] is True
+    assert db.get(Organization, tenant_id) is None
+    assert db.get(User, tenant_user_id) is None
+    assert db.get(Unit, unit_id) is None
+    assert db.get(Contractor, contractor_id) is None
+    assert db.get(Organization, master_id) is not None
+    with pytest.raises(HTTPException, match="cannot be deleted"):
+        api.delete_platform_organization(master.id, OrganizationDeleteInput(confirmation_code="MORAX-MASTER"), product_admin, db)

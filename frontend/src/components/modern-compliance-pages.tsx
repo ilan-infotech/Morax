@@ -848,7 +848,7 @@ function ComplianceActionDialog({
                       <div><dt>Compliance ID</dt><dd>{detail.compliance_id}</dd></div>
                       <div><dt>Act / Rule</dt><dd>{[detail.act, detail.rule_reference].filter(Boolean).join(" / ") || "Not provided"}</dd></div>
                       <div><dt>Compliance type</dt><dd>{detailText(detail.compliance_type)}</dd></div>
-                      <div><dt>Organization unit / site</dt><dd>{detail.subject_name}<small>{humanize(detail.subject_type)}</small></dd></div>
+                      <div><dt>{detail.subject_type === "CONTRACTOR" ? "Contractor details" : "Organization unit / site"}</dt><dd>{detail.subject_name}<small>{humanize(detail.subject_type)}</small></dd></div>
                       <div><dt>Frequency / period</dt><dd>{humanize(detail.frequency)}<small>{detail.period_key}</small></dd></div>
                       <div><dt>Due date</dt><dd>{formatDate(detail.due_date)}{detail.is_overdue && <small>{detail.days_overdue} days overdue</small>}</dd></div>
                       <div><dt>Assigned owner</dt><dd>Maker: {assignedName("MAKER")}<small>Checker: {assignedName("CHECKER")}</small></dd></div>
@@ -1266,8 +1266,12 @@ function EnterpriseRecurringWorklist({ complianceArea }: { complianceArea?: "COM
   });
   const debouncedSearch = useDebouncedValue(filters.q.trim());
   const entities = useQuery({
-    queryKey: ["recurring-compliance-filter-entities"],
+    queryKey: ["recurring-compliance-filter-entities", complianceArea],
     queryFn: async () => {
+      if (complianceArea === "CONTRACTOR") {
+        const contractors = await morax.contractors();
+        return { units: [], contractors, sites: [] };
+      }
       const [units, contractors, sites] = await Promise.all([morax.units(), morax.contractors(), morax.sites()]);
       return { units: units.items, contractors, sites };
     },

@@ -66,12 +66,9 @@ ROLE_PERMISSIONS = {
         "settings.read",
     },
     "CONTRACTOR_MAKER": {
-        "dashboard.read",
         "compliance.read",
         "compliance.make",
-        "documents.read",
         "documents.upload",
-        "settings.read",
     },
     "UNIT_CHECKER": {
         "dashboard.read",
@@ -82,22 +79,15 @@ ROLE_PERMISSIONS = {
         "settings.read",
     },
     "CONTRACTOR_ADMIN": {
-        "dashboard.read",
         "compliance.read",
         "compliance.manage",
-        "documents.read",
         "documents.manage",
-        "reports.read",
-        "entities.read",
-        "settings.read",
+        "documents.upload",
     },
     "CONTRACTOR_CHECKER": {
-        "dashboard.read",
         "compliance.read",
         "compliance.check",
-        "documents.read",
         "documents.verify",
-        "settings.read",
     },
     "VIEWER": {
         "dashboard.read",
@@ -233,11 +223,29 @@ def permissions_for(user: User, scopes: list[UserRoleScope], grants: set[str] | 
     if user.platform_role != PLATFORM_ADMIN_ROLE:
         permitted_grants -= {"compliance_master.manage", "platform.organizations"}
     permissions.update(permitted_grants)
+    contractor_roles = {"CONTRACTOR_ADMIN", "CONTRACTOR_MAKER", "CONTRACTOR_CHECKER"}
+    broader_roles = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "UNIT_CHECKER", "VIEWER", "AUDITOR"}
+    scope_roles = {scope.role for scope in scopes}
+    if user.platform_role != PLATFORM_ADMIN_ROLE and scope_roles & contractor_roles and not scope_roles & broader_roles:
+        # A historic optional grant must never turn a contractor-only account
+        # into a company, unit, dashboard, reporting, or settings user.
+        permissions &= {
+            "compliance.read", "compliance.make", "compliance.check", "compliance.manage",
+            "documents.upload", "documents.verify", "documents.manage",
+        }
     return permissions
 
 
 def features_for(user: User, scopes: list[UserRoleScope], grants: set[str] | None = None) -> list[str]:
     """Return product areas visible for the user's trusted organization context."""
+    contractor_roles = {"CONTRACTOR_ADMIN", "CONTRACTOR_MAKER", "CONTRACTOR_CHECKER"}
+    broader_roles = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "UNIT_CHECKER", "VIEWER", "AUDITOR"}
+    scope_roles = {scope.role for scope in scopes}
+    if scope_roles & contractor_roles and not scope_roles & broader_roles:
+        # Contractor sessions are intentionally a narrow product experience.
+        # The API permission checks remain authoritative for the underlying
+        # compliance records and documents needed inside that experience.
+        return ["compliances.recurring", "notifications"]
     permissions = permissions_for(user, scopes, grants)
     features = {
         feature

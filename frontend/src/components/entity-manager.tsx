@@ -36,6 +36,7 @@ import {
 import { morax } from "../api/morax";
 import type { EntityUserAssignment, Master, User } from "../api/morax";
 import { EmptyState, InlineError, LoadingSkeleton } from "./workspace-ui";
+import { PasswordInput } from "./password-input";
 
 type Row = Record<string, unknown>;
 type EntityKind = "units" | "contractors" | "sites";
@@ -90,14 +91,10 @@ type FormAssignment = {
   role: AssignmentRole;
   pending_user?: PendingEntityUser;
 };
+type SavedContractorFollowUpError = Error & { contractorSaved?: boolean };
 
 const assignmentKey = () =>
   `assignment-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-const contractorCodePreview = (name: string) => {
-  const parts = name.trim().toUpperCase().replace(/[^A-Z0-9]+/g, " ").split(/\s+/).filter(Boolean);
-  if (!parts.length) return "Will be generated";
-  return `${parts.map((part) => part.slice(0, 3)).join("-")}-001`;
-};
 const scopeRoleFor = (kind: "units" | "contractors", role: AssignmentRole) =>
   kind === "units"
     ? ({ ADMIN: "UNIT_ADMIN", MAKER: "UNIT_MAKER", CHECKER: "UNIT_CHECKER" } as const)[role]
@@ -280,6 +277,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
   const [editing, setEditing] = useState<Row | null>(null);
   const [notice, setNotice] = useState("");
   const [entityAssignments, setEntityAssignments] = useState<FormAssignment[]>([]);
+  const [preservedContractorMakers, setPreservedContractorMakers] = useState<FormAssignment[]>([]);
   const [newUserOpen, setNewUserOpen] = useState(false);
   const [newEntityUser, setNewEntityUser] = useState<{
     name: string;
@@ -387,19 +385,14 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
 
   useEffect(() => {
     if (!entityAssignmentsQuery.data) return;
-    setEntityAssignments(entityAssignmentsQuery.data.map((assignment) => ({
+    const assignments = entityAssignmentsQuery.data.map((assignment) => ({
       key: assignmentKey(),
       user_id: assignment.user_id,
       role: assignment.role,
-    })));
+    }));
+    setPreservedContractorMakers(kind === "contractors" ? assignments.filter((assignment) => assignment.role === "MAKER") : []);
+    setEntityAssignments(kind === "contractors" ? assignments.filter((assignment) => assignment.role !== "MAKER") : assignments);
   }, [entityAssignmentsQuery.data]);
-
-  useEffect(() => {
-    if (kind !== "contractors" || !selectedPrincipalEmployerId) return;
-    const employer = optionsQuery.data?.units.find((unit) => String(unit.id) === selectedPrincipalEmployerId);
-    if (!employer) return;
-    form.setValue("state_id", String(employer.state_id ?? ""));
-  }, [form, kind, optionsQuery.data?.units, selectedPrincipalEmployerId]);
 
   const invalidateEntities = async () => {
     await Promise.all([
@@ -417,7 +410,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
         form.setError("compliance_types", { type: "required", message: "Select at least one Unit Compliance Type" });
         throw new Error("Select at least one Unit Compliance Type before saving.");
       }
-      if ((kind === "units" || kind === "sites") && !values.state_id) {
+      if (!values.state_id) {
         throw new Error("Select a State before saving");
       }
       if ((kind === "units" || kind === "sites") && !values.industry_type_id) {
@@ -439,7 +432,10 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
         throw new Error("Select a contractor before saving");
       }
       if (kind === "units" || kind === "contractors") {
-        const roles = new Set(entityAssignments.map((assignment) => assignment.role));
+        const roles = new Set([
+          ...entityAssignments.map((assignment) => assignment.role),
+          ...(kind === "contractors" ? preservedContractorMakers.map((assignment) => assignment.role) : []),
+        ]);
         if (kind === "contractors" && values.contractor_maker_email.trim() && values.contractor_maker_password) {
           roles.add("MAKER");
         }
@@ -478,13 +474,6 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
         saved = await (id
           ? morax.updateContractor(id, body)
           : morax.createContractor(body)) as Record<string, unknown>;
-        const contractorId = String(saved.id);
-        const uploads: Promise<unknown>[] = [];
-        for (const [documentType, files] of Object.entries(contractorFiles)) {
-          for (const file of files) uploads.push(morax.uploadContractorDocument(contractorId, documentType, file));
-        }
-        for (const file of otherDocuments) uploads.push(morax.uploadContractorDocument(contractorId, "OTHER", file));
-        await Promise.all(uploads);
       } else {
         return id ? morax.updateSite(id, body) : morax.createSite(body);
       }
@@ -497,6 +486,14 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
       if (contractorMakerId) {
         assignments.push({ user_id: contractorMakerId, role: "MAKER" });
         assignmentKeys.add(`${contractorMakerId}:MAKER`);
+      }
+      if (kind === "contractors") {
+        for (const assignment of preservedContractorMakers) {
+          if (assignment.user_id && !assignmentKeys.has(`${assignment.user_id}:MAKER`)) {
+            assignments.push({ user_id: assignment.user_id, role: "MAKER" });
+            assignmentKeys.add(`${assignment.user_id}:MAKER`);
+          }
+        }
       }
       for (const assignment of entityAssignments) {
         let userId = assignment.user_id;
@@ -528,10 +525,26 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
           assignments.push({ user_id: userId, role: assignment.role });
         }
       }
-      if (kind === "units") {
-        await morax.replaceUnitUserAssignments(entityId, assignments);
-      } else {
-        await morax.replaceContractorUserAssignments(entityId, assignments);
+      try {
+        if (kind === "units") {
+          await morax.replaceUnitUserAssignments(entityId, assignments);
+        } else {
+          await morax.replaceContractorUserAssignments(entityId, assignments);
+          const uploads: Promise<unknown>[] = [];
+          for (const [documentType, files] of Object.entries(contractorFiles)) {
+            for (const file of files) uploads.push(morax.uploadContractorDocument(entityId, documentType, file));
+          }
+          for (const file of otherDocuments) uploads.push(morax.uploadContractorDocument(entityId, "OTHER", file));
+          await Promise.all(uploads);
+        }
+      } catch (error) {
+        if (kind === "contractors" && !id) {
+          const detail = error instanceof Error ? error.message : "Unable to complete the follow-up step.";
+          const followUpError = new Error(`Contractor was created, but a follow-up step needs attention: ${detail}`) as SavedContractorFollowUpError;
+          followUpError.contractorSaved = true;
+          throw followUpError;
+        }
+        throw error;
       }
       return saved;
     },
@@ -542,10 +555,15 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
       closeForm();
       await invalidateEntities();
     },
-    onError: (error) =>
-      setNotice(
-        error instanceof Error ? error.message : "Could not save the record.",
-      ),
+    onError: async (error) => {
+      if ((error as SavedContractorFollowUpError).contractorSaved) {
+        setNotice("Contractor created successfully. Review its user assignments or documents before continuing.");
+        closeForm();
+        await invalidateEntities();
+        return;
+      }
+      setNotice(error instanceof Error ? error.message : "Could not save the record.");
+    },
   });
 
   const deleteMutation = useMutation({
@@ -588,6 +606,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
     setEditing(null);
     form.reset(blankEntity());
     setEntityAssignments([]);
+    setPreservedContractorMakers([]);
     setNewUserOpen(false);
     setNewEntityUserError("");
     setNewEntityUser({ name: "", email: "", mobile: "", password: "", password_confirmation: "", role: "MAKER" });
@@ -601,6 +620,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
       setEditing(row);
       form.reset(asForm(row));
       setEntityAssignments([]);
+      setPreservedContractorMakers([]);
       setNewUserOpen(false);
       setNewEntityUserError("");
       setContractorFiles({ WORK_ORDER: [], REGISTRATION_CERTIFICATE: [], PF: [], ESI: [], LABOUR_LICENCE: [] });
@@ -613,6 +633,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
     setEditing(null);
     form.reset(blankEntity());
     setEntityAssignments([]);
+    setPreservedContractorMakers([]);
     setNewUserOpen(false);
     setNewEntityUserError("");
     setNewEntityUser({ name: "", email: "", mobile: "", password: "", password_confirmation: "", role: "MAKER" });
@@ -981,18 +1002,6 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                   >
                     <input {...form.register("name")} autoFocus required maxLength={200} />
                   </Field>
-                  {kind === "contractors" && (
-                    <Field
-                      label="Contractor Code"
-                      error={form.formState.errors.code?.message}
-                    >
-                      <input
-                        readOnly
-                        value={editing ? form.watch("code") : contractorCodePreview(form.watch("name"))}
-                        aria-label="Contractor Code"
-                      />
-                    </Field>
-                  )}
                   {kind === "units" ? (
                     <Field label="Unit type" required>
                       <input
@@ -1005,12 +1014,8 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                     <Field label={kind === "contractors" ? "Principal Employer" : "Parent unit"} required={kind === "contractors"}>
                       <select
                         {...form.register("unit_id", {
-                          onChange: (event) => {
+                          onChange: () => {
                             if (kind !== "contractors") return;
-                            const principalEmployer = optionsQuery.data?.units.find(
-                              (unit) => String(unit.id) === event.target.value,
-                            );
-                            form.setValue("state_id", String(principalEmployer?.state_id ?? ""));
                             form.setValue("city_id", "");
                             form.setValue("city", "");
                           },
@@ -1059,26 +1064,19 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                 <div className="form-grid">
                   <Field
                     label="State"
-                    required={kind !== "contractors"}
+                    required
                     error={form.formState.errors.state_id?.message}
                   >
                     <select
                       {...form.register("state_id", {
                         onChange: () => {
-                          if (kind !== "contractors") {
-                            form.setValue("city_id", "");
-                            form.setValue("city", "");
-                          }
+                          form.setValue("city_id", "");
+                          form.setValue("city", "");
                         },
                       })}
-                      disabled={kind === "contractors"}
-                      required={kind !== "contractors"}
+                      required
                     >
-                      <option value="">
-                        {kind === "contractors"
-                          ? "Not configured"
-                          : "Select state"}
-                      </option>
+                      <option value="">Select state</option>
                       {optionsQuery.data?.states.map((state: Master) => (
                         <option key={state.id} value={state.id}>
                           {state.name}
@@ -1275,7 +1273,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                   )}
                 </div>
               </div>
-              {kind !== "sites" && (
+              {false && kind !== "sites" && (
                 <div className="form-section legacy-assignment-panel">
                   <div className="action-row">
                       <button
@@ -1362,7 +1360,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                 <div className="form-section">
                   <h3>Assign users</h3>
                   <div className="assignment-role-grid">
-                    {(["MAKER", "CHECKER", "ADMIN"] as AssignmentRole[]).map((role) => {
+                    {((kind === "contractors" ? ["CHECKER", "ADMIN"] : ["MAKER", "CHECKER", "ADMIN"]) as AssignmentRole[]).map((role) => {
                       const assignment = entityAssignments.find((item) => item.role === role);
                       const title = role === "ADMIN" ? "Assign Admin (Optional)" : `Assign ${role[0]}${role.slice(1).toLowerCase()}`;
                       return <section className="assignment-role-card" key={role}>
@@ -1404,10 +1402,10 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                       <input type="email" required {...form.register("contractor_maker_email")} />
                     </Field>
                     <Field label="Contractor Maker Password" required>
-                      <input type="password" minLength={8} autoComplete="new-password" required {...form.register("contractor_maker_password")} />
+                      <PasswordInput minLength={8} autoComplete="new-password" required {...form.register("contractor_maker_password")} />
                     </Field>
                     <Field label="Confirm Contractor Maker Password" required error={contractorMakerPasswordMismatch ? "Password and Confirm password must match." : undefined}>
-                      <input type="password" minLength={8} autoComplete="new-password" required {...form.register("contractor_maker_password_confirmation")} />
+                      <PasswordInput minLength={8} autoComplete="new-password" required {...form.register("contractor_maker_password_confirmation")} />
                     </Field>
                   </div>
                 </div>
@@ -1572,10 +1570,10 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                         <input value={newEntityUser.mobile} onChange={(event) => setNewEntityUser((current) => ({ ...current, mobile: event.target.value }))} inputMode="numeric" pattern="[6-9][0-9]{9}" maxLength={10} title="Enter a valid 10-digit Indian mobile number" />
                       </Field>
                       <Field label="Password" required>
-                        <input type="password" value={newEntityUser.password} onChange={(event) => setNewEntityUser((current) => ({ ...current, password: event.target.value }))} minLength={8} autoComplete="new-password" required />
+                        <PasswordInput value={newEntityUser.password} onChange={(event) => setNewEntityUser((current) => ({ ...current, password: event.target.value }))} minLength={8} autoComplete="new-password" required />
                       </Field>
                       <Field label="Confirm password" required>
-                        <input type="password" value={newEntityUser.password_confirmation} onChange={(event) => setNewEntityUser((current) => ({ ...current, password_confirmation: event.target.value }))} minLength={8} autoComplete="new-password" required />
+                        <PasswordInput value={newEntityUser.password_confirmation} onChange={(event) => setNewEntityUser((current) => ({ ...current, password_confirmation: event.target.value }))} minLength={8} autoComplete="new-password" required />
                       </Field>
                     </div>
                     <footer className="drawer-footer">
@@ -1636,8 +1634,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
               <div className="form-grid">
                 {contractorMakerPasswordError && <div className="wide"><InlineError message={contractorMakerPasswordError} /></div>}
                 <Field label="New password">
-                  <input
-                    type="password"
+                  <PasswordInput
                     minLength={8}
                     autoComplete="new-password"
                     value={contractorMakerPassword}
@@ -1647,8 +1644,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                   />
                 </Field>
                 <Field label="Confirm new password">
-                  <input
-                    type="password"
+                  <PasswordInput
                     minLength={8}
                     autoComplete="new-password"
                     value={contractorMakerPasswordConfirmation}
