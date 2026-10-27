@@ -58,6 +58,21 @@ class PasswordChangeRequest(BaseModel):
     new_password: str = Field(min_length=8)
 
 
+class ProfileUpdateInput(BaseModel):
+    name: str = Field(min_length=2, max_length=150)
+    mobile: str | None = Field(default=None, max_length=20)
+
+    @field_validator("mobile")
+    @classmethod
+    def validate_mobile(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        normalized = re.sub(r"[\s-]", "", value)
+        if not re.fullmatch(r"[6-9]\d{9}", normalized):
+            raise ValueError("Enter a valid 10-digit Indian mobile number")
+        return normalized
+
+
 class AdministratorPasswordResetInput(BaseModel):
     """A replacement password selected by an authorized MORAX administrator."""
     new_password: str = Field(min_length=8, max_length=256, repr=False)
@@ -141,7 +156,7 @@ class UnitInput(BaseModel):
     gstin: str | None = None
     pan: str | None = None
     lin: str | None = None
-    employer_name: str | None = None
+    employer_name: str = Field(min_length=2, max_length=250)
     contact_email: EmailStr | None = None
     contact_phone: str | None = None
     worker_limit: int | None = Field(default=None, ge=0)
@@ -149,6 +164,7 @@ class UnitInput(BaseModel):
     compliance_types: list[str] = Field(default_factory=list)
     male_employees: int = Field(default=0, ge=0)
     female_employees: int = Field(default=0, ge=0)
+    effective_date: date | None = None
     compliance_start_date: date
     status: str = "ACTIVE"
 
@@ -158,6 +174,13 @@ class UnitInput(BaseModel):
         if value is not None and value.strip() and not re.fullmatch(r"[6-9]\d{9}", value.strip()):
             raise ValueError("Mobile number must be a valid 10-digit Indian mobile number")
         return value.strip() if value else None
+
+    @field_validator("employer_name")
+    @classmethod
+    def employer_name_is_required(cls, value: str) -> str:
+        if len(value.strip()) < 2:
+            raise ValueError("Employer Name is required")
+        return value.strip()
 
     @field_validator("pan")
     @classmethod
@@ -180,6 +203,22 @@ class UnitInput(BaseModel):
         if invalid:
             raise ValueError(f"Unsupported unit compliance type: {', '.join(sorted(invalid))}")
         return list(dict.fromkeys(values))
+
+
+class PendingEntityUserInput(BaseModel):
+    """User credentials staged inside an entity form and created atomically."""
+
+    name: str = Field(min_length=2, max_length=150)
+    email: EmailStr
+    mobile: str | None = Field(default=None, max_length=30)
+    password: str = Field(min_length=8, max_length=256, repr=False)
+
+    @field_validator("mobile")
+    @classmethod
+    def valid_pending_mobile(cls, value: str | None) -> str | None:
+        if value is not None and value.strip() and not re.fullmatch(r"[6-9]\d{9}", value.strip()):
+            raise ValueError("Mobile number must be a valid 10-digit Indian mobile number")
+        return value.strip() if value else None
 
 
 class ContractorInput(BaseModel):
@@ -210,6 +249,7 @@ class ContractorInput(BaseModel):
     contract_end_date: date | None = None
     work_order_expiry_date: date | None = None
     maker_user_id: str | None = Field(default=None, exclude=True)
+    maker_new_user: PendingEntityUserInput | None = Field(default=None, exclude=True)
     checker_user_id: str | None = Field(default=None, exclude=True)
     contractor_maker_email: EmailStr | None = Field(default=None, exclude=True)
     contractor_maker_password: str | None = Field(default=None, min_length=8, max_length=256, exclude=True, repr=False)
@@ -217,6 +257,8 @@ class ContractorInput(BaseModel):
 
     @model_validator(mode="after")
     def contract_dates_are_in_order(self) -> "ContractorInput":
+        if self.maker_user_id and self.maker_new_user:
+            raise ValueError("Select an existing Maker or create a new Maker, not both")
         if bool(self.contractor_maker_email) != bool(self.contractor_maker_password):
             raise ValueError("Contractor Maker email and password must be provided together")
         if self.contract_end_date and not self.contract_start_date:
@@ -342,6 +384,25 @@ class EvidenceVerificationInput(BaseModel):
     reason: str | None = Field(default=None, max_length=4000)
 
 
+class SupportTicketInput(BaseModel):
+    subject: str = Field(min_length=3, max_length=250)
+    category: str = Field(min_length=2, max_length=80)
+    issue_type: str = Field(pattern="^(PRODUCTION_ISSUE|BUG_FIX|ENHANCEMENT|UI_UX|OTHER)$")
+    priority: str = Field(pattern="^(LOW|MEDIUM|HIGH|URGENT)$")
+    description: str = Field(min_length=3, max_length=10000)
+
+
+class SupportTicketReplyInput(BaseModel):
+    body: str = Field(min_length=1, max_length=10000)
+
+
+class SupportTicketUpdateInput(BaseModel):
+    status: str | None = Field(default=None, pattern="^(OPEN|IN_PROGRESS|WAITING_ON_CUSTOMER|RESOLVED|CLOSED)$")
+    issue_type: str | None = Field(default=None, pattern="^(PRODUCTION_ISSUE|BUG_FIX|ENHANCEMENT|UI_UX|OTHER)$")
+    priority: str | None = Field(default=None, pattern="^(LOW|MEDIUM|HIGH|URGENT)$")
+    assigned_to_id: str | None = None
+
+
 class NotApplicableInput(BaseModel):
     reason: str = Field(min_length=3, max_length=4000)
 
@@ -362,6 +423,8 @@ class RuleInput(BaseModel):
     entity_type: str
     state_id: str | None = None
     industry_type_id: str | None = None
+    employee_threshold: int | None = Field(default=None, ge=0)
+    unit_compliance_types: list[str] = Field(default_factory=list)
     frequency: str
     applicable_months: list[int] = Field(default_factory=list)
     due_date_rule: str = "FIXED_DAY_OF_MONTH"
@@ -373,6 +436,17 @@ class RuleInput(BaseModel):
     effective_from: date
     effective_to: date | None = None
     active: bool = True
+
+    @field_validator("frequency")
+    @classmethod
+    def frequency_is_supported(cls, value: str) -> str:
+        normalized = value.strip().upper().replace(" ", "_")
+        aliases = {"YEARLY": "ANNUAL", "HALF-YEARLY": "HALF_YEARLY"}
+        normalized = aliases.get(normalized, normalized)
+        supported = {"ONE_TIME", "DAILY", "WEEKLY", "MONTHLY", "QUARTERLY", "HALF_YEARLY", "ANNUAL", "EVENT_BASED"}
+        if normalized not in supported:
+            raise ValueError("Unsupported frequency")
+        return normalized
 
     @field_validator("document_type")
     @classmethod
@@ -397,6 +471,8 @@ class RuleInput(BaseModel):
     def effective_dates_are_in_order(self) -> "RuleInput":
         if self.effective_to and self.effective_to < self.effective_from:
             raise ValueError("Effective To cannot be earlier than Effective From")
+        if self.frequency.upper() == "MONTHLY" and self.due_date_rule.upper() == "FIXED_DAY_OF_MONTH" and self.due_date_offset is None:
+            self.due_date_offset = 15
         return self
 
     @field_validator("applicable_months")
@@ -407,12 +483,38 @@ class RuleInput(BaseModel):
             raise ValueError("Applicable months must be between 1 and 12")
         return normalized
 
+    @field_validator("unit_compliance_types")
+    @classmethod
+    def rule_unit_compliance_types_are_valid(cls, values: list[str]) -> list[str]:
+        invalid = set(values) - UNIT_COMPLIANCE_TYPES
+        if invalid:
+            raise ValueError(f"Unsupported Unit Compliance Type: {', '.join(sorted(invalid))}")
+        return list(dict.fromkeys(values))
+
 
 class RuleStatusInput(BaseModel):
     active: bool
 
 
+class ComplianceMasterDeleteInput(BaseModel):
+    confirmation: str = Field(min_length=1, max_length=250)
+
+
+class ComplianceActStatusInput(BaseModel):
+    act: str = Field(min_length=1, max_length=250)
+    active: bool
+
+
+class ComplianceActDeleteInput(BaseModel):
+    act: str = Field(min_length=1, max_length=250)
+    confirmation: str = Field(min_length=1, max_length=250)
+
+
 class GenerationRequest(BaseModel):
+    # Product Admin generation is deliberately targeted at a customer tenant.
+    # Compliance rules live in the internal platform tenant, but obligations
+    # must never be generated for that tenant or its development seed data.
+    organization_id: str | None = None
     subject_type: str | None = None
     subject_id: str | None = None
     as_of_date: date | None = None

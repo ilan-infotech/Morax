@@ -1,18 +1,24 @@
-import { useDeferredValue, useMemo, useState } from "react";
+import { Fragment, useDeferredValue, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
-import { Eye, FileSpreadsheet, Plus, Search, X } from "lucide-react";
+import { BookOpen, Download, Eye, FileSpreadsheet, Plus, Power, PowerOff, Search, Trash2, X } from "lucide-react";
 import { morax } from "../api/morax";
 import { EmptyState, InlineError, LoadingSkeleton } from "./workspace-ui";
 import GradientText from "./GradientText/GradientText";
 
 type Row = Record<string, unknown>;
+type ImportMode = "MERGE" | "REPLACE";
+type DeleteTarget =
+  | { kind: "RULE"; id: string; label: string }
+  | { kind: "ACT"; label: string };
 const text = (row: Row, key: string) =>
   row[key] == null ? "" : String(row[key]);
 const today = () => new Date().toISOString().slice(0, 10);
 const frequencies = [
+  "DAILY",
+  "WEEKLY",
   "MONTHLY",
   "QUARTERLY",
   "HALF_YEARLY",
@@ -37,6 +43,7 @@ const documentTypes = [
   ["DISPLAY", "Display"],
   ["NOTICE", "Notice"],
 ] as const;
+const unitComplianceTypes = ["Shops & Establishments", "Mines", "BOCW", "ESI", "PF"] as const;
 
 const ruleSchema = z.object({
   compliance_id: z.string().trim().min(1, "Compliance ID is required"),
@@ -45,6 +52,8 @@ const ruleSchema = z.object({
   entity_type: z.enum(["UNIT", "CONTRACTOR", "CONTRACTOR_SITE"]),
   state_id: z.string(),
   industry_type_id: z.string(),
+  employee_threshold: z.coerce.number().int().min(0).nullable(),
+  unit_compliance_types: z.array(z.string()),
   frequency: z.string().min(1),
   applicable_months: z.string(),
   due_date_rule: z.string().min(1),
@@ -57,7 +66,7 @@ const ruleSchema = z.object({
   effective_to: z.string(),
   active: z.boolean(),
   description: z.string(),
-  act: z.string(),
+  act: z.string().trim().min(1, "Act is required"),
   rule_reference: z.string(),
   section: z.string(),
   compliance_type: z.string(),
@@ -74,6 +83,8 @@ const blankRule = (): RuleForm => ({
   entity_type: "UNIT",
   state_id: "",
   industry_type_id: "",
+  employee_threshold: null,
+  unit_compliance_types: [],
   frequency: "MONTHLY",
   applicable_months: "",
   due_date_rule: "FIXED_DAY_OF_MONTH",
@@ -101,13 +112,20 @@ export function ComplianceMasterManager() {
   const [search, setSearch] = useState("");
   const deferredSearch = useDeferredValue(search);
   const [frequency, setFrequency] = useState("");
+  const [actFilter, setActFilter] = useState("");
   const [active, setActive] = useState("");
   const [page, setPage] = useState(1);
-  const [sort, setSort] = useState({ by: "compliance_id", dir: "asc" });
+  const [sort, setSort] = useState({ by: "act", dir: "asc" });
   const [formOpen, setFormOpen] = useState(false);
   const [detail, setDetail] = useState<Row | null>(null);
   const [notice, setNotice] = useState("");
   const [importFile, setImportFile] = useState<File | null>(null);
+  const [importMode, setImportMode] = useState<ImportMode>("REPLACE");
+  const [replaceConfirmation, setReplaceConfirmation] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
+  const [deleteConfirmation, setDeleteConfirmation] = useState("");
+  const [busyAction, setBusyAction] = useState("");
+  const [previewRows, setPreviewRows] = useState<{ row_number: number; errors: { field: string; message: string }[] }[]>([]);
   const [preview, setPreview] = useState<{
     id: string;
     total_rows: number;
@@ -119,48 +137,69 @@ export function ComplianceMasterManager() {
       page: String(page),
       page_size: "10",
       q: deferredSearch.trim() || undefined,
+      act: actFilter || undefined,
       frequency: frequency || undefined,
       active: active || undefined,
       sort_by: sort.by,
       sort_dir: sort.dir,
     }),
-    [active, deferredSearch, frequency, page, sort],
+    [actFilter, active, deferredSearch, frequency, page, sort],
   );
   const rules = useQuery({
     queryKey: ["rules-page", filters],
     queryFn: () => morax.rulesPage(filters),
     staleTime: 30_000,
   });
+  const acts = useQuery({
+    queryKey: ["compliance-rule-acts"],
+    queryFn: morax.ruleActs,
+    staleTime: 5 * 60_000,
+  });
   const options = useQuery({
     queryKey: ["rule-options"],
     queryFn: async () => {
-      const [states, industries, units, contractors, sites] = await Promise.all(
-        [
-          morax.states(),
-          morax.industries(),
-          morax.unitsPage({ page: "1", page_size: "100" }),
-          morax.contractors(),
-          morax.sites(),
-        ],
-      );
-      return { states, industries, units: units.items, contractors, sites };
+      const [states, industries] = await Promise.all([morax.states(), morax.industries()]);
+      return { states, industries };
     },
     staleTime: 5 * 60_000,
+  });
+  const customerOrganizations = useQuery({
+    queryKey: ["generation-customer-organizations"],
+    queryFn: () => morax.platformOrganizations({ status: "ACTIVE" }),
+    staleTime: 60_000,
   });
   const form = useForm<RuleForm>({
     resolver: zodResolver(ruleSchema),
     defaultValues: blankRule(),
   });
   const generation = useForm<{
+    organization_id: string;
     subject_type: string;
     subject_id: string;
     as_of_date: string;
   }>({
-    defaultValues: { subject_type: "", subject_id: "", as_of_date: today() },
+    defaultValues: { organization_id: "", subject_type: "", subject_id: "", as_of_date: today() },
+  });
+  const generationOrganizationId = generation.watch("organization_id");
+  const generationSubjectType = generation.watch("subject_type") as
+    | "UNIT"
+    | "CONTRACTOR"
+    | "CONTRACTOR_SITE"
+    | "";
+  const generationSubjects = useQuery({
+    queryKey: ["generation-subjects", generationOrganizationId, generationSubjectType],
+    queryFn: () =>
+      morax.generationSubjects(
+        generationOrganizationId,
+        generationSubjectType as "UNIT" | "CONTRACTOR" | "CONTRACTOR_SITE",
+      ),
+    enabled: Boolean(generationOrganizationId && generationSubjectType),
+    staleTime: 30_000,
   });
   const invalidate = () =>
     Promise.all([
       client.invalidateQueries({ queryKey: ["rules-page"] }),
+      client.invalidateQueries({ queryKey: ["compliance-rule-acts"] }),
       client.invalidateQueries({ queryKey: ["dashboard-overview"] }),
     ]);
   const save = useMutation({
@@ -172,6 +211,7 @@ export function ComplianceMasterManager() {
           : [],
         state_id: values.state_id || null,
         industry_type_id: values.industry_type_id || null,
+        unit_compliance_types: values.entity_type === "UNIT" ? values.unit_compliance_types : [],
         due_date_offset: values.due_date_offset || null,
         due_date_anchor: values.due_date_anchor || null,
         effective_to: values.effective_to || null,
@@ -213,11 +253,13 @@ export function ComplianceMasterManager() {
   });
   const runGeneration = useMutation({
     mutationFn: (values: {
+      organization_id: string;
       subject_type: string;
       subject_id: string;
       as_of_date: string;
     }) =>
       morax.generate({
+        organization_id: values.organization_id || undefined,
         subject_type: values.subject_type || undefined,
         subject_id: values.subject_id || undefined,
         as_of_date: values.as_of_date || undefined,
@@ -229,12 +271,7 @@ export function ComplianceMasterManager() {
     onError: (error) =>
       setNotice(error instanceof Error ? error.message : "Generation failed."),
   });
-  const choices =
-    generation.watch("subject_type") === "UNIT"
-      ? options.data?.units
-      : generation.watch("subject_type") === "CONTRACTOR"
-        ? options.data?.contractors
-        : options.data?.sites;
+  const choices = generationSubjects.data ?? [];
   const openNew = () => {
     form.reset(blankRule());
     setNotice("");
@@ -250,6 +287,7 @@ export function ComplianceMasterManager() {
         ]),
       ),
       applicable_months: Array.isArray(row.applicable_months) ? row.applicable_months.join(",") : String(row.applicable_months ?? ""),
+      unit_compliance_types: Array.isArray(row.unit_compliance_types) ? row.unit_compliance_types : [],
       version: Number(row.version || 0) + 1,
       active: true,
     } as RuleForm);
@@ -258,9 +296,43 @@ export function ComplianceMasterManager() {
   };
   const resetFilters = () => {
     setSearch("");
+    setActFilter("");
     setFrequency("");
     setActive("");
     setPage(1);
+  };
+  const updateActStatus = async (actName: string, nextActive: boolean) => {
+    const actionKey = `${nextActive ? "activate" : "deactivate"}:${actName}`;
+    setBusyAction(actionKey);
+    try {
+      const result = await morax.setActStatus(actName, nextActive) as { updated?: number };
+      setNotice(`${actName}: ${result.updated ?? 0} rule version(s) ${nextActive ? "activated" : "deactivated"}.`);
+      await invalidate();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not update the Act status.");
+    } finally {
+      setBusyAction("");
+    }
+  };
+  const confirmPermanentDelete = async () => {
+    if (!deleteTarget || deleteConfirmation.trim() !== deleteTarget.label) return;
+    setBusyAction(`delete:${deleteTarget.kind}:${deleteTarget.label}`);
+    try {
+      const result = deleteTarget.kind === "ACT"
+        ? await morax.deleteAct(deleteTarget.label, deleteConfirmation.trim())
+        : await morax.deleteRule(deleteTarget.id, deleteConfirmation.trim());
+      const deleted = (result as { deleted?: { rules?: number; instances?: number } }).deleted;
+      setNotice(`Deleted ${deleted?.rules ?? 0} rule(s) and ${deleted?.instances ?? 0} generated compliance record(s).`);
+      setDeleteTarget(null);
+      setDeleteConfirmation("");
+      setDetail(null);
+      setPage(1);
+      await invalidate();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Permanent deletion failed.");
+    } finally {
+      setBusyAction("");
+    }
   };
   const setSorting = (by: string) =>
     setSort((current) =>
@@ -290,6 +362,13 @@ export function ComplianceMasterManager() {
           <button
             type="button"
             className="secondary"
+            onClick={() => morax.exportRules().catch((error) => setNotice(error instanceof Error ? error.message : "Export failed."))}
+          >
+            <Download size={16} /> Export current master
+          </button>
+          <button
+            type="button"
+            className="secondary"
             onClick={() =>
               morax
                 .downloadRuleTemplate()
@@ -309,7 +388,7 @@ export function ComplianceMasterManager() {
       </header>
       {notice && (
         <p
-          className={`alert ${notice.includes("success") || notice.includes("completed") || notice.includes("updated") ? "success" : "error"}`}
+          className={`alert ${/success|completed|updated|validated|replaced|merged|deleted|activated|deactivated|saved/i.test(notice) ? "success" : "error"}`}
         >
           {notice}
         </p>
@@ -321,11 +400,32 @@ export function ComplianceMasterManager() {
           )}
         >
           <h2>Generate obligations</h2>
-          <div className="form-grid compact">
+          <div className="generation-form-grid">
+            <label className="generation-organization-field">
+              Customer organization <span className="required">*</span>
+              <select
+                {...generation.register("organization_id", { required: true })}
+                onChange={(event) => {
+                  generation.setValue("organization_id", event.target.value);
+                  generation.setValue("subject_type", "");
+                  generation.setValue("subject_id", "");
+                }}
+              >
+                <option value="">Select customer organization</option>
+                {(customerOrganizations.data ?? []).map((item) => (
+                  <option key={String(item.id)} value={String(item.id)}>
+                    {String(item.organization_name ?? item.name ?? "Unnamed organization")}
+                    {item.organization_code ? ` (${String(item.organization_code)})` : ""}
+                  </option>
+                ))}
+              </select>
+              <small className="muted">Only active customer organizations are shown.</small>
+            </label>
             <label>
               Subject type
               <select
                 {...generation.register("subject_type")}
+                disabled={!generationOrganizationId}
                 onChange={(event) => {
                   generation.setValue("subject_type", event.target.value);
                   generation.setValue("subject_id", "");
@@ -341,12 +441,14 @@ export function ComplianceMasterManager() {
               Subject
               <select
                 {...generation.register("subject_id")}
-                disabled={!generation.watch("subject_type")}
+                disabled={!generationOrganizationId || !generationSubjectType || generationSubjects.isLoading}
               >
-                <option value="">All selected subjects</option>
+                <option value="">
+                  {generationSubjects.isLoading ? "Loading subjects…" : "All selected subjects"}
+                </option>
                 {choices?.map((item) => (
                   <option key={String(item.id)} value={String(item.id)}>
-                    {String(item.name)}
+                    {String(item.name)}{item.code ? ` (${String(item.code)})` : ""}
                   </option>
                 ))}
               </select>
@@ -357,75 +459,120 @@ export function ComplianceMasterManager() {
             </label>
             <button
               className="primary-action"
-              disabled={runGeneration.isPending}
+              disabled={runGeneration.isPending || !generationOrganizationId}
             >
               {runGeneration.isPending ? "Generating…" : "Generate"}
             </button>
           </div>
         </form>
         <div className="master-import">
-          <h2>Import workbook</h2>
-          <p className="muted">
-            Validate the Compliance Master workbook before explicitly confirming
-            import.
-          </p>
+          <div className="master-import-heading">
+            <div>
+              <h2>Import workbook</h2>
+              <p className="muted">Validate first, review the result, and then confirm how the workbook should be applied.</p>
+            </div>
+            <span className="master-step-badge">Excel source</span>
+          </div>
+          <div className="import-mode-grid" role="radiogroup" aria-label="Compliance Master import mode">
+            <label className={importMode === "MERGE" ? "selected" : ""}>
+              <input type="radio" name="import-mode" checked={importMode === "MERGE"} onChange={() => { setImportMode("MERGE"); setReplaceConfirmation(""); }} />
+              <span><b>Merge</b><small>Add new IDs and versions. Existing identical versions are skipped.</small></span>
+            </label>
+            <label className={importMode === "REPLACE" ? "selected danger" : ""}>
+              <input type="radio" name="import-mode" checked={importMode === "REPLACE"} onChange={() => setImportMode("REPLACE")} />
+              <span><b>Replace master</b><small>Make this workbook the complete master and remove rules not present.</small></span>
+            </label>
+          </div>
           <input
             type="file"
             accept=".xlsx"
             onChange={(event) => {
               setImportFile(event.target.files?.[0] ?? null);
               setPreview(null);
+              setPreviewRows([]);
+              setReplaceConfirmation("");
             }}
           />
           <div className="action-row">
             <button
               type="button"
               className="secondary"
-              disabled={!importFile}
+              disabled={!importFile || Boolean(busyAction)}
               onClick={async () => {
+                setBusyAction("validate-import");
                 try {
                   const result = await morax.validateImport(importFile!);
                   setPreview(result);
+                   const details = await morax.previewImport(result.id);
+                   setPreviewRows(details.rows.filter((row) => !row.valid).slice(0, 5));
+                   setNotice(result.error_rows ? "Workbook validation found errors that must be corrected." : "Workbook validated successfully.");
                 } catch (error) {
                   setNotice(
                     error instanceof Error
                       ? error.message
                       : "Workbook validation failed.",
                   );
+                 } finally {
+                   setBusyAction("");
                 }
               }}
             >
-              Validate workbook
+              {busyAction === "validate-import" ? "Validating…" : "Validate workbook"}
             </button>
             {preview && (
               <button
                 type="button"
                 className="primary-action"
-                disabled={preview.error_rows > 0}
+                disabled={Boolean(busyAction) || preview.error_rows > 0 || (importMode === "REPLACE" && replaceConfirmation !== "REPLACE")}
                 onClick={async () => {
+                  setBusyAction("confirm-import");
                   try {
-                    await morax.confirmImport(preview.id);
+                    const result = await morax.confirmImport(preview.id, importMode, importMode === "REPLACE" ? replaceConfirmation : undefined) as { imported?: number; skipped?: number };
                     setPreview(null);
-                    setNotice("Workbook imported successfully.");
+                    setPreviewRows([]);
+                    setImportFile(null);
+                    setReplaceConfirmation("");
+                    setPage(1);
+                    setNotice(`${importMode === "REPLACE" ? "Compliance Master replaced" : "Workbook merged"} successfully: ${result.imported ?? 0} imported, ${result.skipped ?? 0} skipped.`);
                     await invalidate();
                   } catch (error) {
                     setNotice(
                       error instanceof Error ? error.message : "Import failed.",
                     );
+                  } finally {
+                    setBusyAction("");
                   }
                 }}
               >
-                Confirm {preview.valid_rows}/{preview.total_rows}
+                {busyAction === "confirm-import" ? "Applying…" : `${importMode === "REPLACE" ? "Replace master" : "Merge"} (${preview.valid_rows}/${preview.total_rows})`}
               </button>
             )}
           </div>
-          {preview?.error_rows ? (
-            <small className="field-error">
-              {preview.error_rows} row(s) must be corrected before import.
-            </small>
-          ) : null}
+          {preview && (
+            <div className={`import-validation-summary ${preview.error_rows ? "has-errors" : "valid"}`}>
+              <b>{preview.error_rows ? `${preview.error_rows} row(s) require correction` : `${preview.valid_rows} rows are ready`}</b>
+              <span>{preview.total_rows} total · {preview.valid_rows} valid · {preview.error_rows} invalid</span>
+            </div>
+          )}
+          {previewRows.map((row) => (
+            <div className="import-row-error" key={row.row_number}>
+              <b>Row {row.row_number}</b>
+              <span>{row.errors.map((error) => `${error.field}: ${error.message}`).join(" · ")}</span>
+            </div>
+          ))}
+          {preview && importMode === "REPLACE" && preview.error_rows === 0 && (
+            <label className="replace-confirmation">
+              <span>Type <b>REPLACE</b> to confirm permanent replacement</span>
+              <input value={replaceConfirmation} onChange={(event) => setReplaceConfirmation(event.target.value.toUpperCase())} placeholder="REPLACE" autoComplete="off" />
+            </label>
+          )}
         </div>
       </section>
+      <div className="master-summary-strip" aria-label="Compliance Master summary">
+        <div><span>Acts</span><b>{acts.data?.length ?? "—"}</b></div>
+        <div><span>Rule versions</span><b>{total}</b></div>
+        <div><span>Current view</span><b>{actFilter || "All Acts"}</b></div>
+      </div>
       <section className="panel entity-list-panel">
         <div className="crud-toolbar">
           <label className="table-search">
@@ -438,6 +585,21 @@ export function ComplianceMasterManager() {
               }}
               placeholder="Search rule, compliance ID, or Act…"
             />
+          </label>
+          <label className="compact-filter compliance-act-filter">
+            <span>Act</span>
+            <select
+              value={actFilter}
+              onChange={(event) => {
+                setActFilter(event.target.value);
+                setPage(1);
+              }}
+            >
+              <option value="">All Acts</option>
+              {acts.data?.map((item) => (
+                <option key={item} value={item}>{item}</option>
+              ))}
+            </select>
           </label>
           <label className="compact-filter">
             <span>Frequency</span>
@@ -468,7 +630,7 @@ export function ComplianceMasterManager() {
               <option value="false">Inactive</option>
             </select>
           </label>
-          {(search || frequency || active) && (
+          {(search || actFilter || frequency || active) && (
             <button
               type="button"
               className="text-action"
@@ -519,13 +681,32 @@ export function ComplianceMasterManager() {
                 </tr>
               </thead>
               <tbody>
-                {rules.data.items.map((row) => (
-                  <tr key={text(row, "id")}>
+                {rules.data.items.map((row, index) => {
+                  const actName = text(row, "act") || "Act not specified";
+                  const previousAct = index > 0 ? text(rules.data.items[index - 1], "act") || "Act not specified" : "";
+                  return (
+                  <Fragment key={text(row, "id")}>
+                    {actName !== previousAct && (
+                      <tr className="compliance-act-group">
+                        <td colSpan={8}>
+                          <div className="compliance-act-heading">
+                            <span><BookOpen size={16} aria-hidden="true" />{actName}</span>
+                            {actName !== "Act not specified" && (
+                              <span className="compliance-act-actions">
+                                <button type="button" className="text-action" disabled={Boolean(busyAction)} onClick={() => updateActStatus(actName, true)} title={`Activate all rules under ${actName}`}><Power size={14} /> Activate</button>
+                                <button type="button" className="text-action" disabled={Boolean(busyAction)} onClick={() => updateActStatus(actName, false)} title={`Deactivate all rules under ${actName}`}><PowerOff size={14} /> Deactivate</button>
+                                <button type="button" className="text-action danger-text" disabled={Boolean(busyAction)} onClick={() => { setDeleteTarget({ kind: "ACT", label: actName }); setDeleteConfirmation(""); }} title={`Permanently delete ${actName}`}><Trash2 size={14} /> Delete Act</button>
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                    <tr>
                     <td>{text(row, "compliance_id")}</td>
                     <td>
                       <b>{text(row, "name")}</b>
-                      <br />
-                      <small>{text(row, "act") || "No Act reference"}</small>
+                      {text(row, "rule_reference") && <><br /><small>{text(row, "rule_reference")}</small></>}
                     </td>
                     <td>{text(row, "entity_type")}</td>
                     <td>{text(row, "frequency")}</td>
@@ -574,10 +755,23 @@ export function ComplianceMasterManager() {
                         >
                           {row.active ? "Deactivate" : "Activate"}
                         </button>
+                        <button
+                          type="button"
+                          className="icon-action danger-icon"
+                          title={`Permanently delete ${text(row, "compliance_id")}`}
+                          onClick={() => {
+                            setDeleteTarget({ kind: "RULE", id: text(row, "rule_id"), label: text(row, "compliance_id") });
+                            setDeleteConfirmation("");
+                          }}
+                        >
+                          <Trash2 size={16} />
+                        </button>
                       </div>
                     </td>
-                  </tr>
-                ))}
+                    </tr>
+                  </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -672,6 +866,29 @@ export function ComplianceMasterManager() {
                     ))}
                   </select>
                 </RuleField>
+                <RuleField label="Employee threshold">
+                  <input type="number" min="0" {...form.register("employee_threshold")} />
+                </RuleField>
+                {form.watch("entity_type") === "UNIT" && (
+                  <RuleField label="Unit Compliance Types" wide>
+                    <div className="checkbox-grid">
+                      {unitComplianceTypes.map((type) => (
+                        <label className="checkbox-option" key={type}>
+                          <input
+                            type="checkbox"
+                            checked={form.watch("unit_compliance_types").includes(type)}
+                            onChange={(event) => {
+                              const selected = form.getValues("unit_compliance_types");
+                              form.setValue("unit_compliance_types", event.target.checked ? [...selected, type] : selected.filter((value) => value !== type), { shouldDirty: true, shouldValidate: true });
+                            }}
+                          />
+                          <span>{type}</span>
+                        </label>
+                      ))}
+                    </div>
+                    <small>Leave empty only for a universal Unit rule. Otherwise, at least one selected type must match the Unit.</small>
+                  </RuleField>
+                )}
               </div>
             </div>
             <div className="form-section">
@@ -733,7 +950,7 @@ export function ComplianceMasterManager() {
             <div className="form-section">
               <h3>Legal references</h3>
               <div className="form-grid">
-                <RuleField label="Act">
+                <RuleField label="Act *" error={form.formState.errors.act?.message}>
                   <input {...form.register("act")} />
                 </RuleField>
                 <RuleField label="Rule reference">
@@ -794,6 +1011,14 @@ export function ComplianceMasterManager() {
                 <dd>{text(detail, "name")}</dd>
               </div>
               <div>
+                <dt>Act</dt>
+                <dd>{text(detail, "act") || "Not specified"}</dd>
+              </div>
+              <div>
+                <dt>Rule / reference</dt>
+                <dd>{text(detail, "rule_reference") || "Not specified"}</dd>
+              </div>
+              <div>
                 <dt>Frequency</dt>
                 <dd>{text(detail, "frequency")}</dd>
               </div>
@@ -804,14 +1029,44 @@ export function ComplianceMasterManager() {
               <div>
                 <dt>Due date rule</dt>
                 <dd>{text(detail, "due_date_rule")}</dd>
-                <div className="wide">
-                  <dt>Description</dt>
-                  <dd>{text(detail, "description") || "Not provided"}</dd>
-                </div>
+              </div>
+              <div>
+                <dt>Employee threshold</dt>
+                <dd>{text(detail, "employee_threshold") || "No threshold"}</dd>
+              </div>
+              <div className="wide">
+                <dt>Description</dt>
+                <dd>{text(detail, "description") || "Not provided"}</dd>
               </div>
             </dl>
           </div>
         </MasterSheet>
+      )}
+      {deleteTarget && (
+        <div className="dialog-backdrop" role="presentation" onMouseDown={() => { if (!busyAction) setDeleteTarget(null); }}>
+          <section className="compliance-dialog master-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="master-delete-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="dialog-header">
+              <div>
+                <span className="destructive-kicker">Permanent development deletion</span>
+                <h2 id="master-delete-title">Delete {deleteTarget.kind === "ACT" ? "Act and all its rules" : "compliance rule"}?</h2>
+                <p>This also removes generated compliance records, assignments, submissions, workflow history, and evidence linked to the selected rules.</p>
+              </div>
+              <button type="button" className="icon-action" disabled={Boolean(busyAction)} onClick={() => setDeleteTarget(null)}><X size={18} /></button>
+            </div>
+            <div className="master-delete-target"><span>{deleteTarget.kind === "ACT" ? "Act" : "Compliance ID"}</span><b>{deleteTarget.label}</b></div>
+            <label className="replace-confirmation">
+              <span>Enter the exact {deleteTarget.kind === "ACT" ? "Act name" : "Compliance ID"} to confirm</span>
+              <input value={deleteConfirmation} onChange={(event) => setDeleteConfirmation(event.target.value)} autoFocus autoComplete="off" />
+            </label>
+            <div className="dialog-footer">
+              <span className="muted">This operation is audited and cannot be undone from the application.</span>
+              <div className="action-row">
+                <button type="button" className="secondary" disabled={Boolean(busyAction)} onClick={() => setDeleteTarget(null)}>Cancel</button>
+                <button type="button" className="danger-action" disabled={deleteConfirmation.trim() !== deleteTarget.label || Boolean(busyAction)} onClick={confirmPermanentDelete}>{busyAction ? "Deleting…" : "Permanently delete"}</button>
+              </div>
+            </div>
+          </section>
+        </div>
       )}
     </section>
   );

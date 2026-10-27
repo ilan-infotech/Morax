@@ -1,26 +1,13 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   CalendarClock,
   CheckCircle2,
   RefreshCw,
-  UsersRound,
 } from "lucide-react";
-import {
-  Bar,
-  BarChart,
-  Cell,
-  Legend,
-  Pie,
-  PieChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
-
 import { morax } from "../api/morax";
+import type { User } from "../api/morax";
 import {
   DashboardMetricCard,
   DashboardSection,
@@ -31,6 +18,7 @@ import {
   LoadingSkeleton,
   WorkspacePageHeader,
 } from "./workspace-ui";
+import { PremiumComplianceAnalytics } from "./premium-compliance-analytics";
 
 type DashboardFilters = {
   unit_id: string;
@@ -39,25 +27,6 @@ type DashboardFilters = {
   period_key: string;
 };
 
-const chartColors = [
-  '#2A3620', 
-  '#A5B892', 
-  '#5C6B4A', 
-  '#D9EAD3', 
-  '#424B35', 
-  '#7A8C66'
-];
-
-function statusColor(status: string, index: number) {
-  const s = status.toLowerCase();
-  if (s.includes('completed late')) return '#a7f3d0';
-  if (s.includes('completed')) return '#22c55e';
-  if (s.includes('pending') || s.includes('approval')) return '#fbbf24';
-  if (s.includes('overdue') || s.includes('late')) return '#ef4444';
-  if (s.includes('not started') || s.includes('pending')) return '#94a3b8';
-  if (s.includes('in progress')) return '#3b82f6';
-  return chartColors[index % chartColors.length];
-}
 function healthTone(rate: number, overdue: number) {
   if (overdue > 0) return "critical";
   if (rate >= 80) return "healthy";
@@ -67,7 +36,7 @@ function healthTone(rate: number, overdue: number) {
 
 import { motion } from "framer-motion";
 
-function HealthRankings({
+export function HealthRankings({
   rows,
   kind,
 }: {
@@ -144,23 +113,86 @@ function HealthRankings({
   );
 }
 
-export function MainDashboard() {
+export function MainDashboard({ user }: { user: User }) {
   const { organizationId } = useParams();
   const base = organizationId ? "/app/organizations/" + organizationId : "/app";
+  const roles = new Set(user.roles);
+  const contractorOnly = ["CONTRACTOR_ADMIN", "CONTRACTOR_MAKER", "CONTRACTOR_CHECKER"].some((role) => roles.has(role))
+    && !["ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "UNIT_CHECKER", "AUDITOR"].some((role) => roles.has(role));
+  const isMaker = [...roles].some((role) => role.endsWith("_MAKER"));
+  const isChecker = [...roles].some((role) => role.endsWith("_CHECKER"));
+  const isAuditor = roles.has("AUDITOR");
+  const unitScopedOperator = !contractorOnly
+    && !roles.has("ORGANIZATION_ADMIN")
+    && !roles.has("UNIT_ADMIN")
+    && !roles.has("AUDITOR")
+    && (roles.has("UNIT_MAKER") || roles.has("UNIT_CHECKER"));
+  const scopedKind = contractorOnly ? "CONTRACTOR" : unitScopedOperator ? "UNIT" : null;
+  const scopedRole = contractorOnly
+    ? (roles.has("CONTRACTOR_MAKER") ? "CONTRACTOR_MAKER" : "CONTRACTOR_CHECKER")
+    : (roles.has("UNIT_MAKER") ? "UNIT_MAKER" : "UNIT_CHECKER");
+  const scopedIds = contractorOnly
+    ? (user.contractor_context?.options.map((option) => option.id) ?? user.scopes.filter((scope) => scope.role === scopedRole && scope.scope_type === "CONTRACTOR").map((scope) => scope.scope_id))
+    : user.scopes.filter((scope) => scope.role === scopedRole && scope.scope_type === scopedKind).map((scope) => scope.scope_id);
+  const initialScopedId = contractorOnly
+    ? user.contractor_context?.active_contractor_id ?? scopedIds[0] ?? ""
+    : scopedIds[0] ?? "";
   const [filters, setFilters] = useState<DashboardFilters>({
-    unit_id: "",
+    unit_id: unitScopedOperator ? initialScopedId : "",
     entity_id: "",
-    contractor_id: "",
+    contractor_id: contractorOnly ? initialScopedId : "",
     period_key: "",
   });
+  const [tableFilters, setTableFilters] = useState({ status: "", frequency: "", subjectId: "", q: "", page: 1 });
+  const title = contractorOnly
+    ? "Contractor compliance dashboard"
+    : isChecker
+      ? "Compliance approval dashboard"
+      : isMaker
+        ? "My compliance dashboard"
+        : isAuditor
+          ? "Compliance audit dashboard"
+          : "Compliance dashboard";
+  const worklistPath = contractorOnly ? "compliances/contractor" : "compliances/company";
   const overview = useQuery({
-    queryKey: ["dashboard-overview", filters],
-    queryFn: () => morax.dashboardOverview(filters),
-    staleTime: 30_000,
-    refetchOnWindowFocus: false,
+    // Context belongs in the cache key as a second layer of protection against
+    // stale cards during organization impersonation or contractor switching.
+    queryKey: ["dashboard-overview", user.id, user.organization_id, user.contractor_context?.active_contractor_id ?? "all", filters, tableFilters],
+    queryFn: () => morax.dashboardOverview({
+      ...filters,
+      table_status: tableFilters.status,
+      table_frequency: tableFilters.frequency,
+      table_subject_id: tableFilters.subjectId,
+      table_q: tableFilters.q,
+      table_page: String(tableFilters.page),
+      table_page_size: "25",
+    }),
+    staleTime: 0,
+    refetchOnWindowFocus: true,
+    refetchInterval: 30_000,
   });
   const data = overview.data;
   const summary = data?.summary;
+  const scopedOptions = scopedKind === "CONTRACTOR"
+    ? (data?.filters.contractors ?? []).filter((item) => scopedIds.includes(item.id))
+    : (data?.filters.units ?? []).filter((item) => scopedIds.includes(item.id));
+
+  // A scoped operator must never default to a combined multi-entity view.
+  // Persist their last valid choice per account, but only when it is still in
+  // the backend-authorized options returned for the active session.
+  useEffect(() => {
+    if (!scopedKind || !scopedOptions.length) return;
+    const storageKey = `morax-dashboard-${user.id}-${scopedKind.toLowerCase()}`;
+    const saved = localStorage.getItem(storageKey);
+    const selected = scopedKind === "CONTRACTOR" ? filters.contractor_id : filters.unit_id;
+    const valid = scopedOptions.some((item) => item.id === selected);
+    const next = valid ? selected : scopedOptions.some((item) => item.id === saved) ? saved! : scopedOptions[0].id;
+    if (next !== selected) {
+      setFilters((current) => scopedKind === "CONTRACTOR"
+        ? { ...current, contractor_id: next, entity_id: "", period_key: "" }
+        : { ...current, unit_id: next, entity_id: "", contractor_id: "", period_key: "" });
+    }
+  }, [scopedKind, scopedOptions.map((item) => item.id).join("|"), user.id]);
 
   const changeUnit = (unit_id: string) =>
     setFilters({ unit_id, entity_id: "", contractor_id: "", period_key: "" });
@@ -175,11 +207,22 @@ export function MainDashboard() {
     setFilters((current) => ({ ...current, contractor_id, period_key: "" }));
   const changePeriod = (period_key: string) =>
     setFilters((current) => ({ ...current, period_key }));
+  const setTableFilter = (patch: Partial<typeof tableFilters>) => setTableFilters((current) => ({ ...current, ...patch, page: patch.page ?? 1 }));
+  const toggleTableStatus = (status: string) => setTableFilters((current) => ({ ...current, status: current.status === status ? "" : status, page: 1 }));
+  const toggleTableFrequency = (frequency: string) => setTableFilters((current) => ({ ...current, frequency: current.frequency === frequency ? "" : frequency, page: 1 }));
+  const toggleTableEntity = (subjectId: string) => setTableFilters((current) => ({ ...current, subjectId: current.subjectId === subjectId ? "" : subjectId, page: 1 }));
+  const changeScopedEntity = (entityId: string) => {
+    if (!scopedKind) return;
+    localStorage.setItem(`morax-dashboard-${user.id}-${scopedKind.toLowerCase()}`, entityId);
+    setFilters((current) => scopedKind === "CONTRACTOR"
+      ? { ...current, contractor_id: entityId, entity_id: "", period_key: "" }
+      : { ...current, unit_id: entityId, entity_id: "", contractor_id: "", period_key: "" });
+  };
 
   return (
     <div className="modern-page dashboard-page">
       <WorkspacePageHeader
-        title="Compliance dashboard"
+        title={title}
         actions={
           <button
             className="button-secondary"
@@ -198,13 +241,24 @@ export function MainDashboard() {
         message={overview.error instanceof Error ? overview.error.message : ""}
       />
 
-      <DashboardSection
+      {scopedKind ? scopedOptions.length > 1 && <DashboardSection
+        title={`${scopedKind === "UNIT" ? "Unit" : "Contractor"} dashboard`}
+        description="Showing only the selected entity that is assigned to you."
+        className="dashboard-filter-section"
+      >
+        <div className="dashboard-filter-grid scoped-dashboard-selector"><label>
+          {scopedKind === "UNIT" ? "Unit" : "Contractor"}
+          <select value={scopedKind === "UNIT" ? filters.unit_id : filters.contractor_id} onChange={(event) => changeScopedEntity(event.target.value)}>
+            {scopedOptions.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
+          </select>
+        </label></div>
+      </DashboardSection> : <DashboardSection
         title="Dashboard filters"
         description="Selections update every dashboard metric and insight automatically."
         className="dashboard-filter-section"
       >
         <div className="dashboard-filter-grid">
-          <label>
+          {!contractorOnly && <label>
             Organization unit
             <select
               value={filters.unit_id}
@@ -217,7 +271,7 @@ export function MainDashboard() {
                 </option>
               ))}
             </select>
-          </label>
+          </label>}
           <label>
             Entity
             <select
@@ -232,7 +286,7 @@ export function MainDashboard() {
               ))}
             </select>
           </label>
-          <label>
+          {data?.filters.contractors.length !== 1 && <label>
             Contractor
             <select
               value={filters.contractor_id}
@@ -245,7 +299,7 @@ export function MainDashboard() {
                 </option>
               ))}
             </select>
-          </label>
+          </label>}
           <label>
             Period
             <select
@@ -261,7 +315,7 @@ export function MainDashboard() {
             </select>
           </label>
         </div>
-      </DashboardSection>
+      </DashboardSection>}
 
       {overview.isLoading && !data ? (
         <DashboardSection title="Loading compliance health">
@@ -277,114 +331,104 @@ export function MainDashboard() {
               label="Total obligations"
               value={summary?.total ?? 0}
               helper="Selected scope"
+              onClick={() => setTableFilters((current) => ({ ...current, status: "", frequency: "", subjectId: "", page: 1 }))}
+              active={!tableFilters.status && !tableFilters.frequency && !tableFilters.subjectId}
             />
             <DashboardMetricCard
               label="Completed"
               value={summary?.completed ?? 0}
               helper={(summary?.completion_rate ?? 0) + "% compliance"}
               tone="success"
+              onClick={() => toggleTableStatus("COMPLETED_ALL")}
+              active={tableFilters.status === "COMPLETED_ALL"}
             />
             <DashboardMetricCard
               label="Pending action"
               value={summary?.pending ?? 0}
               helper="Drafts and corrections"
               tone="warning"
+              onClick={() => toggleTableStatus("PENDING_ACTION")}
+              active={tableFilters.status === "PENDING_ACTION"}
             />
+            {isChecker && <DashboardMetricCard
+              label="Awaiting my review"
+              value={summary?.awaiting_review ?? 0}
+              helper="Maker submissions requiring a decision"
+              tone="warning"
+              onClick={() => toggleTableStatus("AWAITING_REVIEW")}
+              active={tableFilters.status === "AWAITING_REVIEW"}
+            />}
+            {isMaker && <DashboardMetricCard
+              label="Returned / rejected"
+              value={summary?.rejected ?? 0}
+              helper="Review remarks need attention"
+              tone="critical"
+              onClick={() => toggleTableStatus("REJECTED")}
+              active={tableFilters.status === "REJECTED"}
+            />}
             <DashboardMetricCard
               label="Overdue"
               value={summary?.overdue ?? 0}
               helper="Needs immediate attention"
               tone="critical"
+              onClick={() => toggleTableStatus("OVERDUE")}
+              active={tableFilters.status === "OVERDUE"}
+            />
+            <DashboardMetricCard
+              label="Due today"
+              value={summary?.due_today ?? 0}
+              helper="Deadline is today"
+              tone="warning"
+              onClick={() => toggleTableStatus("DUE_TODAY")}
+              active={tableFilters.status === "DUE_TODAY"}
             />
             <DashboardMetricCard
               label="Due in 7 days"
               value={summary?.due_soon ?? 0}
-              helper="Upcoming open obligations"
+              helper="Excludes obligations due today"
               tone="attention"
+              onClick={() => toggleTableStatus("DUE_SOON")}
+              active={tableFilters.status === "DUE_SOON"}
+            />
+            <DashboardMetricCard
+              label="Upcoming"
+              value={summary?.upcoming ?? 0}
+              helper="More than 7 days remaining"
+              tone="attention"
+              onClick={() => toggleTableStatus("UPCOMING")}
+              active={tableFilters.status === "UPCOMING"}
+            />
+            <DashboardMetricCard
+              label="Not applicable"
+              value={summary?.not_applicable ?? 0}
+              helper="Excluded with a recorded reason"
+              onClick={() => toggleTableStatus("NOT_APPLICABLE")}
+              active={tableFilters.status === "NOT_APPLICABLE"}
             />
           </section>
 
+          <PremiumComplianceAnalytics
+            status={data?.status_distribution ?? []}
+            frequency={data?.frequency_distribution ?? []}
+            entities={contractorOnly || Boolean(filters.contractor_id) ? data?.contractor_health ?? [] : (data?.entity_health ?? []).filter((item) => item.entity_type === "UNIT")}
+            entityLabel={contractorOnly || Boolean(filters.contractor_id) ? "Contractor" : "Unit"}
+            total={summary?.total ?? 0}
+            completionRate={summary?.completion_rate ?? 0}
+            selectedStatus={tableFilters.status}
+            selectedFrequency={tableFilters.frequency}
+            selectedEntityId={tableFilters.subjectId}
+            onStatusToggle={toggleTableStatus}
+            onFrequencyToggle={toggleTableFrequency}
+            onEntityToggle={toggleTableEntity}
+          />
           <section className="dashboard-layout dashboard-two-column">
-            <DashboardSection
-              title="Compliance status"
-              description="Current workflow state across the selected scope."
-              className="compliance-status-card"
-            >
-              {data?.status_distribution.length ? (
-                <div className="compliance-chart-body" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, padding: '24px 16px', overflow: 'visible' }}>
-                  <div className="donut-chart-wrapper" style={{ width: '260px', height: '260px', position: 'relative', flexShrink: 0 }}>
-                    <ResponsiveContainer width="100%" height={260}>
-                      <PieChart>
-                        <Pie
-                          data={data.status_distribution}
-                          dataKey="value"
-                          nameKey="name"
-                          cx="50%"
-                          cy="50%"
-                          innerRadius={74}
-                          outerRadius={106}
-                          paddingAngle={3}
-                        >
-                          {data.status_distribution.map((entry, index) => (
-                            <Cell
-                              key={entry.name}
-                              fill={statusColor(entry.name, index)}
-                            />
-                          ))}
-                        </Pie>
-                        <Tooltip formatter={(value) => [value, "Obligations"]} />
-                      </PieChart>
-                    </ResponsiveContainer>
-                    <div 
-                      className="donut-chart-total"
-                      style={{
-                        position: 'absolute',
-                        top: '50%',
-                        left: '50%',
-                        transform: 'translate(-50%, -50%)',
-                        textAlign: 'center',
-                        display: 'grid',
-                        gap: '0.1rem'
-                      }}
-                    >
-                      <strong>{summary?.completion_rate ?? 0}%</strong>
-                      <span>completed</span>
-                    </div>
-                  </div>
-                  <div className="compliance-legend" style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: '8px 20px', maxWidth: '100%', marginTop: '20px' }}>
-                    {data.status_distribution.map((entry, index) => (
-                      <div key={entry.name} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: '#4b5563' }}>
-                        <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: statusColor(entry.name, index) }} />
-                        <span>
-                          {{
-                            COMPLETED: "Completed",
-                            COMPLETED_LATE: "Completed late",
-                            DUE: "Due",
-                            NOT_APPLICABLE: "Not applicable",
-                            OVERDUE: "Overdue",
-                            PENDING_FOR_APPROVAL: "Pending approval",
-                            REJECTED_BY_CHECKER: "Rejected",
-                          }[entry.name] || entry.name}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <EmptyState
-                  title="No compliance data"
-                  description="No obligations match the current dashboard filters."
-                />
-              )}
-            </DashboardSection>
-
             <DashboardSection
               title="Upcoming deadlines"
               description="Open obligations due over the next 14 days."
               action={
                 <Link
                   className="text-link"
-                  to={base + "/compliances/company"}
+                  to={base + "/" + worklistPath}
                 >
                   View worklist
                 </Link>
@@ -410,9 +454,11 @@ export function MainDashboard() {
                       <span className="deadline-date">
                         {formatDate(item.due_date)}
                         <small>
-                          {item.display_status === "OVERDUE"
-                            ? item.days_overdue + "d overdue"
-                            : "Upcoming"}
+                          {item.display_status === "DUE_TODAY"
+                            ? "Due today"
+                            : item.display_status === "DUE_SOON"
+                              ? "Due soon"
+                              : "Upcoming"}
                         </small>
                       </span>
                     </Link>
@@ -428,70 +474,17 @@ export function MainDashboard() {
             </DashboardSection>
           </section>
 
-          <section className="dashboard-layout dashboard-two-column">
-            <DashboardSection
-              title="Obligations by frequency"
-              description="Workload distribution across compliance schedules."
-            >
-              {data?.frequency_distribution.length ? (
-                <div className="chart-wrap">
-                  <ResponsiveContainer width="100%" height={280}>
-                    <BarChart
-                      data={data.frequency_distribution}
-                      margin={{ top: 8, right: 8, left: -18, bottom: 10 }}
-                    >
-                      <XAxis
-                        dataKey="name"
-                        tickLine={false}
-                        axisLine={false}
-                        fontSize={12}
-                      />
-                      <YAxis
-                        allowDecimals={false}
-                        tickLine={false}
-                        axisLine={false}
-                        fontSize={12}
-                      />
-                      <Tooltip cursor={{ fill: "#eff6ff" }} />
-                      <Bar
-                        dataKey="value"
-                        name="Obligations"
-                        fill="#424B35"
-                        radius={[5, 5, 0, 0]}
-                      />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              ) : (
-                <EmptyState
-                  title="No frequency insight"
-                  description="No compliance schedules match the current filters."
-                />
-              )}
-            </DashboardSection>
-            <DashboardSection
-              title="Contractor compliance"
-              description="Compare contractor performance in the selected scope."
-            >
-              <HealthRankings
-                rows={data?.contractor_health ?? []}
-                kind="contractor"
-              />
-            </DashboardSection>
-          </section>
-
           <DashboardSection
-            title="Entity compliance health"
-            description="Ranked by completion percentage, with completed totals and overdue obligations visible at a glance."
-            className="entity-health-section"
+            title="Compliance records"
+            description="Analytics selections filter this authorized record list immediately."
+            className="dashboard-records-section"
             action={
-              <span className="table-heading-icon">
-                <UsersRound size={16} />
-                Selected entities
-              </span>
+              <button className="button-secondary compact-action" type="button" onClick={() => setTableFilters({ status: "", frequency: "", subjectId: "", q: "", page: 1 })}>Reset filters</button>
             }
           >
-            <HealthRankings rows={data?.entity_health ?? []} kind="entity" />
+            <div className="dashboard-records-toolbar"><label className="table-search"><input value={tableFilters.q} onChange={(event) => setTableFilter({ q: event.target.value })} placeholder="Search compliance or entity" /></label><span>{data?.table.total ?? 0} matching records</span></div>
+            {data?.table.items.length ? <div className="modern-table-wrap"><table className="modern-table"><thead><tr><th>Compliance</th><th>Entity</th><th>Frequency</th><th>Due date</th><th>Status</th><th>Risk</th></tr></thead><tbody>{data.table.items.map((item) => <tr key={item.id}><td><b>{item.compliance_name}</b><small>{item.compliance_id}</small></td><td>{item.subject_name}</td><td>{humanize(item.frequency)}</td><td className={item.is_overdue ? "table-due overdue" : "table-due"}>{formatDate(item.due_date)}</td><td><span className="status-badge neutral">{humanize(item.display_status ?? item.status)}</span></td><td>{humanize(item.risk_level)}</td></tr>)}</tbody></table></div> : <EmptyState title="No matching compliance records" description="Change or reset an analytics selection to see records in your authorized scope." />}
+            <div className="pagination-row"><span>Page {data?.table.page ?? 1} of {Math.max(1, Math.ceil((data?.table.total ?? 0) / (data?.table.page_size ?? 25)))}</span><div><button className="button-secondary" type="button" disabled={(data?.table.page ?? 1) <= 1} onClick={() => setTableFilter({ page: Math.max(1, tableFilters.page - 1) })}>Previous</button><button className="button-secondary" type="button" disabled={(data?.table.page ?? 1) >= Math.max(1, Math.ceil((data?.table.total ?? 0) / (data?.table.page_size ?? 25)))} onClick={() => setTableFilter({ page: tableFilters.page + 1 })}>Next</button></div></div>
           </DashboardSection>
         </>
       )}

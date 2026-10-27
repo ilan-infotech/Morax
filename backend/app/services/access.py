@@ -68,6 +68,7 @@ ROLE_PERMISSIONS = {
         "settings.read",
     },
     "CONTRACTOR_MAKER": {
+        "dashboard.read",
         "compliance.read",
         "compliance.make",
         "documents.upload",
@@ -81,12 +82,14 @@ ROLE_PERMISSIONS = {
         "settings.read",
     },
     "CONTRACTOR_ADMIN": {
+        "dashboard.read",
         "compliance.read",
         "compliance.manage",
         "documents.manage",
         "documents.upload",
     },
     "CONTRACTOR_CHECKER": {
+        "dashboard.read",
         "compliance.read",
         "compliance.check",
         "documents.verify",
@@ -127,7 +130,11 @@ FEATURE_PERMISSIONS = {
     "users": "users.manage",
     "compliance_master": "compliance_master.manage",
     "documents": "documents.read",
-    "notifications": "settings.read",
+    # Notifications are operational work items, not an account-settings
+    # screen.  Contractor Checkers/Makers have compliance.read but deliberately
+    # do not receive settings.read; they must still receive submission and
+    # deadline notifications in their scoped workspace.
+    "notifications": "compliance.read",
     "reports": "reports.read",
     "audit": "audit.read",
     "settings": "settings.read",
@@ -314,7 +321,9 @@ def features_for(user: User, scopes: list[UserRoleScope], grants: set[str] | Non
         # Contractor sessions are intentionally a narrow product experience.
         # The API permission checks remain authoritative for the underlying
         # compliance records and documents needed inside that experience.
-        return ["compliances.recurring", "notifications"]
+        # Contractor users receive a deliberately narrow dashboard. Its data is
+        # still constrained by the selected, authorized contractor context.
+        return ["dashboard", "compliances.recurring", "notifications"]
     permissions = permissions_for(user, scopes, grants)
     features = {
         feature
@@ -497,6 +506,7 @@ def user_summary(db: Session, user: User) -> dict:
         "mobile": user.mobile,
         "active": user.active,
         "created_at": user.created_at.isoformat() if user.created_at else None,
+        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
         "must_change_password": user.must_change_password,
         "roles": sorted({scope.role for scope in scopes}),
         "scopes": [{"role": scope.role, "scope_type": scope.scope_type, "scope_id": scope.scope_id} for scope in scopes],

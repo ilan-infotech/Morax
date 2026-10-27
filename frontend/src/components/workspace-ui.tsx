@@ -39,7 +39,7 @@ export function ComplianceStatusBadge({ status }: { status: string }) {
     ? "critical"
     : normalized.includes("approved") || normalized.includes("completed")
       ? "success"
-      : normalized.includes("review") || normalized.includes("submitted") || normalized.includes("approval")
+      : normalized.includes("due_today") || normalized.includes("due_soon") || normalized.includes("review") || normalized.includes("submitted") || normalized.includes("approval")
         ? "warning"
         : normalized.includes("correction")
           ? "critical"
@@ -92,11 +92,16 @@ export function DashboardMetricCard({
   value,
   helper,
   tone = "total",
+  onClick,
+  active = false,
 }: {
   label: string;
   value: number | string;
   helper?: string;
   tone?: "total" | "success" | "warning" | "attention" | "critical";
+  /** Optional in-place filter action for the table owned by this dashboard. */
+  onClick?: () => void;
+  active?: boolean;
 }) {
   const Icon = metricIcons[tone];
   const count = useMotionValue(0);
@@ -109,6 +114,45 @@ export function DashboardMetricCard({
     }
   }, [value, count]);
 
+  const content = <SpecularCard
+    className={active ? "metric-specular-card is-active" : "metric-specular-card"}
+    tint={active ? "#F0F6EE" : undefined}
+    baseColor={active ? "#8DAF86" : undefined}
+    lineColor={active ? "#B9D0B7" : undefined}
+    textColor={active ? "#234332" : undefined}
+    style={{ padding: "1.05rem" }}
+  >
+    <span className="metric-icon" aria-hidden="true">
+      <Icon size={20} strokeWidth={2.25} />
+    </span>
+    <div>
+      <p>{label}</p>
+      <strong>
+        {typeof value === "number" ? <motion.span>{rounded}</motion.span> : value}
+      </strong>
+      {helper && <small>{helper}</small>}
+    </div>
+  </SpecularCard>;
+
+  if (onClick) {
+    return (
+      <motion.button
+        type="button"
+        className={`dashboard-metric dashboard-metric-interactive ${active ? "is-active" : ""} ${tone}`}
+        onClick={onClick}
+        aria-pressed={active}
+        aria-label={`${label}: ${value}. ${active ? "Clear" : "Apply"} table filter`}
+        title={active ? "Clear this metric filter" : `Show ${label.toLowerCase()} records`}
+        initial={{ opacity: 0, y: 15 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.5 }}
+        style={{ padding: 0, border: "none" }}
+      >
+        {content}
+      </motion.button>
+    );
+  }
+
   return (
     <motion.article
       className={`dashboard-metric ${tone}`}
@@ -117,18 +161,7 @@ export function DashboardMetricCard({
       transition={{ duration: 0.5 }}
       style={{ padding: 0, border: "none" }}
     >
-      <SpecularCard style={{ padding: "1.05rem" }}>
-        <span className="metric-icon" aria-hidden="true">
-          <Icon size={20} strokeWidth={2.25} />
-        </span>
-        <div>
-          <p>{label}</p>
-          <strong>
-            {typeof value === "number" ? <motion.span>{rounded}</motion.span> : value}
-          </strong>
-          {helper && <small>{helper}</small>}
-        </div>
-      </SpecularCard>
+      {content}
     </motion.article>
   );
 }

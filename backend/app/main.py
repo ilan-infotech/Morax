@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 from datetime import date, timedelta
 
 from fastapi import FastAPI
@@ -25,6 +27,12 @@ from app.models import (
     UserRoleScope,
 )
 from app.services.qa_dataset import seed_qa_demo_workspace
+from app.services.compliance import generate_for_subject
+from app.services.notifications import schedule_compliance_reminders
+
+
+logger = logging.getLogger("uvicorn.info")
+_compliance_scheduler_task: asyncio.Task | None = None
 
 
 def seed_dashboard_demo_data(db, organization: Organization) -> None:
@@ -345,6 +353,82 @@ def seed_baseline() -> None:
         db.close()
 
 
+def generate_scheduled_unit_compliance(run_date: date | None = None) -> int:
+    """Idempotently create due obligations for every active compliance subject.
+
+    The function name is retained for compatibility with existing scripts.  A
+    contractor or contractor-site rule must receive the same recurring cycle
+    as a unit rule; otherwise those users could receive reminders only for
+    manually generated records.
+    """
+    db = SessionLocal()
+    created = []
+    try:
+        run_date = run_date or date.today()
+        organizations = db.scalars(
+            select(Organization).where(
+                Organization.status == "ACTIVE",
+                Organization.is_system.is_(False),
+            )
+        )
+        for organization in organizations:
+            subjects = (
+                ("UNIT", Unit),
+                ("CONTRACTOR", Contractor),
+                ("CONTRACTOR_SITE", ContractorSite),
+            )
+            for subject_type, model in subjects:
+                for subject in db.scalars(
+                    select(model).where(
+                        model.organization_id == organization.id,
+                        model.status == "ACTIVE",
+                    )
+                ):
+                    created.extend(
+                        generate_for_subject(db, organization.id, subject_type, subject.id, run_date)
+                    )
+        db.commit()
+        return len(created)
+    except Exception:
+        db.rollback()
+        logger.exception("Scheduled Unit compliance generation failed")
+        return 0
+    finally:
+        db.close()
+
+
+def generate_scheduled_compliance_notifications(run_date: date | None = None) -> int:
+    """Create idempotent deadline and pending-review notifications.
+
+    This reuses the application's existing six-hour scheduler.  Each reminder
+    has a stable event key, so an application restart or retry cannot duplicate
+    the same day's notification.
+    """
+    db = SessionLocal()
+    try:
+        created = schedule_compliance_reminders(db, run_date)
+        db.commit()
+        return created
+    except Exception:
+        db.rollback()
+        logger.exception("Scheduled compliance notification generation failed")
+        return 0
+    finally:
+        db.close()
+
+
+async def compliance_scheduler() -> None:
+    """Run on startup and periodically; database uniqueness keeps it idempotent."""
+    while True:
+        created = await asyncio.to_thread(generate_scheduled_unit_compliance)
+        notifications_created = await asyncio.to_thread(generate_scheduled_compliance_notifications)
+        if created:
+            logger.info("Scheduled compliance generation created %s obligations", created)
+        if notifications_created:
+            logger.info("Scheduled compliance reminder generation created %s notifications", notifications_created)
+        await asyncio.sleep(6 * 60 * 60)
+
+
 app = FastAPI(title=settings.app_name, version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.include_router(router, prefix=settings.api_v1_prefix)
@@ -396,6 +480,26 @@ def ensure_database_schema() -> None:
         except Exception:
             pass
 
+        # Runtime repair mirrors migration 0016 for local installs that use the
+        # application's idempotent schema bootstrap instead of `alembic upgrade`.
+        try:
+            conn.execute(text(
+                "UPDATE units SET effective_date = compliance_start_date "
+                "WHERE effective_date IS NULL"
+            ))
+            conn.execute(text("""
+                UPDATE units
+                SET city_id = (
+                    SELECT cities.id FROM cities
+                    WHERE cities.state_id = units.state_id
+                      AND LOWER(TRIM(cities.name)) = LOWER(TRIM(units.city))
+                    LIMIT 1
+                )
+                WHERE city_id IS NULL AND city IS NOT NULL
+            """))
+        except Exception as e:
+            logger.warning(f"Could not backfill Unit edit fields: {e}")
+
         # Synchronize alembic_version table to latest head
         try:
             conn.execute(
@@ -406,7 +510,7 @@ def ensure_database_schema() -> None:
             )
             conn.execute(text("DELETE FROM alembic_version"))
             conn.execute(
-                text("INSERT INTO alembic_version (version_num) VALUES ('0014_active_contractor_context')")
+                text("INSERT INTO alembic_version (version_num) VALUES ('0016_unit_edit_fields')")
             )
         except Exception as e:
             logger.warning(f"Could not synchronize alembic_version: {e}")
@@ -415,17 +519,31 @@ def ensure_database_schema() -> None:
 
 
 @app.on_event("startup")
-def startup() -> None:
+async def startup() -> None:
     import sys, traceback
     try:
         settings.upload_path.mkdir(parents=True, exist_ok=True)
         ensure_database_schema()
         seed_baseline()
+        global _compliance_scheduler_task
+        _compliance_scheduler_task = asyncio.create_task(compliance_scheduler())
     except Exception as exc:
         sys.stderr.write(f"\nFATAL STARTUP EXCEPTION: {exc}\n")
         traceback.print_exc()
         sys.stderr.flush()
         raise
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    global _compliance_scheduler_task
+    if _compliance_scheduler_task:
+        _compliance_scheduler_task.cancel()
+        try:
+            await _compliance_scheduler_task
+        except asyncio.CancelledError:
+            pass
+        _compliance_scheduler_task = None
 
 
 @app.get("/health")

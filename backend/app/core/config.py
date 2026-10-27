@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     mail_from: str = "no-reply@morax.local"
     india_lgd_api_base_url: str = "https://india-lgd-index-api.vercel.app"
     india_lgd_api_timeout_seconds: int = 10
+    # Development-only escape hatch for replacing or permanently deleting the
+    # Compliance Master. Set this to false before onboarding live customers.
+    allow_compliance_master_hard_delete: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

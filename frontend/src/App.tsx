@@ -38,6 +38,8 @@ import {
   CalendarClock,
   ChartNoAxesCombined,
   ClipboardList,
+  ClipboardCheck,
+  History,
   FileArchive,
   FileText,
   Landmark,
@@ -54,18 +56,24 @@ import {
   X,
   Eye,
   EyeOff,
+  MessageSquarePlus,
+  KeyRound,
+  UserRound,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { setToken } from "./api/client";
 import { morax } from "./api/morax";
 import type { Evidence, Instance, Master, RoleScope, User } from "./api/morax";
-import { ModernWorklist } from "./components/modern-compliance-pages";
+import { CheckerDashboard, ModernWorklist, MyReviewHistory, MySubmissions, PendingReviews } from "./components/modern-compliance-pages";
 import { MainDashboard } from "./components/filtered-dashboard";
 import { ModernEntities } from "./components/entity-manager";
 import { UserAccessManager } from "./components/user-access-manager";
 import { ComplianceMasterManager } from "./components/compliance-master-manager";
 import { DocumentLibrary } from "./components/document-library";
 import { PasswordInput } from "./components/password-input";
+import { SupportTicketManager } from "./components/support-ticket-manager";
+import { NotificationBell, NotificationsPage } from "./components/notification-center";
+import { ChangePasswordPage, ProfileManager } from "./components/profile-manager";
 import "./App.css";
 
 type Row = Record<string, unknown>;
@@ -145,6 +153,10 @@ export function UserProfileDropdown({ user, logout, organizationName }: { user: 
   const [isOpen, setIsOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
+  const navigate = useNavigate();
+  const location = useLocation();
+  const organizationMatch = location.pathname.match(/\/app\/organizations\/([^/]+)/);
+  const profileBase = organizationMatch ? `/app/organizations/${organizationMatch[1]}` : "/app";
 
   useEffect(() => {
     if (!isOpen) return;
@@ -243,10 +255,6 @@ export function UserProfileDropdown({ user, logout, organizationName }: { user: 
               <span style={{ fontSize: "0.85rem", color: "#6b7280", fontFamily: "inherit" }}>{user.platform_role || user.roles[0] || "Workspace user"}</span>
             </div>
 
-            <p style={{ textAlign: "center", fontSize: "0.85rem", color: "#6b7280", margin: 0, lineHeight: 1.4, fontFamily: "inherit" }}>
-              Signed in to MORAX Workspace. Manage your account and session from here.
-            </p>
-
             {organizationName && (
               <div style={{
                 width: "100%",
@@ -261,6 +269,11 @@ export function UserProfileDropdown({ user, logout, organizationName }: { user: 
                 <span style={{ fontSize: "0.9rem", color: "#111827", fontWeight: 500, fontFamily: "inherit" }}>{organizationName}</span>
               </div>
             )}
+
+            <div className="profile-dropdown-actions" style={{ width: "100%", display: "grid", gap: "8px" }}>
+              <button type="button" onClick={() => { setIsOpen(false); navigate(`${profileBase}/profile`); }}><UserRound size={17} />My Profile</button>
+              <button type="button" onClick={() => { setIsOpen(false); navigate(`${profileBase}/change-password`); }}><KeyRound size={17} />Change Password</button>
+            </div>
 
             <button
               onClick={() => {
@@ -398,6 +411,9 @@ const links: WorkspaceLink[] = [
     path: "compliances/company",
     feature: "compliances.recurring",
   },
+  { label: "My Submissions", path: "submissions", feature: "compliances.recurring" },
+  { label: "Pending Reviews", path: "pending-reviews", feature: "compliances.recurring" },
+  { label: "My Review History", path: "review-history", feature: "compliances.recurring" },
   {
     label: "Contractor Compliance",
     path: "compliances/contractor",
@@ -423,6 +439,7 @@ const links: WorkspaceLink[] = [
   },
   { label: "Document library", path: "documents", feature: "documents" },
   { label: "Notifications", path: "notifications", feature: "notifications" },
+  { label: "Support Tickets", path: "support-tickets", feature: "notifications" },
   { label: "Reports", path: "reports", feature: "reports" },
   { label: "Audit trail", path: "audit", feature: "audit" },
   {
@@ -435,6 +452,9 @@ const links: WorkspaceLink[] = [
 const navIcons: Record<string, LucideIcon> = {
   Dashboard: LayoutDashboard,
   "Company Compliance": CalendarClock,
+  "My Submissions": ClipboardList,
+  "Pending Reviews": ClipboardCheck,
+  "My Review History": History,
   "Contractor Compliance": Landmark,
   "One-time": ClipboardList,
   Units: Building2,
@@ -444,6 +464,7 @@ const navIcons: Record<string, LucideIcon> = {
   "Compliance Master": BookOpenCheck,
   "Document library": FileArchive,
   Notifications: Bell,
+  "Support Tickets": MessageSquarePlus,
   Reports: ChartNoAxesCombined,
   "Audit trail": ShieldCheck,
   "Organization settings": SettingsIcon,
@@ -525,16 +546,18 @@ function isContractorOnlyUser(user: User) {
 
 function workspaceLinks(user: User) {
   const features = featureSet(user);
+  const isMaker = user.roles.some((role) => role.includes("MAKER"));
+  const isChecker = user.roles.some((role) => role.includes("CHECKER"));
   if (user.platform_role === "MORAX_ADMIN") {
     // Product administrators manage customer tenants and Product-owned
     // masters. Tenant operational pages are entered only through Login as
     // Organization, keeping the platform experience unambiguous.
-    return links.filter((link) => ["compliance_master", "notifications", "audit"].includes(link.feature));
+    return links.filter((link) => ["dashboard", "compliance_master", "notifications", "audit"].includes(link.feature));
   }
   if (isContractorOnlyUser(user)) {
-    return links.filter((link) => ["compliances/contractor", "notifications"].includes(link.path));
+    return links.filter((link) => ["dashboard", "compliances/contractor", "notifications", "support-tickets"].includes(link.path) || (link.path === "submissions" && isMaker) || (["pending-reviews", "review-history"].includes(link.path) && isChecker));
   }
-  return links.filter((link) => features.has(link.feature));
+  return links.filter((link) => features.has(link.feature) && (link.path !== "submissions" || isMaker) && (!["pending-reviews", "review-history"].includes(link.path) || isChecker));
 }
 
 function defaultWorkspacePath(user: User) {
@@ -552,7 +575,7 @@ function FeatureGate({
 }) {
   if (
     user.platform_role === "MORAX_ADMIN" &&
-    !["platform.organizations", "compliance_master", "notifications", "audit"].includes(feature)
+    !["platform.organizations", "dashboard", "compliance_master", "notifications", "audit"].includes(feature)
   ) {
     return (
       <Panel>
@@ -560,7 +583,7 @@ function FeatureGate({
       </Panel>
     );
   }
-  if (isContractorOnlyUser(user) && !["compliances.recurring", "notifications"].includes(feature)) {
+  if (isContractorOnlyUser(user) && !["dashboard", "compliances.recurring", "notifications"].includes(feature)) {
     return <Panel>Contractor access is limited to authorized Contractor Compliance.</Panel>;
   }
   if (hasFeature(user, feature)) return <>{children}</>;
@@ -690,21 +713,20 @@ function ContractorContextDialog({
   selecting,
   onSelect,
   onClose,
+  onExit,
 }: {
   user: User;
   open: boolean;
   selecting: boolean;
   onSelect: (contractorId: string) => Promise<void>;
   onClose: () => void;
+  onExit: () => Promise<void>;
 }) {
   const context = user.contractor_context;
-  const [selected, setSelected] = useState("");
+  const [selected, setSelected] = useState(
+    context?.active_contractor_id ?? (context?.options.length === 1 ? context.options[0].id : ""),
+  );
   const [error, setError] = useState("");
-  useEffect(() => {
-    if (!open) return;
-    setSelected(context?.active_contractor_id ?? (context?.options.length === 1 ? context.options[0].id : ""));
-    setError("");
-  }, [open, context?.active_contractor_id, context?.options]);
   if (!open || !context?.enabled) return null;
   const selectionRequired = context.selection_required;
   return createPortal(
@@ -749,7 +771,18 @@ function ContractorContextDialog({
         )}
         {error && <p className="alert error">{error}</p>}
         <div className="dialog-footer">
-          {!selectionRequired && <button className="secondary" type="button" onClick={onClose} disabled={selecting}>Cancel</button>}
+          {!selectionRequired ? (
+            <button className="secondary" type="button" onClick={onClose} disabled={selecting}>Cancel</button>
+          ) : (
+            <button
+              className="secondary"
+              type="button"
+              disabled={selecting}
+              onClick={() => onExit().catch((exitError) => setError(message(exitError, "Could not leave this session.")))}
+            >
+              {user.impersonation?.active ? "Return to administrator" : "Log out"}
+            </button>
+          )}
           <button
             className="primary-action"
             type="button"
@@ -807,13 +840,7 @@ function Layout({
           </span>
         </div>
         <div className="topbar-actions" style={{ position: "relative" }}>
-          <Link
-            className="topbar-icon-link"
-            to={prefix + "/notifications"}
-            aria-label="Notifications"
-          >
-            <Bell size={18} />
-          </Link>
+          <NotificationBell prefix={prefix} userId={user.id} />
           <UserProfileDropdown user={user} logout={logout} organizationName={organizationName || (organizationId ? "Organization workspace" : undefined)} />
         </div>
       </header>
@@ -824,11 +851,14 @@ function Layout({
           path="dashboard"
           element={
             <FeatureGate user={user} feature="dashboard">
-              <MainDashboard />
+              {user.roles.some((role) => role.endsWith("_CHECKER")) ? <CheckerDashboard /> : <MainDashboard user={user} />}
             </FeatureGate>
           }
         />
         <Route path="compliances/:kind" element={<ComplianceRoute user={user} />} />
+        <Route path="submissions" element={<FeatureGate user={user} feature="compliances.recurring"><MySubmissions /></FeatureGate>} />
+        <Route path="pending-reviews" element={<FeatureGate user={user} feature="compliances.recurring"><PendingReviews /></FeatureGate>} />
+        <Route path="review-history" element={<FeatureGate user={user} feature="compliances.recurring"><MyReviewHistory /></FeatureGate>} />
         <Route
           path="compliances/detail/:id"
           element={<Detail user={user} />}
@@ -865,10 +895,13 @@ function Layout({
           path="notifications"
           element={
             <FeatureGate user={user} feature="notifications">
-              <Notifications />
+              <NotificationsPage />
             </FeatureGate>
           }
         />
+        <Route path="support-tickets" element={<FeatureGate user={user} feature="notifications"><SupportTicketManager user={user} /></FeatureGate>} />
+        <Route path="profile" element={<ProfileManager user={user} />} />
+        <Route path="change-password" element={<ChangePasswordPage />} />
         <Route
           path="reports"
           element={
@@ -956,6 +989,22 @@ function Organizations({ user }: { user: User }) {
       return;
     }
     try {
+      if (!editing) {
+        const availability = await morax.emailAvailable(form.organization_admin_email);
+        if (!availability.available) {
+          setError("Email ID already exists.");
+          return;
+        }
+      }
+      const contactAvailability = await morax.emailAvailable(
+        form.primary_contact_email,
+        editing ? "ORGANIZATION" : undefined,
+        editing || undefined,
+      );
+      if (!contactAvailability.available) {
+        setError("Email ID already exists.");
+        return;
+      }
       const request = payload(form);
       delete request.organization_admin_password_confirmation;
       if (editing)
@@ -1265,13 +1314,7 @@ function PlatformShell({
             : "Platform administration"}
         </span>
         <div className="topbar-actions" style={{ position: "relative" }}>
-          <Link
-            className="topbar-icon-link"
-            to={prefix + "/notifications"}
-            aria-label="Notifications"
-          >
-            <Bell size={18} />
-          </Link>
+          <NotificationBell prefix={prefix} userId={user.id} />
           <UserProfileDropdown user={user} logout={logout} organizationName={organizationId ? "Organization workspace" : undefined} />
         </div>
       </header>
@@ -1408,6 +1451,22 @@ function OrganizationLanding({
       return;
     }
     try {
+      if (!editing) {
+        const availability = await morax.emailAvailable(form.organization_admin_email);
+        if (!availability.available) {
+          setError("Email ID already exists.");
+          return;
+        }
+      }
+      const contactAvailability = await morax.emailAvailable(
+        form.primary_contact_email,
+        editing ? "ORGANIZATION" : undefined,
+        editing || undefined,
+      );
+      if (!contactAvailability.available) {
+        setError("Email ID already exists.");
+        return;
+      }
       const request = payload(form);
       delete request.organization_admin_password_confirmation;
       if (editing)
@@ -4225,14 +4284,14 @@ function Documents({ user }: { user: User }) {
   );
 }
 
-function Notifications() {
+function LegacyNotifications() {
   const [rows, setRows] = useState<Row[]>([]);
   const [error, setError] = useState("");
   const [unread, setUnread] = useState(false);
   const load = () =>
     morax
-      .notifications(unread)
-      .then(setRows)
+      .notifications({ unread_only: unread ? "true" : "" })
+      .then((result) => setRows(result.items))
       .catch((err) => setError(message(err)));
   useEffect(() => {
     load();
@@ -4827,6 +4886,18 @@ function GlobalSidebar({ user, logout, collapsed, setCollapsed }: { user: User; 
   const match = location.pathname.match(/\/app\/organizations\/([^\/]+)/);
   const organizationId = match && match[1] !== "settings" ? match[1] : undefined;
   const prefix = organizationId ? "/app/organizations/" + organizationId : "/app";
+  const visibleLinks = workspaceLinks(user);
+  const complianceLinks = visibleLinks.filter((link) => ["compliances/company", "compliances/contractor", "compliances/one-time"].includes(link.path));
+  const entityLinks = visibleLinks.filter((link) => ["entities/units", "entities/contractors"].includes(link.path));
+  // Sites remain available by direct authorized route, but are intentionally
+  // removed from the primary sidebar to keep operational navigation compact.
+  const otherLinks = visibleLinks.filter((link) => !["compliances/company", "compliances/contractor", "compliances/one-time", "entities/units", "entities/contractors", "entities/sites"].includes(link.path));
+  const complianceActive = complianceLinks.some((link) => location.pathname === `${prefix}/${link.path}`);
+  const entitiesActive = entityLinks.some((link) => location.pathname === `${prefix}/${link.path}`);
+  const [complianceOpen, setComplianceOpen] = useState(complianceActive);
+  const [entitiesOpen, setEntitiesOpen] = useState(entitiesActive);
+  useEffect(() => { if (complianceActive) setComplianceOpen(true); }, [complianceActive]);
+  useEffect(() => { if (entitiesActive) setEntitiesOpen(true); }, [entitiesActive]);
 
   return (
     <aside className={collapsed ? "collapsed" : ""}>
@@ -4850,13 +4921,28 @@ function GlobalSidebar({ user, logout, collapsed, setCollapsed }: { user: User; 
         {hasFeature(user, "platform.organizations") && (
           <WorkspaceNavLink label="Organizations" to="/app/organizations" collapsed={collapsed} />
         )}
-        {workspaceLinks(user).map(({ label, path }) => (
+        {otherLinks.slice(0, 1).map(({ label, path }) => (
           <WorkspaceNavLink
             key={path}
             label={label}
             to={prefix + "/" + path}
             collapsed={collapsed}
           />
+        ))}
+        {complianceLinks.length > 0 && (collapsed ? complianceLinks.map(({ label, path }) => <WorkspaceNavLink key={path} label={label} to={prefix + "/" + path} collapsed />) : <div className={`sidebar-compliance-group ${complianceActive ? "active" : ""}`}>
+          <button type="button" className="sidebar-compliance-toggle" onClick={() => setComplianceOpen((open) => !open)} aria-expanded={complianceOpen}>
+            <CalendarClock size={18} /><span>Compliance</span><ChevronDown size={16} className={complianceOpen ? "chevron-up" : ""} />
+          </button>
+          {complianceOpen && <div className="sidebar-compliance-children">{complianceLinks.map(({ label, path }) => <WorkspaceNavLink key={path} label={label} to={prefix + "/" + path} />)}</div>}
+        </div>)}
+        {entityLinks.length > 0 && (collapsed ? entityLinks.map(({ label, path }) => <WorkspaceNavLink key={path} label={label} to={prefix + "/" + path} collapsed />) : <div className={`sidebar-compliance-group ${entitiesActive ? "active" : ""}`}>
+          <button type="button" className="sidebar-compliance-toggle" onClick={() => setEntitiesOpen((open) => !open)} aria-expanded={entitiesOpen}>
+            <Building2 size={18} /><span>Entities</span><ChevronDown size={16} className={entitiesOpen ? "chevron-up" : ""} />
+          </button>
+          {entitiesOpen && <div className="sidebar-compliance-children">{entityLinks.map(({ label, path }) => <WorkspaceNavLink key={path} label={label} to={prefix + "/" + path} />)}</div>}
+        </div>)}
+        {otherLinks.slice(1).map(({ label, path }) => (
+          <WorkspaceNavLink key={path} label={label} to={prefix + "/" + path} collapsed={collapsed} />
         ))}
       </nav>
       <button className="logout hover:bg-slate-800 hover:text-white transition-colors rounded-md" onClick={logout} style={{ padding: collapsed ? '0.5rem' : '0.5rem 1rem', display: 'flex', justifyContent: collapsed ? 'center' : 'flex-start', alignItems: 'center', gap: '0.5rem', marginTop: 'auto', color: '#fecaca', background: 'transparent', border: 'none', cursor: 'pointer', width: '100%' }} title={collapsed ? "Log out" : undefined}>
@@ -4944,9 +5030,6 @@ function AppRoutes() {
       .catch(() => setToken(null))
       .finally(() => setReady(true));
   }, []);
-  useEffect(() => {
-    if (user?.contractor_context?.selection_required) setContractorPickerOpen(true);
-  }, [user?.id, user?.contractor_context?.selection_required]);
   if (!ready) return <div className="loading">Loading MORAX…</div>;
   if (location.pathname === "/activate") return <AccountActivation />;
   const resetTenantWorkspace = () => queryClient.clear();
@@ -5075,13 +5158,17 @@ function AppRoutes() {
         />
         <Route path="*" element={<Navigate to={home} replace />} />
       </Routes>
-      <ContractorContextDialog
-        user={user}
-        open={contractorPickerOpen}
-        selecting={selectingContractor}
-        onSelect={selectContractor}
-        onClose={() => setContractorPickerOpen(false)}
-      />
+      {(contractorPickerOpen || Boolean(user.contractor_context?.selection_required)) && (
+        <ContractorContextDialog
+          key={`${user.id}-${user.contractor_context?.active_contractor_id ?? "required"}`}
+          user={user}
+          open
+          selecting={selectingContractor}
+          onSelect={selectContractor}
+          onClose={() => setContractorPickerOpen(false)}
+          onExit={user.impersonation?.active ? endImpersonation : logout}
+        />
+      )}
     </div>
   );
 }

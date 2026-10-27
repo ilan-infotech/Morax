@@ -5,6 +5,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models import ComplianceAssignment, ComplianceEvidence, ComplianceInstance, ComplianceRule, ComplianceRuleVersion, Contractor, ContractorSite, IndustryType, State, Unit, User, UserRoleScope
+from app.services.compliance import compliance_display_status
 
 
 def value(value: Any) -> Any:
@@ -64,57 +65,108 @@ def subject_name(db: Session, instance: ComplianceInstance, cache: dict | None =
     return subject.name if subject else "Deleted subject"
 
 
+def subject_context(db: Session, instance: ComplianceInstance, cache: dict | None = None) -> dict[str, str | None]:
+    """Return presentation details for a single authorized compliance subject.
+
+    The compliance instance stores the source subject id.  Detail popups also
+    need its related unit, contractor, and state labels, but those values must
+    remain derived from the actual subject records rather than duplicated into
+    a compliance snapshot.
+    """
+    cache = cache or {}
+    unit: Unit | None = None
+    contractor: Contractor | None = None
+    site: ContractorSite | None = None
+    if instance.subject_type == "UNIT":
+        unit = cache.get("UNIT", {}).get(instance.subject_id) or db.get(Unit, instance.subject_id)
+    elif instance.subject_type == "CONTRACTOR":
+        contractor = cache.get("CONTRACTOR", {}).get(instance.subject_id) or db.get(Contractor, instance.subject_id)
+        if contractor and contractor.unit_id:
+            unit = cache.get("UNIT", {}).get(contractor.unit_id) or db.get(Unit, contractor.unit_id)
+    elif instance.subject_type == "CONTRACTOR_SITE":
+        site = cache.get("CONTRACTOR_SITE", {}).get(instance.subject_id) or db.get(ContractorSite, instance.subject_id)
+        if site:
+            contractor = cache.get("CONTRACTOR", {}).get(site.contractor_id) or db.get(Contractor, site.contractor_id)
+            if site.unit_id:
+                unit = cache.get("UNIT", {}).get(site.unit_id) or db.get(Unit, site.unit_id)
+            elif contractor and contractor.unit_id:
+                unit = cache.get("UNIT", {}).get(contractor.unit_id) or db.get(Unit, contractor.unit_id)
+    state_id = (
+        getattr(site, "state_id", None)
+        or getattr(contractor, "state_id", None)
+        or getattr(unit, "state_id", None)
+    )
+    state = db.get(State, state_id) if state_id else None
+    return {
+        "unit_name": unit.name if unit else None,
+        "contractor_name": contractor.name if contractor else None,
+        "site_name": site.name if site else None,
+        "state_name": state.name if state else None,
+    }
+
+
 def instance_dict(db: Session, instance: ComplianceInstance, detail: bool = False, cache: dict | None = None) -> dict[str, Any]:
     cache = cache or {}
     version = cache.get("versions", {}).get(instance.rule_version_id) or db.get(ComplianceRuleVersion, instance.rule_version_id)
     rule = cache.get("rules", {}).get(version.rule_id if version else None) or (db.get(ComplianceRule, version.rule_id) if version else None)
-    
+    try:
+        snapshot = json.loads(instance.rule_snapshot_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        snapshot = {}
+
+    # Compliance Master is the current authority; the period snapshot protects
+    # historical details if a linked version is no longer available.  Do not
+    # turn a genuinely blank master field into made-up legal content.
+    def master_value(field: str, fallback: Any = None) -> Any:
+        current = getattr(version, field, None) if version else None
+        return current if current not in (None, "") else snapshot.get(field, fallback)
+
     result = model_dict(instance, [field.name for field in instance.__table__.columns])
     
+    display_status = compliance_display_status(instance)
     result.update({
         "rule_id": rule.id if rule else None,
-        "rule_name": version.name if version else None,
-        "compliance_id": rule.compliance_id if rule else None,
-        "compliance_name": version.name if version else None,
-        "act": version.act if version else None,
-        "rule_reference": version.rule_reference if version else None,
-        "compliance_type": version.compliance_type if version else None,
-        "document_type": version.document_type if version and version.document_type else "PROCEDURAL",
-        "form_number": version.form_number if version else None,
-        "frequency": version.frequency if version else None,
-        "risk_level": version.risk_level if version else None,
-        "required_document": version.required_document if version else None,
+        "rule_name": master_value("name"),
+        "compliance_id": rule.compliance_id if rule else snapshot.get("compliance_id"),
+        "compliance_name": master_value("name"),
+        "act": master_value("act"),
+        "rule_reference": master_value("rule_reference"),
+        "compliance_type": master_value("compliance_type"),
+        "document_type": master_value("document_type", "PROCEDURAL") or "PROCEDURAL",
+        "form_number": master_value("form_number"),
+        "frequency": master_value("frequency"),
+        "risk_level": master_value("risk_level"),
+        "required_document": master_value("required_document"),
         "subject_name": subject_name(db, instance, cache),
-        "is_overdue": instance.status not in {"APPROVED"} and instance.due_date < date.today(),
-        "days_overdue": max(0, (date.today() - instance.due_date).days) if instance.status != "APPROVED" else 0,
+        "is_overdue": display_status == "OVERDUE",
+        "days_overdue": max(0, (date.today() - instance.due_date).days) if display_status == "OVERDUE" else 0,
+        "display_status": display_status,
     })
-    if instance.status in {"PENDING", "IN_PROGRESS", "CORRECTION_REQUIRED"}:
-        result["display_status"] = "OVERDUE" if result["is_overdue"] else "DUE"
-    elif instance.status in {"SUBMITTED", "UNDER_REVIEW"}:
-        result["display_status"] = "PENDING_FOR_APPROVAL"
-    elif instance.status == "APPROVED":
-        result["display_status"] = "COMPLETED_LATE" if instance.completion_late else "COMPLETED"
-    elif instance.status == "NOT_APPLICABLE":
-        result["display_status"] = "NOT_APPLICABLE"
-    else:
-        result["display_status"] = "REJECTED_BY_CHECKER"
     if detail:
         assignments = db.query(ComplianceAssignment).filter_by(instance_id=instance.id, active=True).all()
         evidence = db.query(ComplianceEvidence).filter_by(instance_id=instance.id).all()
         result["assignments"] = [model_dict(item, [field.name for field in item.__table__.columns]) for item in assignments]
         result["evidence"] = [model_dict(item, [field.name for field in item.__table__.columns]) for item in evidence]
-        result["rule_snapshot"] = json.loads(instance.rule_snapshot_json)
-        result["applicability"] = json.loads(instance.applicability_snapshot_json)
-        if version:
-            result.update({
-                "description": version.description,
-                "section": version.section,
-                "legal_description": version.legal_description,
-                "consequence_or_penalty": version.consequence_or_penalty,
-                "version": version.version,
-                "due_date_rule": version.due_date_rule,
-                "due_date_offset": version.due_date_offset,
-                "due_date_anchor": version.due_date_anchor,
-                "grace_days": version.grace_days,
-            })
+        result["rule_snapshot"] = snapshot
+        result["applicability"] = json.loads(instance.applicability_snapshot_json or "{}")
+        result["subject_context"] = subject_context(db, instance, cache)
+        result.update({
+            "description": master_value("description"),
+            "section": master_value("section"),
+            "legal_description": master_value("legal_description"),
+            "consequence_or_penalty": master_value("consequence_or_penalty"),
+            "version": master_value("version"),
+            "due_date_rule": master_value("due_date_rule"),
+            "due_date_offset": master_value("due_date_offset"),
+            "due_date_anchor": master_value("due_date_anchor"),
+            "grace_days": master_value("grace_days"),
+        })
+        result["missing_legal_fields"] = [
+            label for label, field in (
+                ("Act", "act"),
+                ("Section", "section"),
+                ("Rule / legal reference", "rule_reference"),
+                ("Rule description", "description"),
+            ) if not result.get(field)
+        ]
     return result

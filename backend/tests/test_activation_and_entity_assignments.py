@@ -10,7 +10,7 @@ import app.services.access as access
 from app.core.security import hash_password, verify_password
 from app.db.base import Base
 from app.models import AuditLog, AuthSession, Contractor, IndustryType, Organization, State, Unit, User, UserActivation, UserRoleScope
-from app.schemas import AdministratorPasswordResetInput, ContractorContextInput, ContractorInput, EntityUserAssignmentInput, LoginRequest, OrganizationDeleteInput, PlatformOrganizationInput, RoleScopeInput, UnitInput, UserCreateInput
+from app.schemas import AdministratorPasswordResetInput, ContractorContextInput, ContractorInput, EntityUserAssignmentInput, LoginRequest, OrganizationDeleteInput, PendingEntityUserInput, PlatformOrganizationInput, RoleScopeInput, UnitInput, UserCreateInput
 
 
 @pytest.fixture()
@@ -43,6 +43,7 @@ def test_platform_organization_provisions_admin_password(db):
             organization_admin_name="Acme Admin",
             organization_admin_email="admin@acme.example.com",
             organization_admin_password="Acme-Admin-Password-1",
+            primary_contact_email="contact@acme.example.com",
         ),
         platform_admin,
         db,
@@ -95,6 +96,34 @@ def test_platform_organization_provisions_admin_password(db):
     assert verify_password("Shared-Access-Password-1", db.get(User, created_user["id"]).password_hash)
     assert db.scalar(select(UserActivation).where(UserActivation.user_id == created_user["id"])) is None
     assert any(row["id"] == created_user["id"] for row in api.list_users(user=admin, db=db))
+    assert api.email_availability("new-login@acme.example.com", user=admin, db=db) == {"available": True}
+    assert api.email_availability("SHARED@ACME.EXAMPLE.COM", user=admin, db=db) == {"available": False}
+    assert api.email_availability("CONTACT@ACME.EXAMPLE.COM", user=admin, db=db) == {"available": False}
+    with pytest.raises(HTTPException, match="Email ID already exists"):
+        api.create_user(
+            UserCreateInput(
+                name="Duplicate Login",
+                email="CONTACT@ACME.EXAMPLE.COM",
+                password="Duplicate-Password-1",
+                role_scopes=[RoleScopeInput(
+                    role="VIEWER", scope_type="ORGANIZATION", scope_id=organization_id,
+                )],
+            ),
+            admin,
+            db,
+        )
+    with pytest.raises(HTTPException, match="Email ID already exists"):
+        api.create_platform_organization(
+            PlatformOrganizationInput(
+                organization_name="Duplicate Email Organization",
+                organization_code="DUPLICATE-EMAIL",
+                organization_admin_name="Duplicate Admin",
+                organization_admin_email="shared@acme.example.com",
+                organization_admin_password="Duplicate-Admin-Password-1",
+            ),
+            platform_admin,
+            db,
+        )
 
     user_reset = api.reset_user_password(
         created_user["id"],
@@ -236,6 +265,7 @@ def test_mrf_onboarding_login_unit_and_assigned_user_logins(db):
     unit = api.create_unit(
         UnitInput(
             name="MRF Chennai Plant",
+            employer_name="MRF Limited",
             code="MRF-CHN-01",
             industry_type_id=industry.id,
             state_id=state.id,
@@ -311,8 +341,18 @@ def test_generated_codes_unit_types_and_contractor_maker_scope(db):
     db.add(UserRoleScope(user_id=admin.id, role="ORGANIZATION_ADMIN", scope_type="ORGANIZATION", scope_id=organization.id))
     db.commit()
 
+    with pytest.raises(ValueError, match="Employer Name is required"):
+        UnitInput(
+            name="Invalid Unit",
+            employer_name="   ",
+            industry_type_id=industry.id,
+            state_id=state.id,
+            compliance_start_date=date(2026, 10, 22),
+        )
+
     unit = api.create_unit(UnitInput(
         name="Kerala Plant",
+        employer_name="Scope Industries",
         industry_type_id=industry.id,
         state_id=state.id,
         compliance_start_date=date(2026, 10, 22),
@@ -324,11 +364,13 @@ def test_generated_codes_unit_types_and_contractor_maker_scope(db):
     contractor = api.create_contractor(ContractorInput(
         name="Scope Labour Services",
         unit_id=unit["id"],
-        contractor_maker_email="maker@scope.example.com",
-        contractor_maker_password="Maker-Password-1",
+        maker_new_user=PendingEntityUserInput(
+            name="Scope Contractor Maker",
+            email="maker@scope.example.com",
+            password="Maker-Password-1",
+        ),
     ), admin, db)
-    maker = db.scalar(select(User).where(User.email == "maker@scope.example.com"))
-    assert contractor["contractor_maker_user_id"] == maker.id
+    maker = db.get(User, contractor["contractor_maker_user_id"])
     assert contractor["code"].startswith("CONTRACTOR-SCOPE-LABOUR-SERVICES")
     assert access.can_access_subject(db, maker, organization.id, "CONTRACTOR", contractor["id"])
     assert not access.can_access_subject(db, maker, organization.id, "UNIT", unit["id"])
@@ -338,40 +380,31 @@ def test_generated_codes_unit_types_and_contractor_maker_scope(db):
     assert single_login["user"]["contractor_context"]["selection_required"] is False
     assert single_login["user"]["contractor_context"]["active_contractor_id"] == contractor["id"]
 
-    second_contractor = Contractor(
-        organization_id=organization.id,
-        unit_id=unit["id"],
+    second_contractor = api.create_contractor(ContractorInput(
         name="Second Labour Services",
-        code="CONTRACTOR-SECOND-LABOUR",
-        status="ACTIVE",
-    )
-    db.add(second_contractor)
-    db.flush()
-    db.add(UserRoleScope(
-        user_id=maker.id,
-        role="CONTRACTOR_MAKER",
-        scope_type="CONTRACTOR",
-        scope_id=second_contractor.id,
-    ))
-    db.commit()
+        unit_id=unit["id"],
+        maker_user_id=maker.id,
+    ), admin, db)
+    assert second_contractor["contractor_maker_user_id"] == maker.id
+    assert db.scalar(select(User).where(User.email == maker.email)) == maker
 
     multiple_login = api.login(LoginRequest(email=maker.email, password="Maker-Password-1"), db)
     context = multiple_login["user"]["contractor_context"]
     assert context["selection_required"] is True
     assert context["active_contractor_id"] is None
-    assert {option["id"] for option in context["options"]} == {contractor["id"], second_contractor.id}
+    assert {option["id"] for option in context["options"]} == {contractor["id"], second_contractor["id"]}
     assert not access.can_access_subject(db, maker, organization.id, "CONTRACTOR", contractor["id"])
-    assert not access.can_access_subject(db, maker, organization.id, "CONTRACTOR", second_contractor.id)
+    assert not access.can_access_subject(db, maker, organization.id, "CONTRACTOR", second_contractor["id"])
 
     selected = api.select_contractor_context(
-        ContractorContextInput(contractor_id=second_contractor.id),
+        ContractorContextInput(contractor_id=second_contractor["id"]),
         maker,
         db,
     )
-    assert selected["contractor_context"]["active_contractor_id"] == second_contractor.id
+    assert selected["contractor_context"]["active_contractor_id"] == second_contractor["id"]
     assert selected["contractor_context"]["active_contractor_name"] == "Second Labour Services"
     assert not access.can_access_subject(db, maker, organization.id, "CONTRACTOR", contractor["id"])
-    assert access.can_access_subject(db, maker, organization.id, "CONTRACTOR", second_contractor.id)
+    assert access.can_access_subject(db, maker, organization.id, "CONTRACTOR", second_contractor["id"])
     switched_context = api.select_contractor_context(
         ContractorContextInput(contractor_id=contractor["id"]),
         maker,
@@ -379,7 +412,7 @@ def test_generated_codes_unit_types_and_contractor_maker_scope(db):
     )
     assert switched_context["contractor_context"]["active_contractor_id"] == contractor["id"]
     assert access.can_access_subject(db, maker, organization.id, "CONTRACTOR", contractor["id"])
-    assert not access.can_access_subject(db, maker, organization.id, "CONTRACTOR", second_contractor.id)
+    assert not access.can_access_subject(db, maker, organization.id, "CONTRACTOR", second_contractor["id"])
     with pytest.raises(HTTPException, match="not authorized"):
         api.select_contractor_context(ContractorContextInput(contractor_id="unauthorized-contractor"), maker, db)
     assert "CONTRACTOR_CONTEXT_SELECTED" in set(db.scalars(select(AuditLog.action)))

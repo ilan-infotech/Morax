@@ -33,7 +33,7 @@ try {
   $adminA = Api 'POST' '/users' @{ name = "$run Organization Admin"; email = $adminAEmail; password = 'Organization@123'; active = $true } $token
   Api 'PUT' "/users/$($adminA.id)/role-scopes" @(@{ role = 'ORGANIZATION_ADMIN'; scope_type = 'ORGANIZATION'; scope_id = $orgA.id }) $token | Out-Null
   Api 'POST' '/compliance-rules' @{ compliance_id = "$run-RULE"; name = "$run Rule"; version = 1; entity_type = 'UNIT'; state_id = $state.id; industry_type_id = $industry.id; frequency = 'MONTHLY'; due_date_rule = 'FIXED_DAY_OF_MONTH'; due_date_offset = 15; effective_from = $today; active = $true } $token | Out-Null
-  Api 'POST' '/compliance-generation/run' @{ subject_type = 'UNIT'; subject_id = $unitA.id; as_of_date = $today } $token | Out-Null
+  Api 'POST' '/compliance-generation/run' @{ organization_id = $orgA.id; subject_type = 'UNIT'; subject_id = $unitA.id; as_of_date = $today } $token | Out-Null
 
   Api 'POST' "/platform/organizations/$($orgB.id)/enter" $null $token | Out-Null
   $unitB = Api 'POST' '/units' @{ name = "$run Unit B"; code = "$run-B-UNIT"; state_id = $state.id; industry_type_id = $industry.id; compliance_start_date = $today; status = 'ACTIVE' } $token

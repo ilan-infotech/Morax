@@ -65,9 +65,6 @@ type EntityForm = {
   employer_name: string;
   applicable_regulations: string;
   compliance_types: string[];
-  contractor_maker_email: string;
-  contractor_maker_password: string;
-  contractor_maker_password_confirmation: string;
   male_employees: string;
   female_employees: string;
   male_workers: string;
@@ -126,9 +123,6 @@ const blankEntity = (): EntityForm => ({
   employer_name: "",
   applicable_regulations: "",
   compliance_types: [],
-  contractor_maker_email: "",
-  contractor_maker_password: "",
-  contractor_maker_password_confirmation: "",
   male_employees: "0",
   female_employees: "0",
   male_workers: "0",
@@ -164,12 +158,9 @@ const entitySchema = z.object({
   gstin: z.string().trim().refine((value) => !value || /^\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/i.test(value), "Enter a valid 15-character GSTIN"),
   pan: z.string().trim().refine((value) => !value || /^[A-Z]{5}\d{4}[A-Z]$/i.test(value), "Enter PAN in ABCDE1234F format"),
   lin: z.string(),
-  employer_name: z.string(),
+  employer_name: z.string().trim().max(250, "Employer Name must be 250 characters or fewer"),
   applicable_regulations: z.string(),
   compliance_types: z.array(z.string()),
-  contractor_maker_email: z.string(),
-  contractor_maker_password: z.string(),
-  contractor_maker_password_confirmation: z.string(),
   male_employees: z.string().regex(/^\d+$/, "Use a whole number"),
   female_employees: z.string().regex(/^\d+$/, "Use a whole number"),
   male_workers: z.string().regex(/^\d+$/, "Use a whole number"),
@@ -230,6 +221,8 @@ function asForm(row: Row): EntityForm {
       key,
       key === "compliance_types"
         ? (Array.isArray(row[key]) ? row[key].map(String) : fallback)
+        : key === "effective_date"
+          ? String(row.effective_date ?? row.compliance_start_date ?? fallback)
         : row[key] == null ? fallback : String(row[key]),
     ]),
   ) as EntityForm;
@@ -277,7 +270,6 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
   const [editing, setEditing] = useState<Row | null>(null);
   const [notice, setNotice] = useState("");
   const [entityAssignments, setEntityAssignments] = useState<FormAssignment[]>([]);
-  const [preservedContractorMakers, setPreservedContractorMakers] = useState<FormAssignment[]>([]);
   const [newUserOpen, setNewUserOpen] = useState(false);
   const [newEntityUser, setNewEntityUser] = useState<{
     name: string;
@@ -361,13 +353,29 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
   const selectedStateId = form.watch("state_id");
   const selectedPrincipalEmployerId = form.watch("unit_id");
   const selectedIndustryId = form.watch("industry_type_id");
-  const contractorMakerPasswordMismatch = kind === "contractors" && Boolean(form.watch("contractor_maker_password_confirmation")) && form.watch("contractor_maker_password") !== form.watch("contractor_maker_password_confirmation");
   const citiesQuery = useQuery({
     queryKey: ["cities", selectedStateId],
     queryFn: () => morax.cities(selectedStateId),
     enabled: Boolean(selectedStateId),
     staleTime: 5 * 60_000,
   });
+
+  useEffect(() => {
+    if (!formOpen || !editing || !citiesQuery.data?.length) return;
+    const savedCityId = String(editing.city_id ?? "");
+    if (savedCityId && citiesQuery.data.some((city) => city.id === savedCityId)) {
+      return;
+    }
+    const savedCityName = String(editing.city ?? "").trim().toLocaleLowerCase();
+    if (!savedCityName) return;
+    const matchingCity = citiesQuery.data.find(
+      (city) => city.name.trim().toLocaleLowerCase() === savedCityName,
+    );
+    if (matchingCity) {
+      form.setValue("city_id", matchingCity.id, { shouldValidate: true });
+      form.setValue("city", matchingCity.name);
+    }
+  }, [citiesQuery.data, editing, form, formOpen]);
   const otherIndustryId = optionsQuery.data?.industries.find(
     (industry) => industry.code.toUpperCase() === "OTHER",
   )?.id;
@@ -390,8 +398,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
       user_id: assignment.user_id,
       role: assignment.role,
     }));
-    setPreservedContractorMakers(kind === "contractors" ? assignments.filter((assignment) => assignment.role === "MAKER") : []);
-    setEntityAssignments(kind === "contractors" ? assignments.filter((assignment) => assignment.role !== "MAKER") : assignments);
+    setEntityAssignments(assignments);
   }, [entityAssignmentsQuery.data]);
 
   const invalidateEntities = async () => {
@@ -410,6 +417,10 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
         form.setError("compliance_types", { type: "required", message: "Select at least one Unit Compliance Type" });
         throw new Error("Select at least one Unit Compliance Type before saving.");
       }
+      if (kind === "units" && !values.employer_name.trim()) {
+        form.setError("employer_name", { type: "required", message: "Employer Name is required" });
+        throw new Error("Employer Name is required.");
+      }
       if (!values.state_id) {
         throw new Error("Select a State before saving");
       }
@@ -422,23 +433,21 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
       if (kind === "contractors" && !values.unit_id) {
         throw new Error("Select the Principal Employer before saving");
       }
-      if (kind === "contractors" && !editing && (!values.contractor_maker_email.trim() || !values.contractor_maker_password)) {
-        throw new Error("Contractor Maker email and password are required.");
-      }
-      if (kind === "contractors" && values.contractor_maker_password !== values.contractor_maker_password_confirmation) {
-        throw new Error("Contractor Maker password and Confirm password must match.");
-      }
       if (kind === "sites" && !values.contractor_id) {
         throw new Error("Select a contractor before saving");
+      }
+      if ((kind === "units" || kind === "contractors") && values.contact_email) {
+        const availability = await morax.emailAvailable(
+          values.contact_email,
+          kind === "units" ? "UNIT" : "CONTRACTOR",
+          editing ? String(editing.id) : undefined,
+        );
+        if (!availability.available) throw new Error("Email ID already exists.");
       }
       if (kind === "units" || kind === "contractors") {
         const roles = new Set([
           ...entityAssignments.map((assignment) => assignment.role),
-          ...(kind === "contractors" ? preservedContractorMakers.map((assignment) => assignment.role) : []),
         ]);
-        if (kind === "contractors" && values.contractor_maker_email.trim() && values.contractor_maker_password) {
-          roles.add("MAKER");
-        }
         const missing = (["MAKER", "CHECKER"] as AssignmentRole[]).filter((role) => !roles.has(role));
         if (missing.length) {
           throw new Error(`Assign at least one ${missing.map((role) => role[0] + role.slice(1).toLowerCase()).join(" and ")} before saving.`);
@@ -462,10 +471,22 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
           (person) => person.email.toLowerCase() === assignment.pending_user?.email.trim().toLowerCase(),
         );
         if (duplicate) {
-          throw new Error(`${assignment.pending_user.email} already has an account. Select the existing user instead.`);
+          throw new Error("Email ID already exists.");
+        }
+        const availability = await morax.emailAvailable(assignment.pending_user.email);
+        if (!availability.available) {
+          throw new Error("Email ID already exists.");
         }
       }
-      const body = requestBody(values, kind);
+      const body = requestBody(values, kind) as Record<string, unknown>;
+      if (kind === "contractors" && !editing) {
+        const makerAssignment = entityAssignments.find((assignment) => assignment.role === "MAKER");
+        if (makerAssignment?.pending_user) {
+          body.maker_new_user = makerAssignment.pending_user;
+        } else if (makerAssignment?.user_id) {
+          body.maker_user_id = makerAssignment.user_id;
+        }
+      }
       const id = editing ? String(editing.id) : "";
       let saved: Record<string, unknown>;
       if (kind === "units") {
@@ -487,15 +508,8 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
         assignments.push({ user_id: contractorMakerId, role: "MAKER" });
         assignmentKeys.add(`${contractorMakerId}:MAKER`);
       }
-      if (kind === "contractors") {
-        for (const assignment of preservedContractorMakers) {
-          if (assignment.user_id && !assignmentKeys.has(`${assignment.user_id}:MAKER`)) {
-            assignments.push({ user_id: assignment.user_id, role: "MAKER" });
-            assignmentKeys.add(`${assignment.user_id}:MAKER`);
-          }
-        }
-      }
       for (const assignment of entityAssignments) {
+        if (assignment.role === "MAKER" && contractorMakerId) continue;
         let userId = assignment.user_id;
         if (assignment.pending_user) {
           const email = assignment.pending_user.email.trim().toLowerCase();
@@ -606,7 +620,6 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
     setEditing(null);
     form.reset(blankEntity());
     setEntityAssignments([]);
-    setPreservedContractorMakers([]);
     setNewUserOpen(false);
     setNewEntityUserError("");
     setNewEntityUser({ name: "", email: "", mobile: "", password: "", password_confirmation: "", role: "MAKER" });
@@ -620,7 +633,6 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
       setEditing(row);
       form.reset(asForm(row));
       setEntityAssignments([]);
-      setPreservedContractorMakers([]);
       setNewUserOpen(false);
       setNewEntityUserError("");
       setContractorFiles({ WORK_ORDER: [], REGISTRATION_CERTIFICATE: [], PF: [], ESI: [], LABOUR_LICENCE: [] });
@@ -633,7 +645,6 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
     setEditing(null);
     form.reset(blankEntity());
     setEntityAssignments([]);
-    setPreservedContractorMakers([]);
     setNewUserOpen(false);
     setNewEntityUserError("");
     setNewEntityUser({ name: "", email: "", mobile: "", password: "", password_confirmation: "", role: "MAKER" });
@@ -740,12 +751,12 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
             <div className="entity-table-actions">
               <button
                 type="button"
-                className="icon-action"
-                title={`Edit ${meta.singular}`}
-                aria-label={`Edit ${meta.singular}`}
+                className="secondary compact-action"
+                title={`View/Edit ${meta.singular}`}
+                aria-label={`View/Edit ${meta.singular}`}
                 onClick={() => openEdit(row.original)}
               >
-                <Edit3 size={16} />
+                <Edit3 size={14} /> View/Edit
               </button>
               <button
                 type="button"
@@ -1239,8 +1250,8 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                   <Field label="LIN">
                     <input {...form.register("lin")} maxLength={30} />
                   </Field>
-                  <Field label="Employer name">
-                    <input {...form.register("employer_name")} maxLength={250} required={kind !== "contractors"} />
+                  <Field label="Employer Name" required={kind === "units"} error={form.formState.errors.employer_name?.message}>
+                    <input {...form.register("employer_name")} maxLength={250} required={kind === "units"} />
                   </Field>
                   <Field label="Effective date" required>
                     <input type="date" {...form.register("effective_date")} required />
@@ -1360,7 +1371,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                 <div className="form-section">
                   <h3>Assign users</h3>
                   <div className="assignment-role-grid">
-                    {((kind === "contractors" ? ["CHECKER", "ADMIN"] : ["MAKER", "CHECKER", "ADMIN"]) as AssignmentRole[]).map((role) => {
+                    {(["MAKER", "CHECKER", "ADMIN"] as AssignmentRole[]).map((role) => {
                       const assignment = entityAssignments.find((item) => item.role === role);
                       const title = role === "ADMIN" ? "Assign Admin (Optional)" : `Assign ${role[0]}${role.slice(1).toLowerCase()}`;
                       return <section className="assignment-role-card" key={role}>
@@ -1390,23 +1401,6 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                         </div>
                       </section>;
                     })}
-                  </div>
-                </div>
-              )}
-              {kind === "contractors" && !editing && (
-                <div className="form-section">
-                  <h3>Contractor Maker login</h3>
-                  <p className="muted">A restricted Contractor Maker account is required for every new Contractor.</p>
-                  <div className="form-grid">
-                    <Field label="Contractor Maker Email" required>
-                      <input type="email" required {...form.register("contractor_maker_email")} />
-                    </Field>
-                    <Field label="Contractor Maker Password" required>
-                      <PasswordInput minLength={8} autoComplete="new-password" required {...form.register("contractor_maker_password")} />
-                    </Field>
-                    <Field label="Confirm Contractor Maker Password" required error={contractorMakerPasswordMismatch ? "Password and Confirm password must match." : undefined}>
-                      <PasswordInput minLength={8} autoComplete="new-password" required {...form.register("contractor_maker_password_confirmation")} />
-                    </Field>
                   </div>
                 </div>
               )}
@@ -1535,10 +1529,20 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                   </div>
                   <form
                     className="entity-form"
-                    onSubmit={(event) => {
+                    onSubmit={async (event) => {
                       event.preventDefault();
                       if (newEntityUser.password !== newEntityUser.password_confirmation) {
                         setNewEntityUserError("Password and Confirm password must match.");
+                        return;
+                      }
+                      try {
+                        const availability = await morax.emailAvailable(newEntityUser.email);
+                        if (!availability.available) {
+                          setNewEntityUserError("Email ID already exists.");
+                          return;
+                        }
+                      } catch (error) {
+                        setNewEntityUserError(error instanceof Error ? error.message : "Could not validate the Email ID.");
                         return;
                       }
                       setNewEntityUserError("");

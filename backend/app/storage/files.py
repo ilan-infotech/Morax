@@ -6,7 +6,13 @@ from fastapi import HTTPException, UploadFile
 
 from app.core.config import settings
 
-ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".xlsx", ".xls", ".doc", ".docx"}
+# Compliance evidence is stored as an attachment only (never executed or
+# unpacked). CSV exports and ZIP bundles are common statutory evidence formats.
+ALLOWED_EXTENSIONS = {
+    ".pdf", ".png", ".jpg", ".jpeg",
+    ".xlsx", ".xls", ".csv",
+    ".doc", ".docx", ".zip",
+}
 
 
 async def save_upload(upload: UploadFile) -> tuple[str, int, str]:

@@ -16,6 +16,18 @@
   font-family: Inter, Roboto, "Outfit", ui-sans-serif, system-ui, sans-serif; 
   color: var(--color-foreground); 
   background: var(--color-background); 
+  /* Shared interactive states.  Brand green is reserved for primary actions;
+     light-surface controls use the accessible sage hover treatment. */
+  --morax-primary: #424B35;
+  --morax-primary-hover: #344C3B;
+  --morax-primary-foreground: #F5F5DC;
+  --morax-interactive-surface: #FFFFFF;
+  --morax-interactive-text: #234332;
+  --morax-interactive-hover-bg: #E8F1E7;
+  --morax-interactive-hover-border: #B9D0B7;
+  --morax-focus-ring: rgb(35 67 50 / 38%);
+  --morax-disabled-bg: #F1F4EF;
+  --morax-disabled-text: #6B756A;
 }
 
 * { box-sizing: border-box; }

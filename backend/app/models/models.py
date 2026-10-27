@@ -43,6 +43,9 @@ class Organization(Timestamped, Base):
     # A development reset must not be followed by the automatic QA demo seed
     # on the next application start.
     development_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Stored filename only.  The image remains behind the authenticated
+    # organization-profile endpoint rather than becoming a public URL.
+    logo_filename: Mapped[str | None] = mapped_column(String(255))
 
 
 class State(Base):
@@ -103,6 +106,9 @@ class Unit(Timestamped, Base):
     compliance_types_json: Mapped[str | None] = mapped_column(Text)
     male_employees: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     female_employees: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Operational start of the Unit. Kept separately from the date from which
+    # MORAX should generate compliance obligations.
+    effective_date: Mapped[date | None] = mapped_column(Date)
     compliance_start_date: Mapped[date] = mapped_column(Date, nullable=False)
     status: Mapped[str] = mapped_column(String(30), default="ACTIVE", nullable=False)
 
@@ -193,6 +199,7 @@ class User(Timestamped, Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     platform_role: Mapped[str | None] = mapped_column(String(40), index=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class UserActivation(Base):
@@ -301,6 +308,9 @@ class RuleApplicabilityCriteria(Base):
     state_id: Mapped[str | None] = mapped_column(ForeignKey("states.id"))
     industry_type_id: Mapped[str | None] = mapped_column(ForeignKey("industry_types.id"))
     employee_threshold: Mapped[int | None] = mapped_column(Integer)
+    # JSON list using the same controlled values as Unit.compliance_types_json.
+    # Empty means the rule is universal within its other applicability criteria.
+    unit_compliance_types_json: Mapped[str | None] = mapped_column(Text)
     applicability_flag: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     notes: Mapped[str | None] = mapped_column(Text)
 
@@ -456,6 +466,10 @@ class ComplianceWorkflowHistory(Base):
     from_status: Mapped[str | None] = mapped_column(String(40))
     to_status: Mapped[str | None] = mapped_column(String(40))
     comment: Mapped[str | None] = mapped_column(Text)
+    # The exact Maker submission revision being reviewed.  This prevents a
+    # later resubmission from changing the evidence context of an old Checker
+    # decision in history and audit screens.
+    submission_revision: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
@@ -480,9 +494,69 @@ class InAppNotification(Base):
     organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
     recipient_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
     notification_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    category: Mapped[str] = mapped_column(String(50), nullable=False, default="GENERAL", server_default="GENERAL", index=True)
+    event_type: Mapped[str | None] = mapped_column(String(80), index=True)
+    priority: Mapped[str] = mapped_column(String(20), nullable=False, default="NORMAL", server_default="NORMAL", index=True)
     title: Mapped[str] = mapped_column(String(250), nullable=False)
     body: Mapped[str | None] = mapped_column(Text)
+    entity_type: Mapped[str | None] = mapped_column(String(80))
+    entity_id: Mapped[str | None] = mapped_column(String(36))
     reference_type: Mapped[str | None] = mapped_column(String(80))
     reference_id: Mapped[str | None] = mapped_column(String(36))
+    compliance_period_key: Mapped[str | None] = mapped_column(String(40))
+    submission_revision: Mapped[int | None] = mapped_column(Integer)
+    # One logical event per recipient.  Scheduled reminder keys include their
+    # stage/date, so retrying a job never creates duplicate alerts.
+    event_key: Mapped[str | None] = mapped_column(String(255), index=True)
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SupportTicket(Timestamped, Base):
+    __tablename__ = "support_tickets"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    ticket_number: Mapped[str] = mapped_column(String(30), unique=True, nullable=False, index=True)
+    subject: Mapped[str] = mapped_column(String(250), nullable=False)
+    category: Mapped[str] = mapped_column(String(80), nullable=False)
+    # Why the ticket exists, distinct from the functional category.  Existing
+    # tickets are retained as OTHER during the migration rather than guessing
+    # their historical classification.
+    issue_type: Mapped[str] = mapped_column(String(30), nullable=False, default="OTHER", server_default="OTHER", index=True)
+    priority: Mapped[str] = mapped_column(String(20), nullable=False, default="MEDIUM")
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="OPEN", index=True)
+    creator_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    assigned_to_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), index=True)
+    last_activity_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SupportTicketMessage(Base):
+    __tablename__ = "support_ticket_messages"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    ticket_id: Mapped[str] = mapped_column(ForeignKey("support_tickets.id", ondelete="CASCADE"), nullable=False, index=True)
+    author_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SupportTicketAttachment(Base):
+    __tablename__ = "support_ticket_attachments"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    ticket_id: Mapped[str] = mapped_column(ForeignKey("support_tickets.id", ondelete="CASCADE"), nullable=False, index=True)
+    message_id: Mapped[str | None] = mapped_column(ForeignKey("support_ticket_messages.id", ondelete="CASCADE"))
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    stored_filename: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    content_type: Mapped[str | None] = mapped_column(String(150))
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    uploaded_by_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SupportTicketActivity(Base):
+    __tablename__ = "support_ticket_activities"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    ticket_id: Mapped[str] = mapped_column(ForeignKey("support_tickets.id", ondelete="CASCADE"), nullable=False, index=True)
+    actor_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+    action: Mapped[str] = mapped_column(String(80), nullable=False)
+    detail: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

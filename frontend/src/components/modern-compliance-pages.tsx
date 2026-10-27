@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ComponentType, FormEvent } from "react";
 import { Link, useParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   ArrowUpDown,
@@ -13,7 +13,6 @@ import {
   ClipboardCheck,
   ClipboardList,
   Download,
-  ExternalLink,
   Eye,
   FileText,
   FileUp,
@@ -25,6 +24,7 @@ import {
   Search,
   ShieldCheck,
   UserCheck,
+  Upload,
   X,
 } from "lucide-react";
 import {
@@ -69,6 +69,8 @@ const STATUS_COLORS = [
 ];
 
 const recurringFrequencies = [
+  "DAILY",
+  "WEEKLY",
   "MONTHLY",
   "QUARTERLY",
   "HALF_YEARLY",
@@ -85,6 +87,9 @@ const statusOptions = [
   "CORRECTION_REQUIRED",
   "REJECTED",
   "NOT_APPLICABLE",
+  "UPCOMING",
+  "DUE_SOON",
+  "DUE_TODAY",
   "OVERDUE",
 ];
 
@@ -445,6 +450,13 @@ const canCheckCompliance = (user?: User) =>
       ].includes(role),
     ));
 
+const canSubmitCompliance = (user?: User) =>
+  !!user &&
+  (user.platform_role === "MORAX_ADMIN" ||
+    user.roles.some((role) =>
+      ["ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER"].includes(role),
+    ));
+
 const isEditableCompliance = (item: Instance) =>
   !["APPROVED", "SUBMITTED", "UNDER_REVIEW", "NOT_APPLICABLE"].includes(item.status);
 
@@ -471,12 +483,16 @@ const recurringDateWindows = [
 ] as const;
 
 const recurringStatusLabels: Record<string, string> = {
-  DUE: "Due",
+  UPCOMING: "Upcoming",
+  DUE_SOON: "Due Soon",
+  DUE_TODAY: "Due Today",
   OVERDUE: "Overdue",
   COMPLETED: "Completed",
   COMPLETED_LATE: "Completed Late",
-  PENDING_FOR_APPROVAL: "Awaiting Approval",
-  REJECTED_BY_CHECKER: "Rejected",
+  SUBMITTED: "Awaiting Approval",
+  UNDER_REVIEW: "Under Review",
+  REJECTED: "Rejected",
+  NOT_APPLICABLE: "Not Applicable",
 };
 
 const daysFromToday = (value: string) => {
@@ -504,12 +520,16 @@ function ComplianceKpiCard({
   helper,
   tone,
   icon: Icon,
+  onClick,
+  active = false,
 }: {
   label: string;
   value: number | string;
   helper?: string;
   tone: "due" | "overdue" | "completed" | "late" | "rejected" | "approval" | "rate";
   icon: ComponentType<{ size?: number }>;
+  onClick?: () => void;
+  active?: boolean;
 }) {
   const isString = typeof value === "string";
   const numValue = isString ? parseFloat(value.replace(/[^0-9.]/g, "")) : (value as number);
@@ -525,23 +545,24 @@ function ComplianceKpiCard({
     }
   }, [numValue, count]);
 
-  return (
-    <article className={`compliance-kpi-card ${tone}`} style={{ padding: 0, border: "none" }}>
-      <SpecularCard style={{ display: "flex", gap: "1rem", alignItems: "center", padding: "1.1rem" }}>
-        <span className="compliance-kpi-icon" aria-hidden="true">
-          <Icon size={21} />
-        </span>
-        <div>
-          <strong>
-            {!isNaN(numValue) ? <motion.span>{rounded}</motion.span> : value}
-            {!isNaN(numValue) && suffix}
-          </strong>
-          <span className="compliance-kpi-label">{label}</span>
-          {helper && <small>{helper}</small>}
-        </div>
-      </SpecularCard>
-    </article>
-  );
+  const content = <SpecularCard style={{ display: "flex", gap: "1rem", alignItems: "center", padding: "1.1rem" }}>
+    <span className="compliance-kpi-icon" aria-hidden="true">
+      <Icon size={21} />
+    </span>
+    <div>
+      <strong>
+        {!isNaN(numValue) ? <motion.span>{rounded}</motion.span> : value}
+        {!isNaN(numValue) && suffix}
+      </strong>
+      <span className="compliance-kpi-label">{label}</span>
+      {helper && <small>{helper}</small>}
+    </div>
+  </SpecularCard>;
+  return onClick ? (
+    <button type="button" className={`compliance-kpi-card interactive ${tone} ${active ? "is-active" : ""}`} onClick={onClick} aria-pressed={active} aria-label={`${label}: ${value}. ${active ? "Clear" : "Apply"} table filter`} title={active ? "Clear this metric filter" : `Show ${label.toLowerCase()} records`}>
+      {content}
+    </button>
+  ) : <article className={`compliance-kpi-card ${tone}`} style={{ padding: 0, border: "none" }}>{content}</article>;
 }
 
 function RuleCountChip({
@@ -561,12 +582,20 @@ function RecurringRuleGroup({
   group,
   expanded,
   onToggle,
-  onOpen,
+  onView,
+  onSubmit,
+  onReview,
+  canSubmit,
+  canReview,
 }: {
   group: GroupedCompliance;
   expanded: boolean;
   onToggle: () => void;
-  onOpen: (item: Instance) => void;
+  onView: (item: Instance) => void;
+  onSubmit: (item: Instance) => void;
+  onReview: (item: Instance) => void;
+  canSubmit: boolean;
+  canReview: boolean;
 }) {
   const reference = group.records[0];
   const ruleReference = [reference?.act, reference?.rule_reference].filter(Boolean).join(" / ");
@@ -627,9 +656,17 @@ function RecurringRuleGroup({
                   <td><span className={`risk-label ${item.risk_level.toLowerCase()}`}>{humanize(item.risk_level)}</span></td>
                   <td><ComplianceStatusBadge status={item.display_status ?? item.status} /></td>
                   <td>
-                    <button className="icon-action open-compliance-action" type="button" onClick={() => onOpen(item)} aria-label={`Open ${item.compliance_name}`}>
+                    <div className="compliance-table-actions">
+                    <button className="icon-action open-compliance-action" type="button" onClick={() => onView(item)} aria-label={`View ${item.compliance_name}`} title="View compliance details">
                       <Eye size={16} />
                     </button>
+                    {canSubmit && isEditableCompliance(item) && <button className="icon-action submit-compliance-action" type="button" onClick={() => onSubmit(item)} aria-label={`Upload and submit ${item.compliance_name}`} title="Upload documents and submit">
+                      <Upload size={16} />
+                    </button>}
+                    {canReview && ["SUBMITTED", "UNDER_REVIEW"].includes(item.status) && <button className="icon-action review-compliance-action" type="button" onClick={() => onReview(item)} aria-label={`Review ${item.compliance_name}`} title="Review compliance submission">
+                      <ClipboardCheck size={16} />
+                    </button>}
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -641,22 +678,31 @@ function RecurringRuleGroup({
   );
 }
 
+type ComplianceDialogMode = "workflow" | "view" | "submit" | "review";
+
 function ComplianceActionDialog({
   item,
   onClose,
   detailPath,
   onUpdated,
+  mode = "workflow",
 }: {
   item: Instance | undefined;
   onClose: () => void;
   detailPath: string;
   onUpdated?: () => void | Promise<unknown>;
+  mode?: ComplianceDialogMode;
 }) {
+  // Retained in the component contract so existing callers do not need route
+  // changes; the direct dialog is now the complete review path.
+  void detailPath;
+  const queryClient = useQueryClient();
   const [notice, setNotice] = useState("");
   const [decisionNote, setDecisionNote] = useState("");
   const [comment, setComment] = useState("");
   const [category, setCategory] = useState("SUPPORTING_DOCUMENT");
   const [files, setFiles] = useState<File[]>([]);
+  const [uploadProgress, setUploadProgress] = useState("");
   const [verifyReason, setVerifyReason] = useState("");
   const [assignment, setAssignment] = useState({ maker: "", checker: "" });
   const [activityForm, setActivityForm] = useState({
@@ -665,7 +711,14 @@ function ComplianceActionDialog({
     amount: "",
     remarks: "",
   });
+  const [submissionForm, setSubmissionForm] = useState({
+    filing_reference: "",
+    completed_on: toDateInput(new Date()),
+    remarks: "",
+  });
   const [working, setWorking] = useState(false);
+  const [summaryExpanded, setSummaryExpanded] = useState(false);
+  const hydratedDetailId = useRef<string | null>(null);
 
   const detailQuery = useQuery({
     queryKey: ["compliance-instance-detail", item?.id],
@@ -700,13 +753,17 @@ function ComplianceActionDialog({
     setDecisionNote("");
     setComment("");
     setFiles([]);
+    setUploadProgress("");
     setVerifyReason("");
     setCategory("SUPPORTING_DOCUMENT");
+    setSummaryExpanded(false);
+    setSubmissionForm({ filing_reference: "", completed_on: toDateInput(new Date()), remarks: "" });
+    hydratedDetailId.current = null;
   }, [item?.id]);
 
   useEffect(() => {
     const detail = detailQuery.data;
-    if (!detail) return;
+    if (!detail || hydratedDetailId.current === detail.id) return;
     setActivityForm({
       filing_reference: detail.activity_reference ?? "",
       completed_on: detail.completed_on ?? "",
@@ -718,6 +775,12 @@ function ComplianceActionDialog({
       maker: activeAssignments.find((assignmentItem) => assignmentItem.assignment_type === "MAKER")?.user_id ?? "",
       checker: activeAssignments.find((assignmentItem) => assignmentItem.assignment_type === "CHECKER")?.user_id ?? "",
     });
+    setSubmissionForm({
+      filing_reference: detail.activity_reference ?? "",
+      completed_on: detail.completed_on ?? toDateInput(new Date()),
+      remarks: detail.remarks ?? "",
+    });
+    hydratedDetailId.current = detail.id;
   }, [detailQuery.data]);
 
   if (!item) return null;
@@ -729,35 +792,142 @@ function ComplianceActionDialog({
   const manager = canManageCompliance(user);
   const checker = canCheckCompliance(user);
   const activeAssignments = detail.assignments ?? [];
+  const latestReviewNote = [...(detail.history ?? [])]
+    .reverse()
+    .find((entry) => ["REJECT", "REQUEST_CORRECTION"].includes(entry.action) && entry.comment?.trim());
+  const latestSubmission = [...(detail.history ?? [])]
+    .reverse()
+    .find((entry) => entry.action === "SUBMIT");
   const assignedName = (type: "MAKER" | "CHECKER") =>
     people.find(
       (person) =>
         person.id ===
         activeAssignments.find((assignmentItem) => assignmentItem.assignment_type === type)?.user_id,
     )?.name ?? "Not assigned";
+  const submittedBy = latestSubmission?.actor_id
+    ? people.find((person) => person.id === latestSubmission.actor_id)?.name ?? "Assigned Maker"
+    : assignedName("MAKER");
   const documentType =
     documentTypeLabels[detail.document_type ?? ""] ?? humanize(detail.document_type ?? "PROCEDURAL");
   const actionSummary = detail.required_document
     ? `Prepare and upload: ${detail.required_document}`
     : detail.description || detail.legal_description || "Review the requirement and record the compliance activity.";
+  const description = snapshotText(detail, "description", "");
+  const instructions = snapshotText(detail, "legal_description", "");
+  const consequence = snapshotText(detail, "consequence_or_penalty", "");
+  // Compliance Master keeps the short Rule Description and the fuller legal
+  // Section text separately.  Preserve both in the Eye popup instead of
+  // duplicating Legal Description in two places.
+  const ruleDescription = description;
+  const summaryText = description || instructions || actionSummary;
+  const subjectContext = detail.subject_context;
+  const contextFacts = [
+    { label: "Unit", value: subjectContext?.unit_name || (detail.subject_type === "UNIT" ? detail.subject_name : "") },
+    { label: "Contractor", value: subjectContext?.contractor_name || (detail.subject_type === "CONTRACTOR" ? detail.subject_name : "") },
+    { label: "Site", value: subjectContext?.site_name || (detail.subject_type === "CONTRACTOR_SITE" ? detail.subject_name : "") },
+    { label: "State", value: subjectContext?.state_name || "" },
+    { label: "Period", value: detail.period_key },
+  ].filter((field) => field.value);
+  const hasSubmission = Boolean(latestSubmission || detail.submitted_at || detail.activity_reference || detail.evidence?.length);
+  const assignedMaker = assignedName("MAKER");
+  const assignedChecker = assignedName("CHECKER");
+  const hasAssignments = assignedMaker !== "Not assigned" || assignedChecker !== "Not assigned";
 
   const refreshDetail = async () => {
-    await detailQuery.refetch();
+    await Promise.all([
+      detailQuery.refetch(),
+      queryClient.invalidateQueries({ queryKey: ["dashboard-overview"] }),
+      queryClient.invalidateQueries({ queryKey: ["my-submissions"] }),
+      queryClient.invalidateQueries({ queryKey: ["grouped-compliance"] }),
+    ]);
     await onUpdated?.();
   };
 
   const act = async (call: () => Promise<unknown>, success: string) => {
+    // The centralized API client owns success toasts; retain the parameter for
+    // existing action call sites while avoiding a duplicate inline message.
+    void success;
     setWorking(true);
     setNotice("");
     try {
       await call();
-      setNotice(`Success: ${success}`);
       await refreshDetail();
+      return true;
     } catch (error) {
       setNotice(requestMessage(error, "Action failed"));
+      return false;
     } finally {
       setWorking(false);
     }
+  };
+
+  const submitCompliance = async () => {
+    if (!editable) {
+      setNotice("This compliance is not available for Maker submission in its current status.");
+      return;
+    }
+    if (!submissionForm.filing_reference.trim()) {
+      setNotice("Enter the filing or return reference before submitting this compliance.");
+      return;
+    }
+    if (detail.required_document && !detail.evidence?.length && !files.length) {
+      setNotice("Upload at least one supporting document before submitting this compliance.");
+      return;
+    }
+    if (!submissionForm.completed_on) {
+      setNotice("Enter the completion date before submitting this compliance.");
+      return;
+    }
+    if (submissionForm.completed_on > toDateInput(new Date())) {
+      setNotice("Completion date cannot be in the future.");
+      return;
+    }
+    setWorking(true);
+    setNotice("");
+    try {
+      setUploadProgress("Saving submission details...");
+      const savedActivity = await morax.activity(detail.id, {
+        filing_reference: submissionForm.filing_reference.trim(),
+        completed_on: submissionForm.completed_on,
+        amount: detail.amount ?? null,
+        remarks: submissionForm.remarks || null,
+        row_version: detail.row_version,
+      });
+      for (let index = 0; index < files.length; index += 1) {
+        setUploadProgress(`Uploading document ${index + 1} of ${files.length}...`);
+        await morax.evidence(detail.id, files[index], category);
+      }
+      setUploadProgress("Submitting compliance for Checker review...");
+      await morax.submit(detail.id, savedActivity.row_version);
+      setFiles([]);
+      setUploadProgress("");
+      await refreshDetail();
+      onClose();
+    } catch (error) {
+      setUploadProgress("");
+      setNotice(requestMessage(error, "Could not upload and submit compliance."));
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const addSubmissionFiles = (selectedFiles: File[]) => {
+    setFiles((currentFiles) => [
+      ...currentFiles,
+      ...selectedFiles.filter(
+        (selectedFile) =>
+          !currentFiles.some(
+            (currentFile) =>
+              currentFile.name === selectedFile.name &&
+              currentFile.size === selectedFile.size &&
+              currentFile.lastModified === selectedFile.lastModified,
+          ),
+      ),
+    ]);
+  };
+
+  const removeSubmissionFile = (fileIndex: number) => {
+    setFiles((currentFiles) => currentFiles.filter((_, index) => index !== fileIndex));
   };
 
   const verifyEvidence = async (evidence: Evidence, state: "VERIFIED" | "REJECTED") => {
@@ -786,29 +956,48 @@ function ComplianceActionDialog({
     );
   };
 
+  const decideSubmittedCompliance = async (target: "APPROVED" | "REJECTED") => {
+    if (target === "REJECTED" && !decisionNote.trim()) {
+      setNotice("Enter rejection remarks before rejecting this compliance.");
+      return;
+    }
+    const comment = decisionNote.trim() || "Approved";
+    const completed = await act(async () => {
+      // The backend keeps BEGIN_REVIEW in the audit trail, while the Checker
+      // gets one direct decision from the submitted-document popup.
+      const reviewing = detail.status === "SUBMITTED"
+        ? await morax.review(detail.id, { comment: "Review started", row_version: detail.row_version })
+        : detail;
+      return target === "APPROVED"
+        ? morax.approve(detail.id, { comment, row_version: reviewing.row_version })
+        : morax.reject(detail.id, { comment, row_version: reviewing.row_version });
+    }, target === "APPROVED" ? "Approved" : "Rejected");
+    if (completed) onClose();
+  };
+
   return (
     <div className="dialog-backdrop" onMouseDown={onClose} role="presentation">
       <section
-        className="compliance-dialog compliance-detail-dialog"
+        className={`compliance-dialog compliance-detail-dialog ${mode === "submit" || mode === "review" ? "compliance-submit-dialog" : mode === "view" ? "compliance-view-dialog" : ""}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby="compliance-dialog-title"
         onMouseDown={(event) => event.stopPropagation()}
       >
         <div className="dialog-header compliance-dialog-hero">
-          <div>
-            <p className="eyebrow">RECURRING COMPLIANCE</p>
+          {mode === "submit" || mode === "review" || mode === "view" ? <div className="submit-dialog-title">{mode === "submit" ? <FileUp size={18} /> : mode === "review" ? <ClipboardCheck size={18} /> : <Eye size={18} />}<h2 id="compliance-dialog-title">{mode === "view" ? "Compliance details" : mode === "submit" ? "Submit" : "Review"}{mode === "view" ? ` — ${detail.compliance_name}` : ` ${detail.compliance_name}`}</h2></div> : <div>
+            <p className="eyebrow">COMPLIANCE DETAILS</p>
             <h2 id="compliance-dialog-title">{detail.compliance_name}</h2>
             <p>
               {[detail.act, detail.rule_reference || detail.section].filter(Boolean).join(" / ") ||
                 detail.compliance_id}
             </p>
-          </div>
+          </div>}
           <button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog">
             <X size={18} />
           </button>
         </div>
-        <div className="dialog-status-row compliance-hero-meta">
+        {mode === "workflow" && <><div className="dialog-status-row compliance-hero-meta">
           <ComplianceStatusBadge status={detail.display_status ?? detail.status} />
           <span className={`risk-label ${detail.risk_level.toLowerCase()}`}>{humanize(detail.risk_level)}</span>
           <span className="dialog-pill">{humanize(detail.frequency)}</span>
@@ -830,6 +1019,7 @@ function ComplianceActionDialog({
             <p>{actionSummary}</p>
           </div>
         </div>
+        </>}
         <InlineError message={detailQuery.error instanceof Error ? detailQuery.error.message : ""} />
         <InlineError message={notice && !notice.startsWith("Success:") ? notice : ""} />
         {notice.startsWith("Success:") && <p className="alert success">{notice}</p>}
@@ -840,7 +1030,48 @@ function ComplianceActionDialog({
         ) : (
           <>
             <div className="compliance-dialog-body">
-              {true && (
+              {mode === "view" ? (
+                <div className="view-compliance-window">
+                  <section className="submit-rule-summary view-rule-summary">
+                    <h3>{detail.compliance_name}</h3>
+                    {detail.compliance_id && <small className="view-compliance-id">{detail.compliance_id}</small>}
+                    <div className="submit-status-chips">
+                      <ComplianceStatusBadge status={detail.display_status ?? detail.status} />
+                      <span className={`risk-label ${detail.risk_level.toLowerCase()}`}>{humanize(detail.risk_level)}</span>
+                      <span className="dialog-pill">{humanize(detail.frequency)}</span>
+                      {detail.compliance_type && <span className="view-compliance-type-pill">{detail.compliance_type}</span>}
+                    </div>
+                    {summaryText && <p className={summaryExpanded ? "view-summary-expanded" : ""}>{summaryText}</p>}
+                    {summaryText.length > 180 && <button className="view-show-more" type="button" onClick={() => setSummaryExpanded((current) => !current)}>{summaryExpanded ? "Show less" : "Show more"}</button>}
+                  </section>
+                  <section className="view-compliance-facts" aria-label="Compliance facts">
+                    <div className="view-fact-row context-row">
+                      {contextFacts.map((fact) => <div key={fact.label}><span>{fact.label}</span><b>{fact.value}</b></div>)}
+                    </div>
+                    <div className="view-fact-row legal-row">
+                      <div><span>Due date</span><b className={detail.is_overdue ? "overdue-text" : ""}>{formatDate(detail.due_date)}</b></div>
+                      {detail.form_number && <div><span>Form</span><b>{detail.form_number}</b></div>}
+                      {documentType && <div><span>Document type</span><b>{documentType}</b></div>}
+                      {detail.act && <div className="fact-wide"><span>Act</span><b>{detail.act}</b></div>}
+                    </div>
+                    {(detail.section || instructions) && <div className="view-section-copy"><span>Section</span>{detail.section && <b>{detail.section}</b>}{instructions && <p>{instructions}</p>}</div>}
+                    {detail.rule_reference && <div className="view-rule-reference"><span>Rule / legal reference</span><b>{detail.rule_reference}</b></div>}
+                    {hasAssignments && <div className="view-assignment-row"><span>Assigned to</span>{assignedMaker !== "Not assigned" && <b>Maker: {assignedMaker}</b>}{assignedChecker !== "Not assigned" && <b>Checker: {assignedChecker}</b>}</div>}
+                  </section>
+                  {detail.required_document && <details className="view-accordion" open><summary><ClipboardList size={14} /> Required action &amp; instructions</summary><p>{detail.required_document}</p></details>}
+                  {hasSubmission && <details className="view-accordion view-submission-accordion" open>
+                    <summary><FileUp size={14} /> Submission &amp; review</summary>
+                    <div className="view-submission-content">
+                      <p><b>{submittedBy}</b>{detail.submitted_at ? ` submitted ${new Date(detail.submitted_at).toLocaleString()}` : " submitted this compliance."}</p>
+                      {detail.activity_reference && <p>Filing / return reference: <b>{detail.activity_reference}</b></p>}
+                      {detail.remarks && <p>Maker remarks: {detail.remarks}</p>}
+                      {detail.evidence?.length ? <div className="view-evidence-links">{detail.evidence.map((evidence) => <button className="button-link" type="button" key={evidence.id} onClick={() => morax.downloadDocument(evidence.id, evidence.original_filename).catch((error) => setNotice(requestMessage(error)))}><Download size={14} />Download {(detail.evidence?.length ?? 0) === 1 ? "evidence" : evidence.original_filename}</button>)}</div> : <p className="muted">No supporting documents were attached.</p>}
+                    </div>
+                  </details>}
+                  {(detail.rule_reference || ruleDescription) && <details className="view-accordion"><summary><FileText size={14} /> Rule description</summary>{detail.rule_reference && <b className="view-rule-description-reference">{detail.rule_reference}</b>}{ruleDescription && <p>{ruleDescription}</p>}</details>}
+                  {consequence && <details className="view-accordion consequence"><summary><AlertTriangle size={14} /> Consequences of non-compliance</summary><p>{consequence}</p></details>}
+                </div>
+              ) : mode === "workflow" && (
                 <div className="dialog-section-grid">
                   <section className="dialog-section wide">
                     <h3>Requirement</h3>
@@ -872,6 +1103,10 @@ function ComplianceActionDialog({
                       <div><dt>Remarks</dt><dd>{detailText(detail.remarks)}</dd></div>
                     </dl>
                   </section>
+                  <section className="dialog-section wide">
+                    <h3><FileText size={16} /> Submitted evidence</h3>
+                    {detail.evidence?.length ? <div className="evidence-list compact-evidence-list">{detail.evidence.map((evidence) => <article className="evidence-card" key={evidence.id}><div><b>{evidence.original_filename}</b><small>{humanize(evidence.category)}{evidence.size_bytes ? ` · ${Math.ceil(evidence.size_bytes / 1024)} KB` : ""}</small></div><div className="dialog-action-row">{/\.(pdf|png|jpe?g)$/i.test(evidence.original_filename) && <button className="button-secondary" type="button" onClick={() => morax.previewDocument(evidence.id).catch((error) => setNotice(requestMessage(error)))}><Eye size={15} />Preview</button>}<button className="button-secondary" type="button" onClick={() => morax.downloadDocument(evidence.id, evidence.original_filename).catch((error) => setNotice(requestMessage(error)))}><Download size={15} />Download</button></div></article>)}</div> : <p className="muted">No supporting documents have been submitted.</p>}
+                  </section>
                   <section className="dialog-section">
                     <h3>Applicability</h3>
                     {Object.entries(detail.applicability?.matched ?? {}).length ? (
@@ -893,7 +1128,7 @@ function ComplianceActionDialog({
                 </div>
               )}
 
-              {true && (
+              {mode === "workflow" && (
                 <div className="dialog-section-grid">
                   {manager && (
                     <section className="dialog-section wide">
@@ -969,8 +1204,8 @@ function ComplianceActionDialog({
                       {detail.status === "UNDER_REVIEW" && checker && (
                         <>
                           <button disabled={working} type="button" onClick={() => act(() => morax.approve(detail.id, { comment: decisionNote || "Approved", row_version: detail.row_version }), "Approved")}>Approve</button>
-                          <button className="button-secondary" disabled={working} type="button" onClick={() => act(() => morax.correction(detail.id, { comment: decisionNote || "Correction required", row_version: detail.row_version }), "Returned for correction")}>Request correction</button>
-                          <button className="danger" disabled={working} type="button" onClick={() => act(() => morax.reject(detail.id, { comment: decisionNote || "Rejected", row_version: detail.row_version }), "Rejected")}>Reject</button>
+                          <button className="button-secondary" disabled={working} type="button" onClick={() => decisionNote.trim() ? act(() => morax.correction(detail.id, { comment: decisionNote.trim(), row_version: detail.row_version }), "Returned for correction") : setNotice("Enter remarks before returning this compliance for correction.")}>Request correction</button>
+                          <button className="danger" disabled={working} type="button" onClick={() => decisionNote.trim() ? act(() => morax.reject(detail.id, { comment: decisionNote.trim(), row_version: detail.row_version }), "Rejected") : setNotice("Enter rejection remarks before rejecting this compliance.")}>Reject</button>
                         </>
                       )}
                       {manager && editable && <button className="danger" disabled={working} type="button" onClick={() => decisionNote.trim() ? act(() => morax.notApplicable(detail.id, decisionNote.trim()), "Marked not applicable") : setNotice("Enter a reason before marking not applicable")}>Not applicable</button>}
@@ -980,7 +1215,133 @@ function ComplianceActionDialog({
                 </div>
               )}
 
-              {true && (
+              {mode === "review" ? (
+                <div className="submit-compliance-window">
+                  <section className="submit-rule-summary">
+                    <h3>{detail.compliance_name}</h3>
+                    <div className="submit-status-chips">
+                      <ComplianceStatusBadge status={detail.display_status ?? detail.status} />
+                      <span className={`risk-label ${detail.risk_level.toLowerCase()}`}>{humanize(detail.risk_level)}</span>
+                      <span className="dialog-pill">{humanize(detail.frequency)}</span>
+                    </div>
+                    <p>{detail.description || detail.legal_description || "Review the submitted obligation and supporting evidence."}</p>
+                  </section>
+                  <section className="submit-fact-grid" aria-label="Compliance review details">
+                    <div><span>Unit</span><b>{detail.subject_name}</b></div>
+                    <div><span>Period</span><b>{detail.period_key}</b></div>
+                    <div><span>Due date</span><b className={detail.is_overdue ? "overdue-text" : ""}>{formatDate(detail.due_date)}</b></div>
+                    <div><span>Form</span><b>{detail.form_number || "Not specified"}</b></div>
+                  </section>
+                  <section className="submit-legal-card">
+                    <span>Act</span><b>{detail.act || "Not provided"}</b>
+                    <span>Section / Rule</span><b>{detail.rule_reference || detail.section || "Not provided"}</b>
+                    <p>{snapshotText(detail, "legal_description")}</p>
+                  </section>
+                  <section className="dialog-section submit-compliance-section review-submission-section">
+                    <div className="submit-section-heading"><h3><FileUp size={16} /> Maker submission</h3><small>{detail.submitted_at ? `Submitted ${new Date(detail.submitted_at).toLocaleString()}` : "Submission date not available"}</small></div>
+                    <dl className="review-submission-grid">
+                      <div><dt>Submitted by</dt><dd>{submittedBy}</dd></div>
+                      <div><dt>Current status</dt><dd><ComplianceStatusBadge status={detail.status} /></dd></div>
+                      <div><dt>Filing / return reference</dt><dd>{detail.activity_reference || "Not provided"}</dd></div>
+                      <div><dt>Completion date</dt><dd>{formatDate(detail.completed_on || undefined)}</dd></div>
+                      <div className="wide"><dt>Maker remarks</dt><dd>{detail.remarks || "No remarks provided."}</dd></div>
+                    </dl>
+                  </section>
+                  <section className="dialog-section submit-compliance-section">
+                    <div className="submit-section-heading"><h3><FileText size={16} /> Submitted evidence</h3><small>{detail.evidence?.length ?? 0} document{detail.evidence?.length === 1 ? "" : "s"}</small></div>
+                    {detail.evidence?.length ? (
+                      <div className="evidence-list compact-evidence-list">
+                        {detail.evidence.map((evidence) => (
+                          <article className="evidence-card" key={evidence.id}>
+                            <div><b>{evidence.original_filename}</b><small>{humanize(evidence.category)} · {humanize(evidence.verification_state ?? "PENDING")}</small>{evidence.verification_reason && <small>Reason: {evidence.verification_reason}</small>}</div>
+                            <div className="dialog-action-row">
+                              {/\.(pdf|png|jpe?g)$/i.test(evidence.original_filename) && <button className="button-secondary" type="button" onClick={() => morax.previewDocument(evidence.id).catch((error) => setNotice(requestMessage(error)))}><Eye size={15} />Preview</button>}
+                              <button className="button-secondary" type="button" onClick={() => morax.downloadDocument(evidence.id, evidence.original_filename).catch((error) => setNotice(requestMessage(error)))}><Download size={15} />Download</button>
+                              {checker && evidence.verification_state !== "VERIFIED" && <button disabled={working} type="button" onClick={() => verifyEvidence(evidence, "VERIFIED")}>Verify</button>}
+                            </div>
+                          </article>
+                        ))}
+                      </div>
+                    ) : <EmptyState title="No uploaded documents" description="No supporting evidence was submitted with this compliance." icon={FileText} />}
+                  </section>
+                  <section className="dialog-section submit-compliance-section review-decision-section">
+                    <div className="submit-section-heading"><h3><ClipboardCheck size={16} /> Checker decision</h3><small>Approve, or reject with mandatory remarks.</small></div>
+                    <label className="review-remarks-label">Rejection remarks <span className="field-required">*</span><textarea rows={2} value={decisionNote} disabled={working} placeholder="Required only when rejecting this submission" onChange={(event) => setDecisionNote(event.target.value)} /></label>
+                  </section>
+                </div>
+              ) : mode === "submit" ? (
+                <div className="submit-compliance-window">
+                  {latestReviewNote && (
+                    <aside className="submission-review-note" role="note">
+                      <b>{latestReviewNote.action === "REJECT" ? "Checker rejection remarks" : "Checker correction remarks"}</b>
+                      <p>{latestReviewNote.comment}</p>
+                    </aside>
+                  )}
+                  <section className="submit-rule-summary">
+                    <h3>{detail.compliance_name}</h3>
+                    <div className="submit-status-chips">
+                      <ComplianceStatusBadge status={detail.display_status ?? detail.status} />
+                      <span className={`risk-label ${detail.risk_level.toLowerCase()}`}>{humanize(detail.risk_level)}</span>
+                      <span className="dialog-pill">{humanize(detail.frequency)}</span>
+                    </div>
+                    <p>{detail.description || detail.legal_description || "Complete the required obligation and attach supporting evidence."}</p>
+                  </section>
+                  <section className="submit-fact-grid" aria-label="Compliance submission details">
+                    <div><span>Unit</span><b>{detail.subject_name}</b></div>
+                    <div><span>Period</span><b>{detail.period_key}</b></div>
+                    <div><span>Due date</span><b className={detail.is_overdue ? "overdue-text" : ""}>{formatDate(detail.due_date)}</b></div>
+                    <div><span>Form</span><b>{detail.form_number || "Not specified"}</b></div>
+                  </section>
+                  <section className="submit-legal-card">
+                    <span>Act</span><b>{detail.act || "Not provided"}</b>
+                    <span>Section / Rule</span><b>{detail.rule_reference || detail.section || "Not provided"}</b>
+                    <p>{snapshotText(detail, "legal_description")}</p>
+                  </section>
+                  <details className="submit-consequence-card">
+                    <summary><AlertTriangle size={14} /> Consequences of non-compliance</summary>
+                    <p>{snapshotText(detail, "consequence_or_penalty", "No consequence is configured for this compliance.")}</p>
+                  </details>
+                  <section className="dialog-section submit-compliance-section">
+                    <div className="submit-section-heading"><h3><FileUp size={16} /> Submission</h3><small>Submission date: {formatDate(toDateInput(new Date()))}</small></div>
+                    <div className="dialog-form-grid compact evidence-upload-grid">
+                      <label>
+                        <span className="input-label">Filing / return reference <span className="field-required">*</span></span>
+                        <input value={submissionForm.filing_reference} maxLength={120} placeholder="Enter filing or return reference" disabled={working} onChange={(event) => setSubmissionForm({ ...submissionForm, filing_reference: event.target.value })} required />
+                        <small>Reference used for this compliance submission.</small>
+                      </label>
+                      <label>
+                        <span className="input-label">Completion date <span className="field-required">*</span></span>
+                        <input type="date" max={toDateInput(new Date())} value={submissionForm.completed_on} disabled={working} onChange={(event) => setSubmissionForm({ ...submissionForm, completed_on: event.target.value })} required />
+                        <small>Today or an earlier date.</small>
+                      </label>
+                      <label className="wide">
+                        <span className="input-label">Evidence documents {detail.required_document ? <span className="field-required">*</span> : null}</span>
+                        <input type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.xlsx,.xls,.csv,.doc,.docx,.zip" disabled={working} onChange={(event) => addSubmissionFiles(Array.from(event.target.files ?? []))} />
+                        <small>{files.length ? `${files.length} file${files.length === 1 ? "" : "s"} selected. You can select more files to add them.` : "PDF, images, Excel, CSV, Word, or ZIP."}</small>
+                      </label>
+                      <label className="wide">
+                        Submission remarks
+                        <textarea rows={2} placeholder="Add any relevant notes or comments..." value={submissionForm.remarks} disabled={working} onChange={(event) => setSubmissionForm({ ...submissionForm, remarks: event.target.value })} />
+                      </label>
+                    </div>
+                    {files.length ? (
+                      <div className="submission-file-list" aria-label="Selected evidence documents">
+                        {files.map((file, index) => (
+                          <span key={`${file.name}-${file.lastModified}-${file.size}`}>
+                            {file.name}
+                            <button type="button" disabled={working} onClick={() => removeSubmissionFile(index)} aria-label={`Remove ${file.name}`}>
+                              <X size={13} />
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
+                    {detail.required_document && <p className="required-document-note"><b>Required evidence:</b> {detail.required_document}</p>}
+                    {uploadProgress && <p className="upload-progress" role="status">{uploadProgress}</p>}
+                    {detail.evidence?.length ? <p className="muted">{detail.evidence.length} document{detail.evidence.length === 1 ? "" : "s"} already uploaded.</p> : null}
+                  </section>
+                </div>
+              ) : mode === "workflow" ? (
                 <div className="dialog-section-grid">
                   <section className="dialog-section wide">
                     <h3><FileUp size={16} /> Required documents / evidence</h3>
@@ -992,7 +1353,7 @@ function ComplianceActionDialog({
                       </label>
                       <label>
                         File
-                        <input type="file" multiple disabled={!editable || working} onChange={(event) => setFiles(Array.from(event.target.files ?? []))} />
+                        <input type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.xlsx,.xls,.csv,.doc,.docx,.zip" disabled={!editable || working} onChange={(event) => setFiles(Array.from(event.target.files ?? []))} />
                       </label>
                       <button className="button-secondary" disabled={!files.length || !editable || working} type="button" onClick={() => act(() => Promise.all(files.map((file) => morax.evidence(detail.id, file, category))), `${files.length} document(s) uploaded`)}>Upload documents</button>
                     </div>
@@ -1029,9 +1390,9 @@ function ComplianceActionDialog({
                     )}
                   </section>
                 </div>
-              )}
+              ) : null}
 
-              {true && (
+              {mode === "workflow" && (
                 <div className="dialog-section-grid">
                   <section className="dialog-section wide">
                     <h3><MessageSquare size={16} /> Comments</h3>
@@ -1079,11 +1440,10 @@ function ComplianceActionDialog({
           </>
         )}
         <div className="dialog-footer">
-          <button className="button-secondary" type="button" onClick={onClose}>Close</button>
-          <Link className="button-primary" to={detailPath} onClick={onClose}>
-            Full details page
-            <ExternalLink size={16} />
-          </Link>
+          <button className="button-secondary" type="button" onClick={onClose}>{mode === "submit" ? "Cancel" : "Close"}</button>
+          {mode === "submit" ? <button className="button-primary" disabled={working || !editable} type="button" onClick={submitCompliance}>
+            <Upload size={16} /> {working ? "Submitting..." : "Submit Compliance"}
+          </button> : mode === "review" && ["SUBMITTED", "UNDER_REVIEW"].includes(detail.status) ? <div className="dialog-action-row review-action-row"><button className="danger" disabled={working} type="button" onClick={() => decideSubmittedCompliance("REJECTED")}>Reject</button><button className="button-primary" disabled={working} type="button" onClick={() => decideSubmittedCompliance("APPROVED")}>{working ? "Saving..." : "Approve"}</button></div> : null}
         </div>
       </section>
     </div>
@@ -1094,6 +1454,8 @@ function GroupedRecurringWorklist() {
   const { organizationId } = useParams();
   const base = organizationId ? `/app/organizations/${organizationId}` : "/app";
   const [selected, setSelected] = useState<Instance>();
+  const [dialogMode, setDialogMode] = useState<ComplianceDialogMode>("view");
+  const currentUser = useQuery({ queryKey: ["current-user"], queryFn: () => morax.me(), staleTime: 60_000 });
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [page, setPage] = useState(1);
   const [filters, setFilters] = useState<WorklistFilters & { document_type: string; subject_id: string }>({
@@ -1158,9 +1520,13 @@ function GroupedRecurringWorklist() {
   const summary = data?.status_counts ?? {
     total: 0,
     due: 0,
+    upcoming: 0,
+    due_soon: 0,
+    due_today: 0,
     overdue: 0,
     completed: 0,
     completed_late: 0,
+    not_applicable: 0,
     rejected: 0,
     pending_approval: 0,
     compliance_rate: 0,
@@ -1239,11 +1605,11 @@ function GroupedRecurringWorklist() {
               <span className="rule-group-title"><span className="rule-group-icon"><Layers3 size={18} /></span><span>{group.name}</span><span className="rule-count">{group.compliance_count} compliance{group.compliance_count === 1 ? "" : "s"}</span></span>
               <span className="rule-group-meta"><span className={group.due_count ? "rule-due-count" : "rule-due-count clear"}>{group.due_count} due</span><ChevronDown size={19} className={isExpanded ? "chevron-up" : ""} /></span>
             </button>
-            {isExpanded && <div className="modern-table-wrap rule-records-table"><table className="modern-table"><thead><tr><th>Entity</th><th>Compliance type</th><th>Document type</th><th>Form no.</th><th>Frequency / period</th><th>Due date</th><th>Risk</th><th>Status</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>{group.records.map((item) => <tr key={item.id}><td><b>{item.subject_name}</b><small>{humanize(item.subject_type)}</small></td><td><b>{item.compliance_name}</b><small>{item.compliance_id}</small></td><td>{documentTypeLabels[item.document_type ?? ""] ?? humanize(item.document_type ?? "PROCEDURAL")}</td><td>{item.form_number || "—"}</td><td>{humanize(item.frequency)}<small>{item.period_key}</small></td><td><span className={item.is_overdue ? "table-due overdue" : "table-due"}>{formatDate(item.due_date)}<small>{item.is_overdue ? `${item.days_overdue}d overdue` : dueSoon(item) ? "Due soon" : ""}</small></span></td><td><span className={`risk-label ${item.risk_level.toLowerCase()}`}>{humanize(item.risk_level)}</span></td><td><ComplianceStatusBadge status={item.display_status ?? item.status} /></td><td><button className="icon-action" type="button" onClick={() => setSelected(item)} aria-label={`Open ${item.compliance_name}`}><Eye size={16} /></button></td></tr>)}</tbody></table></div>}
+            {isExpanded && <div className="modern-table-wrap rule-records-table"><table className="modern-table"><thead><tr><th>Entity</th><th>Compliance type</th><th>Document type</th><th>Form no.</th><th>Frequency / period</th><th>Due date</th><th>Risk</th><th>Status</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>{group.records.map((item) => <tr key={item.id}><td><b>{item.subject_name}</b><small>{humanize(item.subject_type)}</small></td><td><b>{item.compliance_name}</b><small>{item.compliance_id}</small></td><td>{documentTypeLabels[item.document_type ?? ""] ?? humanize(item.document_type ?? "PROCEDURAL")}</td><td>{item.form_number || "—"}</td><td>{humanize(item.frequency)}<small>{item.period_key}</small></td><td><span className={item.is_overdue ? "table-due overdue" : "table-due"}>{formatDate(item.due_date)}<small>{item.is_overdue ? `${item.days_overdue}d overdue` : dueSoon(item) ? "Due soon" : ""}</small></span></td><td><span className={`risk-label ${item.risk_level.toLowerCase()}`}>{humanize(item.risk_level)}</span></td><td><ComplianceStatusBadge status={item.display_status ?? item.status} /></td><td><div className="compliance-table-actions"><button className="icon-action" type="button" onClick={() => { setDialogMode("view"); setSelected(item); }} aria-label={`View ${item.compliance_name}`} title="View compliance details"><Eye size={16} /></button>{canSubmitCompliance(currentUser.data) && isEditableCompliance(item) && <button className="icon-action submit-compliance-action" type="button" onClick={() => { setDialogMode("submit"); setSelected(item); }} aria-label={`Upload and submit ${item.compliance_name}`} title="Upload documents and submit"><Upload size={16} /></button>}</div></td></tr>)}</tbody></table></div>}
           </article>;
         })}{totalPages > 1 && <div className="pagination-row"><span>Showing rule groups {(page - 1) * (data.page_size ?? 20) + 1}–{Math.min(page * (data.page_size ?? 20), data.total_rules)} of {data.total_rules}</span><div><button className="icon-button" type="button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page === 1} aria-label="Previous rule groups"><ChevronLeft size={17} /></button><span>Page {page} of {totalPages}</span><button className="icon-button" type="button" onClick={() => setPage((current) => Math.min(totalPages, current + 1))} disabled={page === totalPages} aria-label="Next rule groups"><ChevronRight size={17} /></button></div></div>}</div> : <EmptyState title="No recurring compliance records match" description="Try removing a filter or generate applicable obligations from the Compliance Master." icon={FileText} />}
       </DashboardSection>
-      <ComplianceActionDialog item={selected} onClose={() => setSelected(undefined)} detailPath={selected ? `${base}/compliances/detail/${selected.id}` : ""} onUpdated={() => grouped.refetch()} />
+      <ComplianceActionDialog item={selected} mode={dialogMode} onClose={() => setSelected(undefined)} detailPath={selected ? `${base}/compliances/detail/${selected.id}` : ""} onUpdated={() => grouped.refetch()} />
     </div>
   );
 }
@@ -1252,6 +1618,7 @@ function EnterpriseRecurringWorklist({ complianceArea }: { complianceArea?: "COM
   const { organizationId } = useParams();
   const base = organizationId ? `/app/organizations/${organizationId}` : "/app";
   const [selected, setSelected] = useState<Instance>();
+  const [dialogMode, setDialogMode] = useState<ComplianceDialogMode>("workflow");
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [page, setPage] = useState(1);
   const [filters, setFilters] = useState<WorklistFilters & { document_type: string; subject_id: string }>({
@@ -1261,7 +1628,7 @@ function EnterpriseRecurringWorklist({ complianceArea }: { complianceArea?: "COM
   const pendingApprovals = useQuery({
     queryKey: ["my-pending-approvals"],
     queryFn: () => morax.myPendingApprovals(),
-    enabled: Boolean(currentUser.data?.roles.some((role) => role === "UNIT_CHECKER" || role === "UNIT_ADMIN" || role === "ORGANIZATION_ADMIN")),
+    enabled: canCheckCompliance(currentUser.data),
     staleTime: 15_000,
   });
   const debouncedSearch = useDebouncedValue(filters.q.trim());
@@ -1319,7 +1686,7 @@ function EnterpriseRecurringWorklist({ complianceArea }: { complianceArea?: "COM
     staleTime: 20_000,
   });
   const data = grouped.data;
-  const summary = data?.status_counts ?? { total: 0, due: 0, overdue: 0, completed: 0, completed_late: 0, rejected: 0, pending_approval: 0, compliance_rate: 0 };
+  const summary = data?.status_counts ?? { total: 0, due: 0, upcoming: 0, due_soon: 0, due_today: 0, overdue: 0, completed: 0, completed_late: 0, not_applicable: 0, rejected: 0, pending_approval: 0, compliance_rate: 0 };
   const totalPages = Math.max(1, Math.ceil((data?.total_rules ?? 0) / (data?.page_size ?? 20)));
   const selectedEntity = entityOptions.find((item) => item.id === filters.subject_id);
   const activeFilters = [
@@ -1344,6 +1711,7 @@ function EnterpriseRecurringWorklist({ complianceArea }: { complianceArea?: "COM
     setPage(1);
     setFilters({ q: "", status: "", risk_level: "", entity_type: "", subject_id: "", frequency: "", due_window: "", document_type: "" });
   };
+  const toggleMetricStatus = (status: string) => updateFilter("status", filters.status === status ? "" : status);
   const removeFilter = (label: string) => {
     const fields: Record<string, keyof typeof filters> = {
       Status: "status", Risk: "risk_level", "Entity type": "entity_type", Entity: "subject_id", Frequency: "frequency",
@@ -1373,7 +1741,10 @@ function EnterpriseRecurringWorklist({ complianceArea }: { complianceArea?: "COM
               {pendingApprovals.data.items.map((item) => (
                 <article className="evidence-card" key={item.id}>
                   <div><b>{item.compliance_name}</b><small>{item.subject_name} · {item.period_key} · submitted for approval</small></div>
-                  <button type="button" onClick={() => setSelected(item)}>Review</button>
+                  <div className="compliance-table-actions">
+                    <button className="icon-action" type="button" onClick={() => { setDialogMode("view"); setSelected(item); }} aria-label={`View ${item.compliance_name}`} title="View compliance details"><Eye size={16} /></button>
+                    <button className="icon-action review-compliance-action" type="button" onClick={() => { setDialogMode("review"); setSelected(item); }} aria-label={`Review ${item.compliance_name}`} title="Review compliance submission"><ClipboardCheck size={16} /></button>
+                  </div>
                 </article>
               ))}
             </div>
@@ -1383,13 +1754,16 @@ function EnterpriseRecurringWorklist({ complianceArea }: { complianceArea?: "COM
       <InlineError message={grouped.error instanceof Error ? grouped.error.message : ""} />
 
       <section className="recurring-kpi-grid" aria-label="Recurring compliance health">
-        <ComplianceKpiCard label="Due" value={summary.due} helper="Open and not overdue" tone="due" icon={FileText} />
-        <ComplianceKpiCard label="Overdue" value={summary.overdue} helper="Past due date" tone="overdue" icon={AlertTriangle} />
-        <ComplianceKpiCard label="Completed" value={summary.completed} helper="Approved on time" tone="completed" icon={CheckCircle2} />
-        <ComplianceKpiCard label="Completed Late" value={summary.completed_late} helper="Approved after due date" tone="late" icon={CalendarClock} />
-        <ComplianceKpiCard label="Rejected" value={summary.rejected} helper="Rejected by checker" tone="rejected" icon={X} />
-        <ComplianceKpiCard label="Pending Approval" value={summary.pending_approval} helper="Submitted or in review" tone="approval" icon={ShieldCheck} />
-        <ComplianceKpiCard label="Compliance Rate" value={`${summary.compliance_rate}%`} helper={`${summary.total} matching records`} tone="rate" icon={CheckCircle2} />
+        <ComplianceKpiCard label="Upcoming" value={summary.upcoming} helper="More than 7 days remaining" tone="due" icon={FileText} onClick={() => toggleMetricStatus("UPCOMING")} active={filters.status === "UPCOMING"} />
+        <ComplianceKpiCard label="Due Soon" value={summary.due_soon} helper="Due within 7 days" tone="due" icon={CalendarClock} onClick={() => toggleMetricStatus("DUE_SOON")} active={filters.status === "DUE_SOON"} />
+        <ComplianceKpiCard label="Due Today" value={summary.due_today} helper="Deadline is today" tone="late" icon={AlertTriangle} onClick={() => toggleMetricStatus("DUE_TODAY")} active={filters.status === "DUE_TODAY"} />
+        <ComplianceKpiCard label="Overdue" value={summary.overdue} helper="Past due date" tone="overdue" icon={AlertTriangle} onClick={() => toggleMetricStatus("OVERDUE")} active={filters.status === "OVERDUE"} />
+        <ComplianceKpiCard label="Completed" value={summary.completed} helper="Approved on time" tone="completed" icon={CheckCircle2} onClick={() => toggleMetricStatus("COMPLETED")} active={filters.status === "COMPLETED"} />
+        <ComplianceKpiCard label="Completed Late" value={summary.completed_late} helper="Approved after due date" tone="late" icon={CalendarClock} onClick={() => toggleMetricStatus("COMPLETED_LATE")} active={filters.status === "COMPLETED_LATE"} />
+        <ComplianceKpiCard label="Not Applicable" value={summary.not_applicable} helper="Excluded with a recorded reason" tone="due" icon={FileText} onClick={() => toggleMetricStatus("NOT_APPLICABLE")} active={filters.status === "NOT_APPLICABLE"} />
+        <ComplianceKpiCard label="Rejected" value={summary.rejected} helper="Rejected by checker" tone="rejected" icon={X} onClick={() => toggleMetricStatus("REJECTED")} active={filters.status === "REJECTED"} />
+        <ComplianceKpiCard label="Pending Approval" value={summary.pending_approval} helper="Submitted or in review" tone="approval" icon={ShieldCheck} onClick={() => toggleMetricStatus("PENDING_APPROVAL")} active={filters.status === "PENDING_APPROVAL"} />
+        <ComplianceKpiCard label="Total matching" value={summary.total} helper="Clear the metric filter" tone="rate" icon={CheckCircle2} onClick={() => toggleMetricStatus("")} active={!filters.status} />
       </section>
 
       <DashboardSection title="Filters" className="filter-section recurring-filter-section" action={activeFilters.length ? <button className="button-secondary compact-action" type="button" onClick={clearFilters}><RefreshCw size={15} />Clear filters</button> : undefined}>
@@ -1397,7 +1771,7 @@ function EnterpriseRecurringWorklist({ complianceArea }: { complianceArea?: "COM
           <label className="search-control"><span>Search compliances...</span><Search size={16} aria-hidden="true" /><input value={filters.q} onChange={(event) => updateFilter("q", event.target.value)} placeholder="Search compliances..." /></label>
           <label>Entity Type<select value={filters.entity_type} onChange={(event) => updateFilter("entity_type", event.target.value)}><option value="">All</option>{["UNIT", "CONTRACTOR", "CONTRACTOR_SITE"].map((value) => <option value={value} key={value}>{humanize(value)}</option>)}</select></label>
           <label>Entity<select value={filters.subject_id} onChange={(event) => updateFilter("subject_id", event.target.value)} disabled={entities.isLoading}><option value="">All Entities</option>{entityOptions.map((item) => <option value={item.id} key={`${item.type}-${item.id}`}>{item.name}</option>)}</select></label>
-          <label>Status<select value={filters.status} onChange={(event) => updateFilter("status", event.target.value)}><option value="">All</option>{Object.entries(recurringStatusLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
+          <label>Status<select value={filters.status} onChange={(event) => updateFilter("status", event.target.value)}><option value="">All</option><option value="PENDING_ACTION">Pending action</option><option value="PENDING_APPROVAL">Pending approval</option>{Object.entries(recurringStatusLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
           <label>Risk Level<select value={filters.risk_level} onChange={(event) => updateFilter("risk_level", event.target.value)}><option value="">All</option>{["LOW", "MEDIUM", "HIGH", "CRITICAL"].map((value) => <option value={value} key={value}>{humanize(value)}</option>)}</select></label>
           <label>Frequency<select value={filters.frequency} onChange={(event) => updateFilter("frequency", event.target.value)}><option value="">All</option>{recurringFrequencies.map((value) => <option value={value} key={value}>{humanize(value)}</option>)}</select></label>
           <label>Date Range<select value={filters.due_window} onChange={(event) => updateFilter("due_window", event.target.value)}>{recurringDateWindows.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
@@ -1415,10 +1789,10 @@ function EnterpriseRecurringWorklist({ complianceArea }: { complianceArea?: "COM
         </div>
         {grouped.isLoading ? <LoadingSkeleton rows={7} /> : data?.groups.length ? <div className="rule-group-list">{data.groups.map((group) => {
           const isExpanded = expanded.has(group.id);
-          return <RecurringRuleGroup group={group} expanded={isExpanded} onToggle={() => toggleGroup(group.id)} onOpen={setSelected} key={group.id} />;
+          return <RecurringRuleGroup group={group} expanded={isExpanded} onToggle={() => toggleGroup(group.id)} onView={(item) => { setDialogMode("view"); setSelected(item); }} onSubmit={(item) => { setDialogMode("submit"); setSelected(item); }} onReview={(item) => { setDialogMode("review"); setSelected(item); }} canSubmit={canSubmitCompliance(currentUser.data)} canReview={canCheckCompliance(currentUser.data)} key={group.id} />;
         })}{totalPages > 1 && <div className="pagination-row"><span>Showing rule groups {(page - 1) * (data.page_size ?? 20) + 1}-{Math.min(page * (data.page_size ?? 20), data.total_rules)} of {data.total_rules}</span><div><button className="icon-button" type="button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page === 1} aria-label="Previous rule groups"><ChevronLeft size={17} /></button><span>Page {page} of {totalPages}</span><button className="icon-button" type="button" onClick={() => setPage((current) => Math.min(totalPages, current + 1))} disabled={page === totalPages} aria-label="Next rule groups"><ChevronRight size={17} /></button></div></div>}</div> : <EmptyState title="No recurring compliance records match" description="Try removing a filter or generate applicable obligations from the Compliance Master." icon={FileText} />}
       </DashboardSection>
-      <ComplianceActionDialog item={selected} onClose={() => setSelected(undefined)} detailPath={selected ? `${base}/compliances/detail/${selected.id}` : ""} onUpdated={() => Promise.all([grouped.refetch(), pendingApprovals.refetch()])} />
+      <ComplianceActionDialog item={selected} mode={dialogMode} onClose={() => setSelected(undefined)} detailPath={selected ? `${base}/compliances/detail/${selected.id}` : ""} onUpdated={() => Promise.all([grouped.refetch(), pendingApprovals.refetch()])} />
     </div>
   );
 }
@@ -1430,12 +1804,322 @@ export function ModernWorklist() {
   return kind === "recurring" ? <EnterpriseRecurringWorklist /> : <OneTimeWorklist />;
 }
 
+type SubmissionRow = Instance & {
+  submission_status?: string;
+  submitted_date?: string;
+  submitted_at?: string;
+  filed_late?: boolean;
+  submission_revision?: number;
+};
+
+export function MySubmissions() {
+  const { organizationId } = useParams();
+  const base = organizationId ? `/app/organizations/${organizationId}` : "/app";
+  const [selected, setSelected] = useState<Instance>();
+  const [dialogMode, setDialogMode] = useState<ComplianceDialogMode>("view");
+  const [filters, setFilters] = useState({ q: "", status: "", frequency: "", timeliness: "", risk_level: "", date_from: "", date_to: "", sort_by: "submitted_at", sort_dir: "desc", page: "1", page_size: "25" });
+  const query = useQuery({
+    queryKey: ["my-submissions", filters],
+    queryFn: () => morax.mySubmissions(filters),
+    refetchInterval: 15_000,
+  });
+  const data = query.data;
+  const summary = data?.summary ?? { all: 0, awaiting_review: 0, approved: 0, rejected: 0, filed_on_time: 0, filed_late: 0 };
+  const setFilter = (name: keyof typeof filters, value: string) => setFilters((current) => ({ ...current, [name]: value, ...(name !== "page" && name !== "page_size" ? { page: "1" } : {}) }));
+  const clearFilters = () => setFilters({ q: "", status: "", frequency: "", timeliness: "", risk_level: "", date_from: "", date_to: "", sort_by: "submitted_at", sort_dir: "desc", page: "1", page_size: "25" });
+  const toggleSort = (field: "compliance_name" | "due_date" | "submitted_at" | "risk_level" | "status") => setFilters((current) => ({ ...current, sort_by: field, sort_dir: current.sort_by === field && current.sort_dir === "desc" ? "asc" : "desc" }));
+  const metricFilter = (metric: "all" | "awaiting" | "approved" | "rejected" | "on-time" | "late") => {
+    const active = metric === "all"
+      ? !filters.status && !filters.timeliness
+      : metric === "awaiting" ? filters.status === "AWAITING_REVIEW"
+      : metric === "approved" ? filters.status === "APPROVED"
+      : metric === "rejected" ? filters.status === "REJECTED"
+      : metric === "on-time" ? filters.timeliness === "ON_TIME"
+      : filters.timeliness === "LATE";
+    setFilters((current) => active
+      ? { ...current, status: "", timeliness: "", page: "1" }
+      : {
+          ...current,
+          status: metric === "awaiting" ? "AWAITING_REVIEW" : metric === "approved" ? "APPROVED" : metric === "rejected" ? "REJECTED" : "",
+          timeliness: metric === "on-time" ? "ON_TIME" : metric === "late" ? "LATE" : "",
+          page: "1",
+        });
+  };
+  const totalPages = Math.max(1, Math.ceil((data?.total ?? 0) / Number(filters.page_size)));
+  const currentPage = Number(filters.page);
+  const status = (row: SubmissionRow) => row.submission_status ?? row.status;
+  const submissionDate = (row: SubmissionRow) => row.submitted_date ?? row.submitted_at;
+
+  return <div className="modern-page my-submissions-page">
+    <WorkspacePageHeader eyebrow="DASHBOARD / MY SUBMISSIONS" title="My submissions" description="Track every compliance filing sent by you for Checker review." actions={<div className="page-actions"><button className="button-secondary" type="button" onClick={() => setFilter("status", "REJECTED")}>Resubmit rejected</button><Link className="button-secondary" to={`${base}/dashboard`}>Dashboard</Link></div>} />
+    <section className="submission-summary-grid" aria-label="Submission summary">
+      {[
+        ["All submissions", summary.all, "all"], ["Awaiting review", summary.awaiting_review, "awaiting"], ["Approved", summary.approved, "approved"], ["Rejected", summary.rejected, "rejected"], ["Filed on time", summary.filed_on_time, "on-time"], ["Filed late", summary.filed_late, "late"],
+      ].map(([label, value, tone]) => {
+        const metric = tone as "all" | "awaiting" | "approved" | "rejected" | "on-time" | "late";
+        const active = metric === "all" ? !filters.status && !filters.timeliness : metric === "awaiting" ? filters.status === "AWAITING_REVIEW" : metric === "approved" ? filters.status === "APPROVED" : metric === "rejected" ? filters.status === "REJECTED" : metric === "on-time" ? filters.timeliness === "ON_TIME" : filters.timeliness === "LATE";
+        return <button className={`submission-summary-card ${tone} ${active ? "is-active" : ""}`} type="button" key={String(label)} aria-pressed={active} title={active ? "Clear this metric filter" : `Show ${String(label).toLowerCase()}`} onClick={() => metricFilter(metric)}><b>{value}</b><span>{label}</span></button>;
+      })}
+    </section>
+    <DashboardSection title="Submission history" description={`${data?.total ?? 0} submission${(data?.total ?? 0) === 1 ? "" : "s"}`}>
+      <div className="my-submissions-filters">
+        <label className="search-control"><span>Search</span><Search size={16} /><input value={filters.q} onChange={(event) => setFilter("q", event.target.value)} placeholder="Compliance, act, rule, document type..." /></label>
+        <label>Status<select value={filters.status} onChange={(event) => setFilter("status", event.target.value)}><option value="">All statuses</option><option value="AWAITING_REVIEW">Awaiting review</option><option value="APPROVED">Approved</option><option value="REJECTED">Rejected</option><option value="CORRECTION_REQUIRED">Correction required</option></select></label>
+        <label>Compliance<select value={filters.frequency} onChange={(event) => setFilter("frequency", event.target.value)}><option value="">Recurring + one-time</option><option value="ONE_TIME">One-time</option><option value="MONTHLY">Recurring</option><option value="QUARTERLY">Recurring</option><option value="YEARLY">Recurring</option></select></label>
+        <label>Timeliness<select value={filters.timeliness} onChange={(event) => setFilter("timeliness", event.target.value)}><option value="">On time + late</option><option value="ON_TIME">Filed on time</option><option value="LATE">Filed late</option></select></label>
+        <label>Risk<select value={filters.risk_level} onChange={(event) => setFilter("risk_level", event.target.value)}><option value="">All risks</option>{["LOW", "MEDIUM", "HIGH", "CRITICAL"].map((value) => <option value={value} key={value}>{humanize(value)}</option>)}</select></label>
+        <label>From<input type="date" value={filters.date_from} onChange={(event) => setFilter("date_from", event.target.value)} /></label>
+        <label>To<input type="date" value={filters.date_to} onChange={(event) => setFilter("date_to", event.target.value)} /></label>
+        <button className="button-secondary compact-action" type="button" onClick={clearFilters}>Clear filters</button>
+      </div>
+      <InlineError message={query.error instanceof Error ? "Unable to load submission history. Please try again." : ""} />
+      <div className="modern-table-wrap"><table className="modern-table"><thead><tr><th><button type="button" onClick={() => toggleSort("compliance_name")}>Compliance</button></th><th><button type="button" onClick={() => toggleSort("due_date")}>Due</button></th><th><button type="button" onClick={() => toggleSort("submitted_at")}>Submitted</button></th><th><button type="button" onClick={() => toggleSort("risk_level")}>Risk</button></th><th><button type="button" onClick={() => toggleSort("status")}>Status</button></th><th>Actions</th></tr></thead><tbody>{query.isLoading ? <tr><td colSpan={6}><LoadingSkeleton rows={3} /></td></tr> : (data?.items as SubmissionRow[] | undefined)?.length ? (data?.items as SubmissionRow[]).map((row) => <tr key={row.id}><td><b>{row.compliance_name}</b><small>{[row.act, row.rule_reference || row.section].filter(Boolean).join(" / ") || row.compliance_id}</small></td><td>{formatDate(row.due_date)}</td><td>{formatDate(submissionDate(row))}<small>{row.filed_late ? "Filed late" : "Filed on time"}</small></td><td><span className={`risk-label ${row.risk_level.toLowerCase()}`}>{humanize(row.risk_level)}</span></td><td><ComplianceStatusBadge status={status(row)} /></td><td><div className="compliance-table-actions"><button className="icon-action" type="button" title="View submission" aria-label={`View ${row.compliance_name}`} onClick={() => { setDialogMode("view"); setSelected(row); }}><Eye size={16} /></button>{["REJECTED", "CORRECTION_REQUIRED"].includes(status(row)) && <button className="icon-action submit-compliance-action" type="button" title="Correct and resubmit" aria-label={`Resubmit ${row.compliance_name}`} onClick={() => { setDialogMode("submit"); setSelected(row); }}><Upload size={16} /></button>}{row.evidence?.[0] && <button className="icon-action" type="button" title="Download latest supporting document" aria-label={`Download evidence for ${row.compliance_name}`} onClick={() => morax.downloadDocument(row.evidence![0].id, row.evidence![0].original_filename)}><Download size={16} /></button>}</div></td></tr>) : <tr><td colSpan={6} className="empty-table-message">You have not submitted anything yet.</td></tr>}</tbody></table></div>
+      <div className="pagination-row"><label>Show <select value={filters.page_size} onChange={(event) => setFilter("page_size", event.target.value)}>{[10, 25, 50].map((value) => <option value={value} key={value}>{value}</option>)}</select> entries</label><span>Showing {data?.total ? (currentPage - 1) * Number(filters.page_size) + 1 : 0} to {Math.min(currentPage * Number(filters.page_size), data?.total ?? 0)} of {data?.total ?? 0}</span><div><button className="button-secondary" type="button" disabled={currentPage <= 1} onClick={() => setFilter("page", String(currentPage - 1))}>Previous</button><button className="button-secondary" type="button" disabled={currentPage >= totalPages} onClick={() => setFilter("page", String(currentPage + 1))}>Next</button></div></div>
+    </DashboardSection>
+    <ComplianceActionDialog item={selected} mode={dialogMode} onClose={() => setSelected(undefined)} detailPath={selected ? `${base}/compliances/detail/${selected.id}` : ""} onUpdated={() => query.refetch()} />
+  </div>;
+}
+
+type CheckerQueueRow = Instance & {
+  submitted_at?: string | null;
+  submitted_by_name?: string;
+  waiting_days?: number;
+  submission_revision?: number | null;
+};
+
+type CheckerHistoryRow = CheckerQueueRow & {
+  decision: "APPROVED" | "REJECTED";
+  review_action: string;
+  review_remarks?: string | null;
+  reviewed_at: string;
+  review_duration_hours?: number | null;
+};
+
+function EvidenceDownloadPicker({
+  items,
+  onClose,
+}: {
+  items: Evidence[] | undefined;
+  onClose: () => void;
+}) {
+  if (!items) return null;
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+    <section className="dialog compliance-evidence-picker" role="dialog" aria-modal="true" aria-label="Download evidence" onMouseDown={(event) => event.stopPropagation()}>
+      <div className="dialog-header"><div><p className="eyebrow">SUBMISSION EVIDENCE</p><h2>Download supporting documents</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close"><X size={18} /></button></div>
+      <div className="evidence-list compact-evidence-list">{items.length ? items.map((evidence) => <article className="evidence-card" key={evidence.id}><div><b>{evidence.original_filename}</b><small>{humanize(evidence.category)}{evidence.size_bytes ? ` · ${Math.ceil(evidence.size_bytes / 1024)} KB` : ""}</small></div><button className="button-secondary" type="button" onClick={() => morax.downloadDocument(evidence.id, evidence.original_filename)}><Download size={15} />Download</button></article>) : <EmptyState title="No uploaded documents" description="The Maker did not attach supporting evidence to this submission." icon={FileText} />}</div>
+      <div className="dialog-footer"><button className="button-secondary" type="button" onClick={onClose}>Close</button></div>
+    </section>
+  </div>;
+}
+
+function CheckerActionButtons({
+  item,
+  onView,
+  onReview,
+  onDownload,
+}: {
+  item: CheckerQueueRow;
+  onView: () => void;
+  onReview: () => void;
+  onDownload: () => void;
+}) {
+  return <div className="compliance-table-actions">
+    <button className="icon-action open-compliance-action" type="button" title="View compliance details" aria-label={`View ${item.compliance_name}`} onClick={onView}><Eye size={16} /></button>
+    <button className="icon-action review-compliance-action" type="button" title="Review submission" aria-label={`Review ${item.compliance_name}`} onClick={onReview}><ClipboardCheck size={16} /></button>
+    <button className="icon-action" type="button" title="Download evidence" aria-label={`Download evidence for ${item.compliance_name}`} onClick={onDownload}><Download size={16} /></button>
+  </div>;
+}
+
+function useEvidenceDownload() {
+  const [choices, setChoices] = useState<Evidence[] | undefined>();
+  const [downloadError, setDownloadError] = useState("");
+  const download = async (item: Instance) => {
+    setDownloadError("");
+    try {
+      const detail = await morax.instance(item.id);
+      const evidence = detail.evidence ?? [];
+      if (evidence.length === 1) {
+        await morax.downloadDocument(evidence[0].id, evidence[0].original_filename);
+      } else {
+        setChoices(evidence);
+      }
+    } catch (error) {
+      setDownloadError(requestMessage(error, "Unable to download supporting documents."));
+    }
+  };
+  return { choices, closeChoices: () => setChoices(undefined), download, downloadError };
+}
+
+function useCheckerEntityOptions() {
+  const currentUser = useQuery({ queryKey: ["current-user"], queryFn: () => morax.me(), staleTime: 60_000 });
+  const entities = useQuery({
+    queryKey: ["checker-authorized-entities"],
+    queryFn: async () => {
+      const [units, contractors] = await Promise.all([morax.units(), morax.contractors()]);
+      return { units: units.items, contractors };
+    },
+    enabled: Boolean(currentUser.data),
+    staleTime: 60_000,
+  });
+  const options = useMemo(() => {
+    const activeContractorId = currentUser.data?.contractor_context?.enabled
+      ? currentUser.data.contractor_context.active_contractor_id
+      : undefined;
+    const scopes = (currentUser.data?.scopes ?? []).filter((scope) =>
+      scope.role.endsWith("_CHECKER")
+      && ["UNIT", "CONTRACTOR"].includes(scope.scope_type)
+      // Contractor-only sessions are intentionally limited to the active
+      // contractor context selected through the existing workspace switcher.
+      && (!activeContractorId || scope.scope_type !== "CONTRACTOR" || scope.scope_id === activeContractorId),
+    );
+    const unitNames = new Map((entities.data?.units ?? []).map((unit) => [String(unit.id), String(unit.name ?? "Unit")]));
+    const contractorNames = new Map((entities.data?.contractors ?? []).map((contractor) => [String(contractor.id), String(contractor.name ?? contractor.legal_name ?? "Contractor")]));
+    return scopes.map((scope) => ({
+      id: scope.scope_id,
+      type: scope.scope_type,
+      name: scope.scope_type === "UNIT" ? unitNames.get(scope.scope_id) : contractorNames.get(scope.scope_id),
+    })).filter((option): option is { id: string; type: string; name: string } => Boolean(option.name));
+  }, [currentUser.data, entities.data]);
+  return { options, isLoading: currentUser.isLoading || entities.isLoading };
+}
+
+function CheckerDashboard() {
+  const { organizationId } = useParams();
+  const base = organizationId ? `/app/organizations/${organizationId}` : "/app";
+  const [selected, setSelected] = useState<CheckerQueueRow>();
+  const [dialogMode, setDialogMode] = useState<ComplianceDialogMode>("review");
+  const { options: checkerEntities, isLoading: checkerEntitiesLoading } = useCheckerEntityOptions();
+  const [subjectId, setSubjectId] = useState("");
+  useEffect(() => { if (checkerEntities.length && !checkerEntities.some((entity) => entity.id === subjectId)) setSubjectId(checkerEntities[0].id); }, [checkerEntities, subjectId]);
+  const reviewReady = !checkerEntitiesLoading && (!checkerEntities.length || Boolean(subjectId));
+  const pending = useQuery({ queryKey: ["checker-dashboard-pending", subjectId], queryFn: () => morax.myPendingApprovals({ page_size: "100", subject_id: subjectId }), enabled: reviewReady, refetchInterval: 20_000 });
+  const selectedEntity = checkerEntities.find((entity) => entity.id === subjectId);
+  const overviewFilters: Record<string, string> = selectedEntity ? selectedEntity.type === "UNIT" ? { unit_id: subjectId } : { contractor_id: subjectId } : {};
+  const overview = useQuery({ queryKey: ["checker-dashboard-overview", subjectId], queryFn: () => morax.dashboardOverview(overviewFilters), enabled: reviewReady, refetchInterval: 30_000 });
+  const history = useQuery({ queryKey: ["checker-dashboard-history"], queryFn: () => morax.myReviewHistory({ page_size: "100" }), refetchInterval: 20_000 });
+  const { choices, closeChoices, download, downloadError } = useEvidenceDownload();
+  const pendingRows = (pending.data?.items ?? []) as CheckerQueueRow[];
+  const reviewSummary = history.data?.summary ?? { total_reviewed: 0, approved: 0, rejected: 0 };
+  const complianceSummary = overview.data?.summary;
+  const riskRows = ["HIGH", "MEDIUM", "LOW"].map((risk) => ({ name: humanize(risk), value: pendingRows.filter((row) => row.risk_level === risk).length }));
+  const statusRows = [
+    { name: "Pending review", value: pendingRows.length },
+    { name: "Approved by me", value: reviewSummary.approved },
+    { name: "Rejected by me", value: reviewSummary.rejected },
+  ].filter((row) => row.value > 0);
+  const refresh = () => Promise.all([pending.refetch(), history.refetch(), overview.refetch()]);
+
+  return <div className="modern-page checker-dashboard-page">
+    <WorkspacePageHeader eyebrow="CHECKER WORKSPACE" title="Compliance review dashboard" description="Review only Maker submissions assigned to your authorized entity. Decisions and documents remain linked to the correct compliance period." actions={<div className="page-actions">{checkerEntities.length > 1 && <label className="compact-entity-selector">Entity<select value={subjectId} onChange={(event) => setSubjectId(event.target.value)}>{checkerEntities.map((entity) => <option key={`${entity.type}-${entity.id}`} value={entity.id}>{entity.name}</option>)}</select></label>}<Link className="button-primary" to={`${base}/pending-reviews`}><ClipboardCheck size={16} />Pending reviews</Link><Link className="button-secondary" to={`${base}/review-history`}><History size={16} />My review history</Link></div>} />
+    <InlineError message={pending.error instanceof Error ? "Unable to load your review queue. Please try again." : downloadError} />
+    <section className="dashboard-metric-grid checker-summary-grid" aria-label="Checker review summary">
+      <DashboardMetricCard label="Awaiting my review" value={pending.data?.summary.pending_review ?? 0} helper="Assigned Maker submissions" tone="warning" />
+      <DashboardMetricCard label="Waiting over 3 days" value={pending.data?.summary.pending_more_than_3_days ?? 0} helper="Prioritize these reviews" tone="critical" />
+      <DashboardMetricCard label="Upcoming compliance" value={complianceSummary?.upcoming ?? 0} helper="More than 7 days to deadline" tone="attention" />
+      <DashboardMetricCard label="Due this month" value={(complianceSummary?.due_today ?? 0) + (complianceSummary?.due_soon ?? 0)} helper="Due today or within 7 days" tone="attention" />
+      <DashboardMetricCard label="Overdue compliance" value={complianceSummary?.overdue ?? 0} helper="Authorized entity scope" tone="critical" />
+      <DashboardMetricCard label="Rejected — awaiting resubmission" value={complianceSummary?.rejected ?? 0} helper="Maker correction required" tone="critical" />
+      <DashboardMetricCard label="Approved by me" value={reviewSummary.approved} helper="All retained decisions" tone="success" />
+      <DashboardMetricCard label="Rejected by me" value={reviewSummary.rejected} helper="Corrections requested" tone="critical" />
+      <DashboardMetricCard label="Completed compliance" value={complianceSummary?.completed ?? 0} helper={`${complianceSummary?.completion_rate ?? 0}% compliance health`} tone="success" />
+      <DashboardMetricCard label="Total reviewed" value={reviewSummary.total_reviewed} helper="Approval and rejection history" />
+    </section>
+    <section className="dashboard-layout dashboard-two-column">
+      <DashboardSection title="Review queue status" description="Live queue and your completed decisions.">
+        {statusRows.length ? <ResponsiveContainer width="100%" height={230}><PieChart><Pie data={statusRows} dataKey="value" nameKey="name" innerRadius={62} outerRadius={90} paddingAngle={3}>{statusRows.map((entry, index) => <Cell key={entry.name} fill={STATUS_COLORS[index]} />)}</Pie><Tooltip /></PieChart></ResponsiveContainer> : <EmptyState title="No review activity yet" description="Maker submissions assigned to you will appear here." icon={ClipboardCheck} />}
+      </DashboardSection>
+      <DashboardSection title="Pending by risk" description="Use risk to prioritize review work.">
+        <ResponsiveContainer width="100%" height={230}><BarChart data={riskRows}><XAxis dataKey="name" /><YAxis allowDecimals={false} /><Tooltip /><Bar dataKey="value" fill="#2A3620" radius={[5, 5, 0, 0]} /></BarChart></ResponsiveContainer>
+      </DashboardSection>
+    </section>
+    <DashboardSection title="Latest review queue" description="Open a submission directly; no nested details screen is required." action={<Link className="text-button" to={`${base}/pending-reviews`}>View all</Link>}>
+      {pending.isLoading ? <LoadingSkeleton rows={4} /> : pendingRows.length ? <div className="modern-table-wrap"><table className="modern-table"><thead><tr><th>Compliance</th><th>Due date</th><th>Submitted by</th><th>Waiting</th><th>Actions</th></tr></thead><tbody>{pendingRows.slice(0, 6).map((row) => <tr key={row.id}><td><b>{row.compliance_name}</b><small>{[row.act, row.rule_reference].filter(Boolean).join(" / ")}</small></td><td>{formatDate(row.due_date)}</td><td>{row.submitted_by_name ?? "Maker"}<small>{formatDate(row.submitted_at ?? undefined)}</small></td><td>{row.waiting_days ?? 0} day{row.waiting_days === 1 ? "" : "s"}</td><td><CheckerActionButtons item={row} onView={() => { setDialogMode("view"); setSelected(row); }} onReview={() => { setDialogMode("review"); setSelected(row); }} onDownload={() => void download(row)} /></td></tr>)}</tbody></table></div> : <EmptyState title="No submissions awaiting your review" description="New submissions will appear automatically when a Maker submits an assigned compliance." icon={ClipboardCheck} />}
+    </DashboardSection>
+    <ComplianceActionDialog item={selected} mode={dialogMode} onClose={() => setSelected(undefined)} detailPath={selected ? `${base}/compliances/detail/${selected.id}` : ""} onUpdated={refresh} />
+    <EvidenceDownloadPicker items={choices} onClose={closeChoices} />
+  </div>;
+}
+
+export function PendingReviews() {
+  const { organizationId } = useParams();
+  const base = organizationId ? `/app/organizations/${organizationId}` : "/app";
+  const [filters, setFilters] = useState({ q: "", status: "", risk_level: "", frequency: "", date_from: "", date_to: "", waiting_over_days: "", page: "1", page_size: "25" });
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const [selected, setSelected] = useState<CheckerQueueRow>();
+  const [dialogMode, setDialogMode] = useState<ComplianceDialogMode>("review");
+  const { options: checkerEntities, isLoading: checkerEntitiesLoading } = useCheckerEntityOptions();
+  const [subjectId, setSubjectId] = useState("");
+  useEffect(() => { if (checkerEntities.length && !checkerEntities.some((entity) => entity.id === subjectId)) setSubjectId(checkerEntities[0].id); }, [checkerEntities, subjectId]);
+  const reviewReady = !checkerEntitiesLoading && (!checkerEntities.length || Boolean(subjectId));
+  const pending = useQuery({ queryKey: ["checker-pending-reviews", filters, subjectId], queryFn: () => morax.myPendingApprovals({ ...filters, subject_id: subjectId }), enabled: reviewReady, refetchInterval: 15_000 });
+  const { choices, closeChoices, download, downloadError } = useEvidenceDownload();
+  const rows = (pending.data?.items ?? []) as CheckerQueueRow[];
+  const groups = useMemo(() => {
+    const result = new Map<string, { name: string; rows: CheckerQueueRow[] }>();
+    rows.forEach((row) => {
+      const key = row.rule_id || row.rule_reference || row.compliance_id;
+      const current = result.get(key) ?? { name: row.rule_name || row.rule_reference || row.compliance_name, rows: [] };
+      current.rows.push(row);
+      result.set(key, current);
+    });
+    return [...result.entries()].map(([id, group]) => ({ id, ...group }));
+  }, [rows]);
+  const updateFilter = (key: keyof typeof filters, value: string) => setFilters((current) => ({ ...current, [key]: value, ...(key === "page" || key === "page_size" ? {} : { page: "1" }) }));
+  const clearFilters = () => setFilters({ q: "", status: "", risk_level: "", frequency: "", date_from: "", date_to: "", waiting_over_days: "", page: "1", page_size: "25" });
+  const toggleQueueMetric = (status = "", waiting_over_days = "") => setFilters((current) => current.status === status && current.waiting_over_days === waiting_over_days ? { ...current, status: "", waiting_over_days: "", page: "1" } : { ...current, status, waiting_over_days, page: "1" });
+  const refresh = () => pending.refetch();
+  const totalPages = Math.max(1, Math.ceil((pending.data?.total ?? 0) / Number(filters.page_size)));
+  const currentPage = Number(filters.page);
+  const toggleGroup = (id: string) => setExpanded((current) => { const next = new Set(current); next.has(id) ? next.delete(id) : next.add(id); return next; });
+  return <div className="modern-page pending-reviews-page">
+    <WorkspacePageHeader eyebrow="COMPLIANCE / CHECKER" title="Pending reviews" description="Review compliance documents submitted by Makers assigned to you." actions={<div className="page-actions">{checkerEntities.length > 1 && <label className="compact-entity-selector">Entity<select value={subjectId} onChange={(event) => setSubjectId(event.target.value)}>{checkerEntities.map((entity) => <option key={`${entity.type}-${entity.id}`} value={entity.id}>{entity.name}</option>)}</select></label>}<Link className="button-secondary" to={`${base}/review-history`}><History size={16} />My review history</Link></div>} />
+    <section className="dashboard-metric-grid checker-summary-grid"><DashboardMetricCard label="Total submitted" value={pending.data?.total ?? 0} helper="Your active review queue" onClick={() => toggleQueueMetric()} active={!filters.status && !filters.waiting_over_days} /><DashboardMetricCard label="Pending review" value={pending.data?.summary.pending_review ?? 0} helper="Awaiting your decision" tone="warning" onClick={() => toggleQueueMetric()} active={!filters.status && !filters.waiting_over_days} /><DashboardMetricCard label="Over 3 days" value={pending.data?.summary.pending_more_than_3_days ?? 0} helper="Needs priority" tone="critical" onClick={() => toggleQueueMetric("", "3")} active={filters.waiting_over_days === "3"} /><DashboardMetricCard label="Overdue" value={pending.data?.summary.overdue ?? 0} helper="In your review queue" tone="critical" onClick={() => toggleQueueMetric("OVERDUE")} active={filters.status === "OVERDUE"} /></section>
+    <DashboardSection title="Filters" description="Search and filters apply together." className="filter-section" action={<button className="button-secondary compact-action" type="button" onClick={clearFilters}><RefreshCw size={15} />Clear filters</button>}>
+      <div className="filter-grid grouped-filter-grid"><label className="search-control"><span>Search</span><Search size={16} /><input value={filters.q} onChange={(event) => updateFilter("q", event.target.value)} placeholder="Compliance, Act, Rule, or Maker" /></label><label>Status<select value={filters.status} onChange={(event) => updateFilter("status", event.target.value)}><option value="">All pending statuses</option><option value="SUBMITTED">Submitted</option><option value="UNDER_REVIEW">Under review</option><option value="OVERDUE">Overdue</option></select></label><label>Risk level<select value={filters.risk_level} onChange={(event) => updateFilter("risk_level", event.target.value)}><option value="">All risk levels</option>{["LOW", "MEDIUM", "HIGH", "CRITICAL"].map((item) => <option key={item} value={item}>{humanize(item)}</option>)}</select></label><label>Frequency<select value={filters.frequency} onChange={(event) => updateFilter("frequency", event.target.value)}><option value="">All frequencies</option>{recurringFrequencies.map((item) => <option key={item} value={item}>{humanize(item)}</option>)}</select></label><label>Due from<input type="date" value={filters.date_from} onChange={(event) => updateFilter("date_from", event.target.value)} /></label><label>Due to<input type="date" value={filters.date_to} onChange={(event) => updateFilter("date_to", event.target.value)} /></label></div>
+    </DashboardSection>
+    <InlineError message={pending.error instanceof Error ? "Unable to load pending reviews. Please try again." : downloadError} />
+    <DashboardSection title="Compliances — Grouped by Rule" description={`${pending.data?.total ?? 0} submission${(pending.data?.total ?? 0) === 1 ? "" : "s"} awaiting your review`} className="grouped-compliance-section" action={<div className="group-actions"><button className="button-secondary compact-action" type="button" onClick={() => setExpanded(new Set(groups.map((group) => group.id)))} disabled={!groups.length}>Expand all</button><button className="button-secondary compact-action" type="button" onClick={() => setExpanded(new Set())} disabled={!expanded.size}>Collapse all</button></div>}>
+      {pending.isLoading ? <LoadingSkeleton rows={7} /> : groups.length ? <div className="rule-group-list">{groups.map((group) => { const open = expanded.has(group.id); return <article className={`rule-group ${open ? "expanded" : ""}`} key={group.id}><button className="rule-group-header" type="button" onClick={() => toggleGroup(group.id)} aria-expanded={open}><span className="rule-group-title"><span className="rule-group-icon"><Layers3 size={18} /></span><span>{group.name}</span><span className="rule-count">{group.rows.length} submission{group.rows.length === 1 ? "" : "s"}</span></span><span className="rule-group-meta"><span className="rule-due-count">{group.rows.length} awaiting</span><ChevronDown size={19} className={open ? "chevron-up" : ""} /></span></button>{open && <div className="modern-table-wrap rule-records-table"><table className="modern-table"><thead><tr><th>Compliance type</th><th>Document type</th><th>Form no.</th><th>Frequency</th><th>Due date</th><th>Risk</th><th>Status</th><th>Submitted by</th><th>Actions</th></tr></thead><tbody>{group.rows.map((row) => <tr key={row.id}><td><b>{row.compliance_name}</b><small>{row.compliance_id}</small></td><td>{documentTypeLabels[row.document_type ?? ""] ?? humanize(row.document_type ?? "PROCEDURAL")}</td><td>{row.form_number || "—"}</td><td>{humanize(row.frequency)}<small>{row.period_key}</small></td><td><span className={row.is_overdue ? "table-due overdue" : "table-due"}>{formatDate(row.due_date)}<small>{row.waiting_days ? `${row.waiting_days}d waiting` : "New"}</small></span></td><td><span className={`risk-label ${row.risk_level.toLowerCase()}`}>{humanize(row.risk_level)}</span></td><td><ComplianceStatusBadge status="AWAITING_REVIEW" /></td><td>{row.submitted_by_name || "Maker"}<small>{formatDate(row.submitted_at ?? undefined)}</small></td><td><CheckerActionButtons item={row} onView={() => { setDialogMode("view"); setSelected(row); }} onReview={() => { setDialogMode("review"); setSelected(row); }} onDownload={() => void download(row)} /></td></tr>)}</tbody></table></div>}</article>; })}</div> : <EmptyState title="No submissions await your review" description="New Maker submissions assigned to you will appear here automatically." icon={ClipboardCheck} />}
+      <div className="pagination-row"><label>Show <select value={filters.page_size} onChange={(event) => updateFilter("page_size", event.target.value)}>{[10, 25, 50].map((size) => <option key={size} value={size}>{size}</option>)}</select> entries</label><span>Showing {pending.data?.total ? (currentPage - 1) * Number(filters.page_size) + 1 : 0} to {Math.min(currentPage * Number(filters.page_size), pending.data?.total ?? 0)} of {pending.data?.total ?? 0}</span><div><button className="button-secondary" type="button" disabled={currentPage <= 1} onClick={() => updateFilter("page", String(currentPage - 1))}>Previous</button><button className="button-secondary" type="button" disabled={currentPage >= totalPages} onClick={() => updateFilter("page", String(currentPage + 1))}>Next</button></div></div>
+    </DashboardSection>
+    <ComplianceActionDialog item={selected} mode={dialogMode} onClose={() => setSelected(undefined)} detailPath={selected ? `${base}/compliances/detail/${selected.id}` : ""} onUpdated={refresh} />
+    <EvidenceDownloadPicker items={choices} onClose={closeChoices} />
+  </div>;
+}
+
+export function MyReviewHistory() {
+  const { organizationId } = useParams();
+  const base = organizationId ? `/app/organizations/${organizationId}` : "/app";
+  const [filters, setFilters] = useState({ q: "", decision: "", date_from: "", date_to: "", sort_by: "reviewed_at", sort_dir: "desc", page: "1", page_size: "25" });
+  const [selected, setSelected] = useState<CheckerHistoryRow>();
+  const history = useQuery({ queryKey: ["checker-review-history", filters], queryFn: () => morax.myReviewHistory(filters), refetchInterval: 20_000 });
+  const { choices, closeChoices, download, downloadError } = useEvidenceDownload();
+  const rows = (history.data?.items ?? []) as CheckerHistoryRow[];
+  const summary = history.data?.summary ?? { total_reviewed: 0, approved: 0, rejected: 0, average_review_hours: 0 };
+  const updateFilter = (key: keyof typeof filters, value: string) => setFilters((current) => ({ ...current, [key]: value, ...(key === "page" || key === "page_size" ? {} : { page: "1" }) }));
+  const toggleDecisionMetric = (decision = "") => updateFilter("decision", filters.decision === decision ? "" : decision);
+  const currentPage = Number(filters.page);
+  const totalPages = Math.max(1, Math.ceil((history.data?.total ?? 0) / Number(filters.page_size)));
+  return <div className="modern-page review-history-page"><WorkspacePageHeader eyebrow="COMPLIANCE / CHECKER" title="My review history" description="Every approval, rejection, and correction decision made by you is retained here." actions={<Link className="button-secondary" to={`${base}/pending-reviews`}><ClipboardCheck size={16} />Pending reviews</Link>} />
+    <section className="dashboard-metric-grid checker-summary-grid"><DashboardMetricCard label="Total reviewed" value={summary.total_reviewed} helper="Your final decisions" onClick={() => toggleDecisionMetric()} active={!filters.decision} /><DashboardMetricCard label="Approved by me" value={summary.approved} helper="Completed submissions" tone="success" onClick={() => toggleDecisionMetric("APPROVED")} active={filters.decision === "APPROVED"} /><DashboardMetricCard label="Rejected by me" value={summary.rejected} helper="Corrections required" tone="critical" onClick={() => toggleDecisionMetric("REJECTED")} active={filters.decision === "REJECTED"} /><DashboardMetricCard label="Average review time" value={`${summary.average_review_hours}h`} helper="Submission to final decision" tone="attention" /></section>
+    <DashboardSection title="Review history" description={`${history.data?.total ?? 0} decision${(history.data?.total ?? 0) === 1 ? "" : "s"}`} className="filter-section"><div className="filter-grid grouped-filter-grid"><label className="search-control"><span>Search</span><Search size={16} /><input value={filters.q} onChange={(event) => updateFilter("q", event.target.value)} placeholder="Compliance, Act, Rule, or entity" /></label><label>Decision<select value={filters.decision} onChange={(event) => updateFilter("decision", event.target.value)}><option value="">All decisions</option><option value="APPROVED">Approved</option><option value="REJECTED">Rejected / correction</option></select></label><label>Sort by<select value={filters.sort_by} onChange={(event) => updateFilter("sort_by", event.target.value)}><option value="reviewed_at">Reviewed date</option><option value="submitted_at">Submitted date</option><option value="compliance_name">Compliance name</option><option value="decision">Decision</option><option value="review_duration">Review duration</option></select></label><label>Direction<select value={filters.sort_dir} onChange={(event) => updateFilter("sort_dir", event.target.value)}><option value="desc">Newest first</option><option value="asc">Oldest first</option></select></label><label>Reviewed from<input type="date" value={filters.date_from} onChange={(event) => updateFilter("date_from", event.target.value)} /></label><label>Reviewed to<input type="date" value={filters.date_to} onChange={(event) => updateFilter("date_to", event.target.value)} /></label><button className="button-secondary compact-action" type="button" onClick={() => setFilters({ q: "", decision: "", date_from: "", date_to: "", sort_by: "reviewed_at", sort_dir: "desc", page: "1", page_size: "25" })}>Clear filters</button></div></DashboardSection>
+    <InlineError message={history.error instanceof Error ? "Unable to load review history. Please try again." : downloadError} />
+    <DashboardSection title="Decisions" className="grouped-compliance-section">{history.isLoading ? <LoadingSkeleton rows={5} /> : rows.length ? <div className="modern-table-wrap"><table className="modern-table"><thead><tr><th>Compliance</th><th>Entity</th><th>Period</th><th>Submitted by</th><th>Reviewed</th><th>Decision</th><th>Review remarks</th><th>Actions</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.id}-${row.reviewed_at}-${row.review_action}`}><td><b>{row.compliance_name}</b><small>{[row.act, row.rule_reference].filter(Boolean).join(" / ")}</small></td><td>{row.subject_name}</td><td>{row.period_key}</td><td>{row.submitted_by_name}<small>{formatDate(row.submitted_at ?? undefined)}</small></td><td>{formatDate(row.reviewed_at)}</td><td><ComplianceStatusBadge status={row.decision} /></td><td>{row.review_remarks || "—"}</td><td><CheckerActionButtons item={row} onView={() => setSelected(row)} onReview={() => setSelected(row)} onDownload={() => void download(row)} /></td></tr>)}</tbody></table></div> : <EmptyState title="No review decisions yet" description="Your approvals and rejections will remain available here." icon={History} />}<div className="pagination-row"><label>Show <select value={filters.page_size} onChange={(event) => updateFilter("page_size", event.target.value)}>{[10, 25, 50].map((size) => <option key={size} value={size}>{size}</option>)}</select> entries</label><span>Showing {history.data?.total ? (currentPage - 1) * Number(filters.page_size) + 1 : 0} to {Math.min(currentPage * Number(filters.page_size), history.data?.total ?? 0)} of {history.data?.total ?? 0}</span><div><button className="button-secondary" disabled={currentPage <= 1} type="button" onClick={() => updateFilter("page", String(currentPage - 1))}>Previous</button><button className="button-secondary" disabled={currentPage >= totalPages} type="button" onClick={() => updateFilter("page", String(currentPage + 1))}>Next</button></div></div></DashboardSection>
+    <ComplianceActionDialog item={selected} mode="view" onClose={() => setSelected(undefined)} detailPath={selected ? `${base}/compliances/detail/${selected.id}` : ""} />
+    <EvidenceDownloadPicker items={choices} onClose={closeChoices} />
+  </div>;
+}
+
+export { CheckerDashboard };
+
 function OneTimeWorklist() {
   const { kind, organizationId } = useParams();
   const base = organizationId ? `/app/organizations/${organizationId}` : "/app";
   const isOneTime = kind === "one-time";
   const [items, setItems] = useState<Instance[]>([]);
   const [selected, setSelected] = useState<Instance>();
+  const [dialogMode, setDialogMode] = useState<ComplianceDialogMode>("view");
+  const currentUser = useQuery({ queryKey: ["current-user"], queryFn: () => morax.me(), staleTime: 60_000 });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [filters, setFilters] = useState<WorklistFilters>({
@@ -1566,6 +2250,7 @@ function OneTimeWorklist() {
       due_window: "",
     });
   };
+  const toggleWorklistMetric = (status = "") => updateFilter("status", filters.status === status ? "" : status);
   const toggleSort = (field: "due_date" | "status" | "risk_level") => {
     setPage(1);
     if (field === sort) setSortAscending((current) => !current);
@@ -1594,11 +2279,11 @@ function OneTimeWorklist() {
       <InlineError message={error} />
 
       <section className="worklist-summary" aria-label="Worklist overview">
-        <DashboardMetricCard label="Total" value={visibleItems.length} helper="Matching obligations" />
-        <DashboardMetricCard label="Completed" value={completed} helper="Approved obligations" tone="success" />
-        <DashboardMetricCard label="Open" value={open} helper="Requires workflow action" tone="warning" />
-        <DashboardMetricCard label="Overdue" value={overdue} helper="Past due date" tone="critical" />
-        <DashboardMetricCard label="Due soon" value={dueSoonCount} helper="Due in 7 days" tone="warning" />
+        <DashboardMetricCard label="Total" value={visibleItems.length} helper="Matching obligations" onClick={() => toggleWorklistMetric()} active={!filters.status} />
+        <DashboardMetricCard label="Completed" value={completed} helper="Approved obligations" tone="success" onClick={() => toggleWorklistMetric("COMPLETED")} active={filters.status === "COMPLETED"} />
+        <DashboardMetricCard label="Open" value={open} helper="Requires workflow action" tone="warning" onClick={() => toggleWorklistMetric("PENDING_ACTION")} active={filters.status === "PENDING_ACTION"} />
+        <DashboardMetricCard label="Overdue" value={overdue} helper="Past due date" tone="critical" onClick={() => toggleWorklistMetric("OVERDUE")} active={filters.status === "OVERDUE"} />
+        <DashboardMetricCard label="Due soon" value={dueSoonCount} helper="Due in 7 days" tone="warning" onClick={() => toggleWorklistMetric("DUE_SOON")} active={filters.status === "DUE_SOON"} />
       </section>
 
       <DashboardSection
@@ -1780,12 +2465,7 @@ function OneTimeWorklist() {
                       </td>
                       <td><span className={`risk-label ${item.risk_level.toLowerCase()}`}>{humanize(item.risk_level)}</span></td>
                       <td><ComplianceStatusBadge status={item.display_status ?? item.status} /></td>
-                      <td>
-                        <button className="table-action" type="button" onClick={() => setSelected(item)}>
-                          <Eye size={16} />
-                          Open
-                        </button>
-                      </td>
+                      <td><div className="compliance-table-actions"><button className="icon-action" type="button" onClick={() => { setDialogMode("view"); setSelected(item); }} aria-label={`View ${item.compliance_name}`} title="View compliance details"><Eye size={16} /></button>{canSubmitCompliance(currentUser.data) && isEditableCompliance(item) && <button className="icon-action submit-compliance-action" type="button" onClick={() => { setDialogMode("submit"); setSelected(item); }} aria-label={`Upload and submit ${item.compliance_name}`} title="Upload documents and submit"><Upload size={16} /></button>}</div></td>
                     </tr>
                   ))}
                 </tbody>
@@ -1817,6 +2497,7 @@ function OneTimeWorklist() {
 
       <ComplianceActionDialog
         item={selected}
+        mode={dialogMode}
         onClose={() => setSelected(undefined)}
         detailPath={selected ? `${base}/compliances/detail/${selected.id}` : ""}
         onUpdated={load}

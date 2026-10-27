@@ -7,29 +7,31 @@ from datetime import UTC, date, datetime, timedelta
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.security import create_access_token, hash_password, verify_password
+from app.core.security import create_access_token, hash_password, password_strength_error, verify_password
 from app.core.config import settings
 from app.db.session import get_db
 from app.models import (
     ApplicabilityEvaluation, AuditLog, AuthSession, City, ComplianceAssignment, ComplianceComment, ComplianceEvidence, ComplianceImport, ContractorDocument, InAppNotification,
     ComplianceImportError, ComplianceImportRow, ComplianceInstance, ComplianceRule, ComplianceRuleVersion, ComplianceSubmission,
     ComplianceWorkflowHistory, Contractor, ContractorSite, IndustryType, Organization, RuleApplicabilityCriteria,
-    State, Unit, User, UserActivation, UserPermissionGrant, UserRoleScope,
+    State, SupportTicket, SupportTicketActivity, SupportTicketAttachment, SupportTicketMessage, Unit, User, UserActivation, UserPermissionGrant, UserRoleScope,
 )
 from app.schemas import (
     AccountActivationInput, ActivityInput, AdministratorPasswordResetInput, AssignmentInput, CommentInput, ContractorContextInput, ContractorInput, ContractorSiteInput, EntityUserAssignmentInput, GenerationRequest,
-    DevelopmentResetInput, LoginRequest, OrganizationDeleteInput, OrganizationInput, PlatformOrganizationInput, OrganizationStatusInput, PasswordChangeRequest, RoleScopeInput, RuleInput, UnitInput, UserCreateInput,
-    WorkflowDecision, SubmissionInput, UserUpdateInput, EvidenceVerificationInput, NotApplicableInput, RuleStatusInput, DOCUMENT_TYPES,
+    DevelopmentResetInput, LoginRequest, OrganizationDeleteInput, OrganizationInput, PlatformOrganizationInput, OrganizationStatusInput, PasswordChangeRequest, ProfileUpdateInput, RoleScopeInput, RuleInput, UnitInput, UserCreateInput,
+    WorkflowDecision, SubmissionInput, UserUpdateInput, EvidenceVerificationInput, NotApplicableInput, RuleStatusInput, ComplianceMasterDeleteInput, ComplianceActStatusInput, ComplianceActDeleteInput, SupportTicketInput, SupportTicketReplyInput, SupportTicketUpdateInput, DOCUMENT_TYPES, UNIT_COMPLIANCE_TYPES,
 )
 from app.services.access import CHECKER_ROLES, MAKER_ROLES, MODULE_PERMISSION_CHOICES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, contractor_context_for_user, current_user, has_permission, is_org_admin, platform_master_organization_id, require_org_admin, roles_for, scopes_for, user_summary
 from app.services.audit import audit
 from app.services.activation import activate_account
-from app.services.compliance import SUBJECTS, assert_assignment_or_admin, generate_for_subject, submit, transition
+from app.services.compliance import SUBJECTS, assert_assignment_or_admin, compliance_display_status, generate_for_subject, submit, transition
 from app.services.location_master import ensure_cities_for_state, ensure_states
+from app.services.notifications import assignment_recipients, emit_notification, notify_compliance_event
 from app.services.serialization import entity_dict, instance_dict, model_dict
 from app.storage.files import delete_stored_file, file_path, save_upload
 
@@ -53,6 +55,31 @@ def customer_organization_or_404(db: Session, organization_id: str) -> Organizat
 def require_platform_admin(user: User) -> None:
     if user.platform_role != PLATFORM_ADMIN_ROLE:
         raise HTTPException(403, "MORAX platform administrator permission is required")
+
+
+def email_is_in_use(
+    db: Session,
+    email: str,
+    exclude_type: str | None = None,
+    exclude_id: str | None = None,
+) -> bool:
+    """Check login and contact emails as one product-wide namespace."""
+    normalized = email.strip().lower()
+    if not normalized:
+        return False
+    candidates = (
+        ("USER", User, User.email),
+        ("ORGANIZATION", Organization, Organization.contact_email),
+        ("UNIT", Unit, Unit.contact_email),
+        ("CONTRACTOR", Contractor, Contractor.contact_email),
+    )
+    for kind, model, column in candidates:
+        query = select(model.id).where(func.lower(column) == normalized)
+        if exclude_type and exclude_id and exclude_type.upper() == kind:
+            query = query.where(model.id != exclude_id)
+        if db.scalar(query.limit(1)):
+            return True
+    return False
 
 
 def organization_dict(organization: Organization) -> dict:
@@ -350,6 +377,26 @@ def replace_entity_assignments(
         old=old_assignments,
         new=new_assignments,
     )
+    old_keys = {(item["user_id"], item["role"]) for item in old_assignments}
+    for item in new_assignments:
+        if (item["user_id"], item["role"]) in old_keys:
+            continue
+        emit_notification(
+            db,
+            organization_id=organization_id,
+            recipient_id=item["user_id"],
+            notification_type="USER_ASSIGNMENT",
+            category="ASSIGNMENT",
+            event_type="ENTITY_ASSIGNED",
+            priority="NORMAL",
+            title=f"You were assigned as {item['role'].title()}",
+            body=f"{entity.name} is now in your assigned {entity_type.lower().replace('_', ' ')} scope.",
+            entity_type=entity_type,
+            entity_id=entity_id,
+            reference_type=entity_type,
+            reference_id=entity_id,
+            event_key=f"assignment:{entity_type}:{entity_id}:{item['user_id']}:{item['role']}",
+        )
     return new_assignments
 
 
@@ -482,6 +529,25 @@ def configure_contractor_assignments(db: Session, contractor: Contractor, maker_
                 prior.active = False
                 prior.ended_at = datetime.now(UTC)
             db.add(ComplianceAssignment(instance_id=instance.id, user_id=assignee.id, assignment_type=assignment_type, assigned_by_id=actor_id))
+    for role, assignee in (("Maker", maker), ("Checker", checker)):
+        if not assignee:
+            continue
+        emit_notification(
+            db,
+            organization_id=contractor.organization_id,
+            recipient_id=assignee.id,
+            notification_type="USER_ASSIGNMENT",
+            category="ASSIGNMENT",
+            event_type="CONTRACTOR_ASSIGNED",
+            priority="NORMAL",
+            title=f"You were assigned as Contractor {role}",
+            body=f"{contractor.name} is now in your assigned contractor scope.",
+            entity_type="CONTRACTOR",
+            entity_id=contractor.id,
+            reference_type="CONTRACTOR",
+            reference_id=contractor.id,
+            event_key=f"assignment:CONTRACTOR:{contractor.id}:{assignee.id}:{role.upper()}",
+        )
     audit(db, organization_id=contractor.organization_id, actor_id=actor_id, action="ASSIGN_CONTRACTOR_USERS", module="CONTRACTORS", entity_type="Contractor", entity_id=contractor.id, new={"maker_user_id": maker_user_id, "checker_user_id": checker_user_id})
 
 
@@ -569,6 +635,24 @@ def parse_applicable_months(value) -> list[int]:
         raise HTTPException(422, "Applicable Months must be comma-separated month numbers (1-12)") from exc
 
 
+def parse_unit_compliance_types(value) -> list[str]:
+    if value in (None, ""):
+        return []
+    values = value if isinstance(value, (list, tuple)) else re.split(r"[,;]", str(value))
+    aliases = {item.lower(): item for item in UNIT_COMPLIANCE_TYPES}
+    normalized: list[str] = []
+    for item in values:
+        text = str(item).strip()
+        if not text:
+            continue
+        canonical = aliases.get(text.lower())
+        if not canonical:
+            raise HTTPException(422, f"Unsupported Unit Compliance Type: {text}")
+        if canonical not in normalized:
+            normalized.append(canonical)
+    return normalized
+
+
 def stage_construction_checklist(workbook, organization_id: str, user: User, db: Session) -> dict:
     """Stage COW sample rows as Master records; no statutory schedule is inferred."""
     sheet = workbook["COW"]
@@ -626,6 +710,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         expires_at=datetime.now(UTC) + timedelta(minutes=480),
     )
     db.add(session)
+    user.last_login_at = datetime.now(UTC)
     audit(db, organization_id=user.organization_id, actor_id=user.id, action="LOGIN", module="AUTH", entity_type="User", entity_id=user.id)
     db.commit()
     setattr(user, "_morax_active_organization_id", user.organization_id)
@@ -806,6 +891,18 @@ def me(user: User = Depends(current_user), db: Session = Depends(get_db)):
     return user_summary(db, user)
 
 
+@router.get("/validation/email-availability")
+def email_availability(
+    email: str,
+    exclude_type: str | None = None,
+    exclude_id: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    del user  # Authentication is required even though the lookup is global.
+    return {"available": not email_is_in_use(db, email, exclude_type, exclude_id)}
+
+
 @router.get("/platform/organizations")
 def list_platform_organizations(q: str | None = None, status: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
     require_platform_admin(user)
@@ -838,8 +935,11 @@ def create_platform_organization(payload: PlatformOrganizationInput, user: User 
     if db.scalar(select(Organization).where(Organization.code == code)):
         raise HTTPException(409, "Organization code already exists")
     admin_email = str(payload.organization_admin_email).lower()
-    if db.scalar(select(User).where(User.email == admin_email)):
-        raise HTTPException(409, "An account with the Organization Admin email already exists")
+    if email_is_in_use(db, admin_email):
+        raise HTTPException(409, "Email ID already exists.")
+    contact_email = str(payload.primary_contact_email).lower() if payload.primary_contact_email else None
+    if contact_email and (contact_email == admin_email or email_is_in_use(db, contact_email)):
+        raise HTTPException(409, "Email ID already exists.")
     if payload.state_id and not db.get(State, payload.state_id):
         raise HTTPException(422, "State must be a configured master value")
     validate_organization_city(db, payload.state_id, payload.city)
@@ -1294,11 +1394,122 @@ def enter_platform_organization(organization_id: str, user: User = Depends(curre
 def change_password(payload: PasswordChangeRequest, user: User = Depends(current_user), db: Session = Depends(get_db)):
     if not verify_password(payload.current_password, user.password_hash):
         raise HTTPException(422, "Current password is incorrect")
+    if verify_password(payload.new_password, user.password_hash):
+        raise HTTPException(422, "New password must be different from the current password")
+    if strength_error := password_strength_error(payload.new_password):
+        raise HTTPException(422, strength_error)
     user.password_hash = hash_password(payload.new_password)
     user.must_change_password = False
+    current_session_id = getattr(user, "_morax_session_id", None)
+    revoked_sessions = 0
+    for session in db.scalars(select(AuthSession).where(
+        AuthSession.user_id == user.id,
+        AuthSession.revoked_at.is_(None),
+    )):
+        if session.id != current_session_id:
+            session.revoked_at = datetime.now(UTC)
+            revoked_sessions += 1
     audit(db, organization_id=user.organization_id, actor_id=user.id, action="CHANGE_PASSWORD", module="AUTH", entity_type="User", entity_id=user.id)
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "sessions_revoked": revoked_sessions}
+
+
+def _profile_entities(db: Session, user: User, organization_id: str) -> list[dict]:
+    """Return only entities the current trusted user can actually access."""
+    entities: list[dict] = []
+    for kind, model in (("UNIT", Unit), ("CONTRACTOR", Contractor), ("CONTRACTOR_SITE", ContractorSite)):
+        for entity in db.scalars(select(model).where(model.organization_id == organization_id).order_by(model.name)):
+            if can_access_subject(db, user, organization_id, kind, entity.id):
+                entities.append(entity_dict(db, entity, kind))
+    return entities
+
+
+@router.get("/profile")
+def get_my_profile(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Role-aware account, assignment and activity profile for the signed-in user."""
+    organization_id = org_for(user)
+    organization = db.get(Organization, organization_id)
+    if not organization:
+        raise HTTPException(404, "Organization not found")
+    entities = _profile_entities(db, user, organization_id)
+    accessible = {
+        (item["entity_type"], item["id"])
+        for item in entities
+    }
+    instances = [
+        instance for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == organization_id))
+        if (instance.subject_type, instance.subject_id) in accessible
+    ]
+    instance_ids = [instance.id for instance in instances]
+    submissions = list(db.scalars(select(ComplianceSubmission).where(
+        ComplianceSubmission.submitted_by_id == user.id,
+        ComplianceSubmission.instance_id.in_(instance_ids or ["__none__"]),
+    )))
+    submitted_instance_ids = {submission.instance_id for submission in submissions}
+    reviewed_actions = list(db.scalars(select(ComplianceWorkflowHistory).where(
+        ComplianceWorkflowHistory.actor_id == user.id,
+        ComplianceWorkflowHistory.instance_id.in_(instance_ids or ["__none__"]),
+        ComplianceWorkflowHistory.action.in_(["APPROVE", "REJECT", "REQUEST_CORRECTION"]),
+    )))
+    by_id = {instance.id: instance for instance in instances}
+    maker_instances = [by_id[item] for item in submitted_instance_ids if item in by_id]
+    return {
+        "account": {
+            "id": user.id, "name": user.name, "email": user.email, "mobile": user.mobile,
+            "roles": sorted(roles_for(db, user.id)), "member_since": user.created_at,
+            "last_login_at": user.last_login_at,
+        },
+        "organization": model_dict(organization, [field.name for field in organization.__table__.columns]),
+        "entities": entities,
+        "activity": {
+            "maker": {
+                "total_submitted": len(maker_instances),
+                "pending_approval": sum(item.status in {"SUBMITTED", "UNDER_REVIEW"} for item in maker_instances),
+                "approved": sum(item.status == "APPROVED" for item in maker_instances),
+                "rejected": sum(item.status in {"REJECTED", "CORRECTION_REQUIRED"} for item in maker_instances),
+            },
+            "checker": {
+                "total_reviewed": len(reviewed_actions),
+                "pending_review": sum(item.status in {"SUBMITTED", "UNDER_REVIEW"} for item in instances),
+                "approved_by_me": sum(item.action == "APPROVE" for item in reviewed_actions),
+                "rejected_by_me": sum(item.action in {"REJECT", "REQUEST_CORRECTION"} for item in reviewed_actions),
+            },
+        },
+    }
+
+
+@router.patch("/profile")
+def update_my_profile(payload: ProfileUpdateInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    old = {"name": user.name, "mobile": user.mobile}
+    user.name, user.mobile = payload.name.strip(), payload.mobile
+    audit(db, organization_id=org_for(user), actor_id=user.id, action="UPDATE_MY_PROFILE", module="AUTH", entity_type="User", entity_id=user.id, old=old, new={"name": user.name, "mobile": user.mobile})
+    db.commit()
+    return {"id": user.id, "name": user.name, "email": user.email, "mobile": user.mobile}
+
+
+@router.post("/profile/organization-logo")
+async def upload_organization_logo(file: UploadFile = File(...), user: User = Depends(current_user), db: Session = Depends(get_db)):
+    organization_id = org_for(user)
+    require_org_admin(db, user, organization_id)
+    if not (file.filename or "").lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+        raise HTTPException(422, "Organization logo must be a PNG, JPG, JPEG, or WEBP image")
+    organization = db.get(Organization, organization_id)
+    stored_name, _, _ = await save_upload(file)
+    previous = organization.logo_filename
+    organization.logo_filename = stored_name
+    audit(db, organization_id=organization_id, actor_id=user.id, action="UPDATE_ORGANIZATION_LOGO", module="ORGANIZATION", entity_type="Organization", entity_id=organization.id)
+    db.commit()
+    if previous:
+        delete_stored_file(previous)
+    return {"filename": stored_name}
+
+
+@router.get("/profile/organization-logo")
+def download_organization_logo(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    organization = db.get(Organization, org_for(user))
+    if not organization or not organization.logo_filename:
+        raise HTTPException(404, "Organization logo not found")
+    return FileResponse(file_path(organization.logo_filename), filename="organization-logo")
 
 
 @router.post("/auth/activate")
@@ -1369,6 +1580,8 @@ def update_organization(payload: OrganizationInput, user: User = Depends(current
     organization_id = org_for(user)
     require_org_admin(db, user, organization_id)
     organization = db.get(Organization, organization_id)
+    if payload.contact_email and email_is_in_use(db, str(payload.contact_email), "ORGANIZATION", organization.id):
+        raise HTTPException(409, "Email ID already exists.")
     if payload.state_id and not db.get(State, payload.state_id):
         raise HTTPException(422, "State must be a configured master value")
     validate_organization_city(db, payload.state_id, payload.city)
@@ -1402,9 +1615,14 @@ def get_unit(unit_id: str, user: User = Depends(current_user), db: Session = Dep
 def create_unit(payload: UnitInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     organization_id = org_for(user)
     require_permission(db, user, "entities.manage")
+    # Preserve compatibility with older API clients while ensuring every new
+    # Unit has a persisted effective date.
+    payload.effective_date = payload.effective_date or payload.compliance_start_date
     payload.code = (payload.code or "").strip().upper() or generated_code(db, Unit, payload.name, "UNIT", organization_id)
     if db.scalar(select(Unit).where(Unit.organization_id == organization_id, Unit.code == payload.code)):
         raise HTTPException(409, "A unit with this code already exists in the organization")
+    if payload.contact_email and email_is_in_use(db, str(payload.contact_email)):
+        raise HTTPException(409, "Email ID already exists.")
     if not db.get(State, payload.state_id) or not db.get(IndustryType, payload.industry_type_id):
         raise HTTPException(422, "State and industry type must be configured master values")
     payload.city_id, payload.city = resolve_city(db, payload.state_id, payload.city_id, payload.city)
@@ -1425,6 +1643,9 @@ def update_unit(unit_id: str, payload: UnitInput, user: User = Depends(current_u
     if not unit or unit.organization_id != org_for(user):
         raise HTTPException(404, "Unit not found")
     require_permission(db, user, "entities.manage")
+    payload.effective_date = payload.effective_date or unit.effective_date or payload.compliance_start_date
+    if payload.contact_email and email_is_in_use(db, str(payload.contact_email), "UNIT", unit.id):
+        raise HTTPException(409, "Email ID already exists.")
     payload.code = (payload.code or unit.code).strip().upper()
     if db.scalar(select(Unit).where(Unit.organization_id == unit.organization_id, Unit.code == payload.code, Unit.id != unit.id)):
         raise HTTPException(409, "A unit with this code already exists in the organization")
@@ -1518,9 +1739,17 @@ def create_contractor(payload: ContractorInput, user: User = Depends(current_use
     )
     if db.scalar(select(Contractor).where(Contractor.organization_id == org, Contractor.code == payload.code)):
         raise HTTPException(409, "A contractor with this code already exists in the organization")
-    maker_email = str(payload.contractor_maker_email).lower() if payload.contractor_maker_email else None
-    if not maker_email or not payload.contractor_maker_password:
-        raise HTTPException(422, "Contractor Maker email and password are required when creating a contractor")
+    if payload.contact_email and email_is_in_use(db, str(payload.contact_email)):
+        raise HTTPException(409, "Email ID already exists.")
+    maker_email = (
+        str(payload.maker_new_user.email).strip().lower()
+        if payload.maker_new_user
+        else (str(payload.contractor_maker_email).strip().lower() if payload.contractor_maker_email else None)
+    )
+    if not payload.maker_user_id and not maker_email:
+        raise HTTPException(422, "Assign Maker is required when creating a contractor")
+    if payload.maker_new_user and maker_email and email_is_in_use(db, maker_email):
+        raise HTTPException(409, "Email ID already exists.")
     principal_employer = principal_employer_for(db, org, payload.unit_id)
     if not payload.state_id:
         payload.state_id = principal_employer.state_id
@@ -1531,21 +1760,29 @@ def create_contractor(payload: ContractorInput, user: User = Depends(current_use
         payload.compliance_start_date = payload.contract_start_date or date.today()
     validate_worker_capacity(db, principal_employer, payload.male_workers + payload.female_workers)
     payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
-    contractor = Contractor(organization_id=org, **payload.model_dump(exclude={"contractor_maker_email", "contractor_maker_password"}))
+    contractor = Contractor(organization_id=org, **payload.model_dump(exclude={"maker_user_id", "maker_new_user", "checker_user_id", "contractor_maker_email", "contractor_maker_password"}))
     db.add(contractor); db.flush()
-    contractor_maker = db.scalar(select(User).where(User.email == maker_email)) if maker_email else None
+    contractor_maker = db.get(User, payload.maker_user_id) if payload.maker_user_id else None
+    if payload.maker_user_id and (not contractor_maker or contractor_maker.organization_id != org):
+        raise HTTPException(422, "Contractor Maker must be an active user in your organization")
+    if not contractor_maker and maker_email:
+        contractor_maker = db.scalar(select(User).where(User.email == maker_email))
     reusing_contractor_maker = contractor_maker is not None
     if contractor_maker and contractor_maker.organization_id != org:
         raise HTTPException(409, "The Contractor Maker email belongs to another organization")
     if contractor_maker and not contractor_maker.active:
         raise HTTPException(422, "The existing Contractor Maker account is inactive")
     if not contractor_maker and maker_email:
+        pending_maker = payload.maker_new_user
+        maker_password = pending_maker.password if pending_maker else payload.contractor_maker_password
+        if not maker_password:
+            raise HTTPException(422, "A password is required when creating a new Contractor Maker")
         contractor_maker = User(
             organization_id=org,
-            name=f"{contractor.name} Maker",
+            name=pending_maker.name if pending_maker else f"{contractor.name} Maker",
             email=maker_email,
-            password_hash=hash_password(payload.contractor_maker_password or ""),
-            mobile=payload.contact_phone,
+            password_hash=hash_password(maker_password),
+            mobile=(pending_maker.mobile if pending_maker else None) or payload.contact_phone,
             active=True,
             must_change_password=False,
         )
@@ -1562,7 +1799,7 @@ def create_contractor(payload: ContractorInput, user: User = Depends(current_use
         if reusing_contractor_maker:
             audit(db, organization_id=org, actor_id=user.id, action="REUSE_CONTRACTOR_MAKER", module="USERS", entity_type="User", entity_id=contractor_maker.id, new={"email": maker_email, "contractor_id": contractor.id, "role": "CONTRACTOR_MAKER"})
     generate_for_subject(db, org, "CONTRACTOR", contractor.id, date.today(), user.id)
-    configure_contractor_assignments(db, contractor, payload.maker_user_id, payload.checker_user_id, user.id)
+    configure_contractor_assignments(db, contractor, contractor_maker.id if contractor_maker else None, payload.checker_user_id, user.id)
     audit(db, organization_id=org, actor_id=user.id, action="CREATE_CONTRACTOR", module="ENTITIES", entity_type="Contractor", entity_id=contractor.id, new={"name": contractor.name})
     commit_or_conflict(db, "Contractor and Contractor Maker could not be saved")
     return entity_dict(db, contractor, "CONTRACTOR") | ({"contractor_maker_user_id": contractor_maker.id} if contractor_maker else {})
@@ -1574,6 +1811,8 @@ def update_contractor(contractor_id: str, payload: ContractorInput, user: User =
     if not contractor or contractor.organization_id != org_for(user):
         raise HTTPException(404, "Contractor not found")
     require_permission(db, user, "entities.manage")
+    if payload.contact_email and email_is_in_use(db, str(payload.contact_email), "CONTRACTOR", contractor.id):
+        raise HTTPException(409, "Email ID already exists.")
     payload.code = (payload.code or contractor.code).strip().upper()
     if db.scalar(select(Contractor).where(Contractor.organization_id == contractor.organization_id, Contractor.code == payload.code, Contractor.id != contractor.id)):
         raise HTTPException(409, "A contractor with this code already exists in the organization")
@@ -1814,8 +2053,8 @@ def list_users(paginated: bool = False, page: int = 1, page_size: int = 50, q: s
 @router.post("/users")
 def create_user(payload: UserCreateInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user); require_org_admin(db, user, org)
-    if db.scalar(select(User).where(User.email == payload.email.lower())):
-        raise HTTPException(409, "A user with this email already exists")
+    if email_is_in_use(db, str(payload.email)):
+        raise HTTPException(409, "Email ID already exists.")
     validate_role_scopes(db, org, payload.role_scopes)
     invalid_permissions = set(payload.module_permissions) - MODULE_PERMISSION_CHOICES
     if invalid_permissions:
@@ -1898,14 +2137,125 @@ def replace_role_scopes(user_id: str, payload: list[RoleScopeInput], user: User 
     commit_or_conflict(db, "Role scope could not be saved because it conflicts with an existing scope"); return user_summary(db, target)
 
 
+COMPLIANCE_MASTER_HEADERS = [
+    "Compliance ID", "Compliance Name", "Description", "Act", "Rule", "Section",
+    "Compliance Type", "Document Type", "Form Number", "Legal Description",
+    "Consequence / Penalty", "Version", "Entity Type", "State", "Industry Type",
+    "Employee Threshold", "Unit Compliance Types", "Frequency", "Applicable Months", "Due Date Rule",
+    "Due Date Offset", "Due Date Anchor", "Required Document", "Risk Level",
+    "Effective From", "Effective To", "Active",
+]
+
+
+def style_compliance_workbook(worksheet) -> None:
+    header_fill = PatternFill("solid", fgColor="34452A")
+    for cell in worksheet[1]:
+        cell.fill = header_fill
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = worksheet.dimensions
+    worksheet.row_dimensions[1].height = 34
+    for column in worksheet.columns:
+        letter = column[0].column_letter
+        longest = max(len(str(cell.value or "")) for cell in column)
+        worksheet.column_dimensions[letter].width = min(max(longest + 2, 12), 42)
+
+
+def compliance_export_row(
+    version: ComplianceRuleVersion,
+    rule: ComplianceRule,
+    criteria: RuleApplicabilityCriteria,
+    state_names: dict[str, str],
+    industry_names: dict[str, str],
+) -> list:
+    months = ",".join(str(item) for item in json.loads(version.applicable_months_json or "[]"))
+    return [
+        rule.compliance_id, version.name, version.description or "", version.act or "",
+        version.rule_reference or "", version.section or "", version.compliance_type or "",
+        version.document_type or "", version.form_number or "", version.legal_description or "",
+        version.consequence_or_penalty or "", version.version, criteria.entity_type,
+        state_names.get(criteria.state_id or "", ""), industry_names.get(criteria.industry_type_id or "", ""),
+        criteria.employee_threshold if criteria.employee_threshold is not None else "",
+        ",".join(json.loads(criteria.unit_compliance_types_json or "[]")),
+        version.frequency, months, version.due_date_rule,
+        version.due_date_offset if version.due_date_offset is not None else "",
+        version.due_date_anchor or "", version.required_document or "", version.risk_level,
+        version.effective_from.isoformat(), version.effective_to.isoformat() if version.effective_to else "",
+        "TRUE" if version.active else "FALSE",
+    ]
+
+
+def permanently_delete_compliance_rules(db: Session, rule_ids: list[str]) -> tuple[dict[str, int], list[str]]:
+    """Delete selected master rules and every generated development record."""
+    unique_rule_ids = list(dict.fromkeys(rule_ids))
+    if not unique_rule_ids:
+        return {"rules": 0, "versions": 0, "instances": 0, "evidence": 0}, []
+    version_ids = list(db.scalars(select(ComplianceRuleVersion.id).where(ComplianceRuleVersion.rule_id.in_(unique_rule_ids))))
+    instance_ids = list(db.scalars(select(ComplianceInstance.id).where(ComplianceInstance.rule_version_id.in_(version_ids)))) if version_ids else []
+    evidence_rows = list(db.scalars(select(ComplianceEvidence).where(ComplianceEvidence.instance_id.in_(instance_ids)))) if instance_ids else []
+    stored_files = [item.stored_filename for item in evidence_rows]
+    counts = {
+        "rules": len(unique_rule_ids),
+        "versions": len(version_ids),
+        "instances": len(instance_ids),
+        "evidence": len(evidence_rows),
+    }
+    if instance_ids:
+        db.execute(delete(InAppNotification).where(
+            InAppNotification.reference_type == "ComplianceInstance",
+            InAppNotification.reference_id.in_(instance_ids),
+        ))
+        for model in (ComplianceEvidence, ComplianceComment, ComplianceSubmission, ComplianceAssignment, ComplianceWorkflowHistory):
+            db.execute(delete(model).where(model.instance_id.in_(instance_ids)))
+        db.execute(delete(ComplianceInstance).where(ComplianceInstance.id.in_(instance_ids)))
+    if version_ids:
+        db.execute(delete(ApplicabilityEvaluation).where(ApplicabilityEvaluation.rule_version_id.in_(version_ids)))
+        db.execute(delete(RuleApplicabilityCriteria).where(RuleApplicabilityCriteria.rule_version_id.in_(version_ids)))
+        db.execute(delete(ComplianceRuleVersion).where(ComplianceRuleVersion.id.in_(version_ids)))
+    db.execute(delete(ComplianceRule).where(ComplianceRule.id.in_(unique_rule_ids)))
+    return counts, stored_files
+
+
+def require_compliance_hard_delete_enabled() -> None:
+    if not settings.allow_compliance_master_hard_delete:
+        raise HTTPException(403, "Permanent Compliance Master deletion is disabled in this environment. Deactivate or revise the rule instead.")
+
+
 @router.get("/compliance-master/template")
 def compliance_template(user: User = Depends(current_user), db: Session = Depends(get_db)):
     require_platform_admin(user)
-    headers = ["Compliance ID", "Compliance Name", "Version", "Entity Type", "State", "Industry Type", "Frequency", "Applicable Months", "Due Date Rule", "Due Date Offset", "Due Date Anchor", "Required Document", "Risk Level", "Effective From", "Effective To", "Active"]
-    workbook = Workbook(); worksheet = workbook.active; worksheet.title = "Compliance Master"; worksheet.append(headers)
-    worksheet.append(["DEMO-HALF-YEARLY-001", "Half-yearly demonstration filing", 1, "UNIT", "Tamil Nadu", "Factory", "HALF_YEARLY", "6,12", "FIXED_DAY_OF_MONTH", 15, "", "PT Return", "MEDIUM", "2026-01-01", "", "TRUE"])
+    workbook = Workbook(); worksheet = workbook.active; worksheet.title = "Compliance Master"; worksheet.append(COMPLIANCE_MASTER_HEADERS)
+    worksheet.append(["DEMO-HALF-YEARLY-001", "Half-yearly demonstration filing", "Example compliance description", "Example Act", "Rule 1", "Section 1", "STATUTORY_RETURN", "RETURN", "Form A", "Example legal description", "", 1, "UNIT", "Tamil Nadu", "Factory", 10, "PF,ESI", "HALF_YEARLY", "6,12", "FIXED_DAY_OF_MONTH", 15, "", "PT Return", "MEDIUM", "2026-01-01", "", "TRUE"])
+    style_compliance_workbook(worksheet)
     stream = io.BytesIO(); workbook.save(stream); stream.seek(0)
     return StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=compliance-master-template.xlsx"})
+
+
+@router.get("/compliance-master/export")
+def export_compliance_master(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_platform_admin(user)
+    master_org = platform_master_organization_id(db)
+    rows = db.query(ComplianceRuleVersion, ComplianceRule, RuleApplicabilityCriteria).join(
+        ComplianceRule, ComplianceRule.id == ComplianceRuleVersion.rule_id
+    ).join(
+        RuleApplicabilityCriteria, RuleApplicabilityCriteria.rule_version_id == ComplianceRuleVersion.id
+    ).filter(
+        ComplianceRule.organization_id == master_org
+    ).order_by(ComplianceRuleVersion.act, ComplianceRule.compliance_id, ComplianceRuleVersion.version).all()
+    state_names = {item.id: item.name for item in db.scalars(select(State))}
+    industry_names = {item.id: item.name for item in db.scalars(select(IndustryType))}
+    workbook = Workbook(); worksheet = workbook.active; worksheet.title = "Compliance Master"; worksheet.append(COMPLIANCE_MASTER_HEADERS)
+    for version, rule, criteria in rows:
+        worksheet.append(compliance_export_row(version, rule, criteria, state_names, industry_names))
+    style_compliance_workbook(worksheet)
+    notes = workbook.create_sheet("Export Summary")
+    notes.append(["Exported at", datetime.now(UTC).isoformat()])
+    notes.append(["Rule versions", len(rows)])
+    notes.append(["Import guidance", "Use Merge to add versions, or Replace Master to make this workbook the complete master."])
+    stream = io.BytesIO(); workbook.save(stream); stream.seek(0)
+    filename = f"morax-compliance-master-{date.today().isoformat()}.xlsx"
+    return StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
 def rule_version_dict(version: ComplianceRuleVersion, rule: ComplianceRule, criteria: RuleApplicabilityCriteria) -> dict:
@@ -1919,6 +2269,8 @@ def rule_version_dict(version: ComplianceRuleVersion, rule: ComplianceRule, crit
         "frequency": version.frequency, "entity_type": criteria.entity_type,
         "applicable_months": json.loads(version.applicable_months_json or "[]"),
         "state_id": criteria.state_id, "industry_type_id": criteria.industry_type_id,
+        "employee_threshold": criteria.employee_threshold,
+        "unit_compliance_types": json.loads(criteria.unit_compliance_types_json or "[]"),
         "due_date_rule": version.due_date_rule, "due_date_offset": version.due_date_offset,
         "due_date_anchor": version.due_date_anchor, "grace_days": version.grace_days,
         "required_document": version.required_document, "risk_level": version.risk_level,
@@ -1928,19 +2280,22 @@ def rule_version_dict(version: ComplianceRuleVersion, rule: ComplianceRule, crit
 
 
 @router.get("/compliance-rules")
-def list_rules(paginated: bool = False, page: int = 1, page_size: int = 50, q: str | None = None, frequency: str | None = None, active: bool | None = None, sort_by: str = "compliance_id", sort_dir: str = "asc", user: User = Depends(current_user), db: Session = Depends(get_db)):
+def list_rules(paginated: bool = False, page: int = 1, page_size: int = 50, q: str | None = None, act: str | None = None, frequency: str | None = None, active: bool | None = None, sort_by: str = "compliance_id", sort_dir: str = "asc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     require_platform_admin(user)
     master_org = platform_master_organization_id(db)
     query = db.query(ComplianceRuleVersion, ComplianceRule, RuleApplicabilityCriteria).join(ComplianceRule, ComplianceRule.id == ComplianceRuleVersion.rule_id).join(RuleApplicabilityCriteria, RuleApplicabilityCriteria.rule_version_id == ComplianceRuleVersion.id).filter(ComplianceRule.organization_id == master_org)
     if q:
         text = f"%{q.strip()}%"
         query = query.filter(or_(ComplianceRule.compliance_id.ilike(text), ComplianceRuleVersion.name.ilike(text), ComplianceRuleVersion.act.ilike(text)))
+    if act:
+        query = query.filter(ComplianceRuleVersion.act == act.strip())
     if frequency:
         query = query.filter(ComplianceRuleVersion.frequency == frequency.upper())
     if active is not None:
         query = query.filter(ComplianceRuleVersion.active.is_(active))
     ordering = {
         "compliance_id": ComplianceRule.compliance_id,
+        "act": ComplianceRuleVersion.act,
         "name": ComplianceRuleVersion.name,
         "frequency": ComplianceRuleVersion.frequency,
         "risk_level": ComplianceRuleVersion.risk_level,
@@ -1956,6 +2311,112 @@ def list_rules(paginated: bool = False, page: int = 1, page_size: int = 50, q: s
     total = query.count()
     rows = query.offset((safe_page - 1) * safe_size).limit(safe_size).all()
     return {"items": [rule_version_dict(version, rule, criteria) for version, rule, criteria in rows], "total": total, "page": safe_page, "page_size": safe_size}
+
+
+@router.get("/compliance-rules/acts")
+def list_compliance_acts(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_platform_admin(user)
+    master_org = platform_master_organization_id(db)
+    return list(db.scalars(
+        select(ComplianceRuleVersion.act)
+        .join(ComplianceRule, ComplianceRule.id == ComplianceRuleVersion.rule_id)
+        .where(
+            ComplianceRule.organization_id == master_org,
+            ComplianceRuleVersion.act.is_not(None),
+            ComplianceRuleVersion.act != "",
+        )
+        .distinct()
+        .order_by(ComplianceRuleVersion.act)
+    ))
+
+
+@router.post("/compliance-acts/status")
+def set_compliance_act_status(payload: ComplianceActStatusInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_platform_admin(user)
+    master_org = platform_master_organization_id(db)
+    versions = list(db.scalars(
+        select(ComplianceRuleVersion)
+        .join(ComplianceRule, ComplianceRule.id == ComplianceRuleVersion.rule_id)
+        .where(ComplianceRule.organization_id == master_org, ComplianceRuleVersion.act == payload.act)
+    ))
+    if not versions:
+        raise HTTPException(404, "Compliance Act not found")
+    for version in versions:
+        version.active = payload.active
+    audit(
+        db,
+        organization_id=master_org,
+        actor_id=user.id,
+        action="ACTIVATE_COMPLIANCE_ACT" if payload.active else "DEACTIVATE_COMPLIANCE_ACT",
+        module="COMPLIANCE_MASTER",
+        entity_type="ComplianceAct",
+        entity_id=master_org,
+        new={"act": payload.act, "active": payload.active, "versions": len(versions)},
+    )
+    db.commit()
+    return {"act": payload.act, "active": payload.active, "updated": len(versions)}
+
+
+@router.delete("/compliance-acts")
+def delete_compliance_act(payload: ComplianceActDeleteInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_platform_admin(user)
+    require_compliance_hard_delete_enabled()
+    if payload.confirmation.strip() != payload.act.strip():
+        raise HTTPException(422, "Enter the exact Act name to confirm permanent deletion")
+    master_org = platform_master_organization_id(db)
+    rule_ids = list(db.scalars(
+        select(ComplianceRule.id)
+        .join(ComplianceRuleVersion, ComplianceRuleVersion.rule_id == ComplianceRule.id)
+        .where(ComplianceRule.organization_id == master_org, ComplianceRuleVersion.act == payload.act)
+        .distinct()
+    ))
+    if not rule_ids:
+        raise HTTPException(404, "Compliance Act not found")
+    counts, stored_files = permanently_delete_compliance_rules(db, rule_ids)
+    audit(
+        db,
+        organization_id=master_org,
+        actor_id=user.id,
+        action="DELETE_COMPLIANCE_ACT",
+        module="COMPLIANCE_MASTER",
+        entity_type="ComplianceAct",
+        entity_id=master_org,
+        old={"act": payload.act, **counts},
+        reason="Confirmed permanent development-stage deletion",
+    )
+    db.commit()
+    for stored_filename in stored_files:
+        delete_stored_file(stored_filename)
+    return {"ok": True, "act": payload.act, "deleted": counts}
+
+
+@router.delete("/compliance-rule-groups/{rule_id}")
+def delete_compliance_rule(rule_id: str, payload: ComplianceMasterDeleteInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_platform_admin(user)
+    require_compliance_hard_delete_enabled()
+    master_org = platform_master_organization_id(db)
+    rule = db.get(ComplianceRule, rule_id)
+    if not rule or rule.organization_id != master_org:
+        raise HTTPException(404, "Compliance rule not found")
+    if payload.confirmation.strip() != rule.compliance_id:
+        raise HTTPException(422, "Enter the exact Compliance ID to confirm permanent deletion")
+    compliance_id = rule.compliance_id
+    counts, stored_files = permanently_delete_compliance_rules(db, [rule.id])
+    audit(
+        db,
+        organization_id=master_org,
+        actor_id=user.id,
+        action="DELETE_COMPLIANCE_RULE",
+        module="COMPLIANCE_MASTER",
+        entity_type="ComplianceRule",
+        entity_id=rule_id,
+        old={"compliance_id": compliance_id, **counts},
+        reason="Confirmed permanent development-stage deletion",
+    )
+    db.commit()
+    for stored_filename in stored_files:
+        delete_stored_file(stored_filename)
+    return {"ok": True, "compliance_id": compliance_id, "deleted": counts}
 
 
 @router.get("/compliance-rules/{version_id}")
@@ -1979,7 +2440,7 @@ def create_rule_version(db: Session, org: str, actor: User, payload: RuleInput):
     elif payload.version != (db.scalar(select(func.max(ComplianceRuleVersion.version)).where(ComplianceRuleVersion.rule_id == rule.id)) or 0) + 1:
         raise HTTPException(422, "Rule version must be the next sequential version")
     version = ComplianceRuleVersion(rule_id=rule.id, version=payload.version, name=payload.name, description=payload.description, act=payload.act, rule_reference=payload.rule_reference, section=payload.section, compliance_type=payload.compliance_type, document_type=payload.document_type, form_number=payload.form_number, legal_description=payload.legal_description, consequence_or_penalty=payload.consequence_or_penalty, frequency=payload.frequency.upper(), applicable_months_json=json.dumps(payload.applicable_months), due_date_rule=payload.due_date_rule.upper(), due_date_offset=payload.due_date_offset, due_date_anchor=payload.due_date_anchor, grace_days=payload.grace_days, required_document=payload.required_document, risk_level=payload.risk_level.upper(), effective_from=payload.effective_from, effective_to=payload.effective_to, active=payload.active)
-    db.add(version); db.flush(); db.add(RuleApplicabilityCriteria(rule_version_id=version.id, entity_type=payload.entity_type, state_id=payload.state_id, industry_type_id=payload.industry_type_id))
+    db.add(version); db.flush(); db.add(RuleApplicabilityCriteria(rule_version_id=version.id, entity_type=payload.entity_type, state_id=payload.state_id, industry_type_id=payload.industry_type_id, employee_threshold=payload.employee_threshold, unit_compliance_types_json=json.dumps(payload.unit_compliance_types)))
     audit(db, organization_id=org, actor_id=actor.id, action="CREATE_RULE_VERSION", module="COMPLIANCE_MASTER", entity_type="ComplianceRuleVersion", entity_id=version.id, new={"compliance_id": payload.compliance_id, "version": payload.version})
     return version
 
@@ -2020,7 +2481,7 @@ async def validate_import(file: UploadFile = File(...), user: User = Depends(cur
     if "Compliance Master" not in workbook.sheetnames: raise HTTPException(422, "Worksheet 'Compliance Master' is required")
     sheet = workbook["Compliance Master"]
     headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
-    required = {"Compliance ID", "Compliance Name", "Version", "Entity Type", "Frequency", "Due Date Rule", "Effective From"}
+    required = {"Compliance ID", "Compliance Name", "Act", "Version", "Entity Type", "Frequency", "Due Date Rule", "Effective From"}
     if not required.issubset(set(headers)): raise HTTPException(422, f"Missing required headers: {', '.join(sorted(required - set(headers)))}")
     import_record = ComplianceImport(organization_id=master_org, uploaded_by_id=user.id, original_filename=file.filename or "compliance-master.xlsx")
     db.add(import_record); db.flush(); seen = set(); valid = errors = total = 0
@@ -2034,14 +2495,22 @@ async def validate_import(file: UploadFile = File(...), user: User = Depends(cur
         if identity in seen: messages.append(("Compliance ID", "Duplicate Compliance ID and Version in uploaded file"))
         seen.add(identity)
         if str(row.get("Entity Type", "")).upper() not in SUBJECTS: messages.append(("Entity Type", "Must be UNIT, CONTRACTOR, or CONTRACTOR_SITE"))
-        if str(row.get("Frequency", "")).upper() not in {"ONE_TIME", "MONTHLY", "QUARTERLY", "HALF_YEARLY", "ANNUAL", "EVENT_BASED"}: messages.append(("Frequency", "Unsupported MVP frequency"))
+        if str(row.get("Frequency", "")).upper() not in {"ONE_TIME", "DAILY", "WEEKLY", "MONTHLY", "QUARTERLY", "HALF_YEARLY", "HALF-YEARLY", "ANNUAL", "YEARLY", "EVENT_BASED"}: messages.append(("Frequency", "Unsupported frequency"))
         try:
             if any(month < 1 or month > 12 for month in parse_applicable_months(row.get("Applicable Months"))):
                 messages.append(("Applicable Months", "Months must be between 1 and 12"))
         except HTTPException:
             messages.append(("Applicable Months", "Use comma-separated month numbers (1-12)"))
+        try:
+            parse_unit_compliance_types(row.get("Unit Compliance Types"))
+        except HTTPException:
+            messages.append(("Unit Compliance Types", "Use only Shops & Establishments, Mines, BOCW, ESI, or PF"))
         if row.get("State") and str(row["State"]).strip().lower() not in states_by_name: messages.append(("State", "State is not configured"))
         if row.get("Industry Type") and str(row["Industry Type"]).strip().lower() not in industries_by_name: messages.append(("Industry Type", "Industry Type is not configured"))
+        if row.get("Employee Threshold") not in (None, ""):
+            try:
+                if int(row["Employee Threshold"]) < 0: messages.append(("Employee Threshold", "Must be zero or a positive integer"))
+            except (TypeError, ValueError): messages.append(("Employee Threshold", "Must be zero or a positive integer"))
         try: int(row.get("Version")); date.fromisoformat(str(row.get("Effective From")))
         except (TypeError, ValueError): messages.append(("Version/Effective From", "Version must be an integer and Effective From must be ISO date"))
         import_row = ComplianceImportRow(import_id=import_record.id, row_number=number, payload_json=json.dumps(row, default=str), valid=not messages); db.add(import_row); db.flush()
@@ -2067,25 +2536,47 @@ def import_preview(import_id: str, user: User = Depends(current_user), db: Sessi
 
 
 @router.post("/compliance-imports/{import_id}/confirm")
-def confirm_import(import_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def confirm_import(import_id: str, mode: str = "MERGE", confirmation: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
     require_platform_admin(user)
+    normalized_mode = mode.strip().upper()
+    if normalized_mode not in {"MERGE", "REPLACE"}:
+        raise HTTPException(422, "Import mode must be MERGE or REPLACE")
     master_org = platform_master_organization_id(db)
     record = db.get(ComplianceImport, import_id)
     if not record or record.organization_id != master_org: raise HTTPException(404, "Import not found")
     if record.status != "VALIDATED": raise HTTPException(409, "Import has already been confirmed or cancelled")
+    if record.error_rows:
+        raise HTTPException(422, "Correct every invalid workbook row before confirming the import")
+    if not record.valid_rows:
+        raise HTTPException(422, "The workbook does not contain any valid compliance rules")
     state_names = {state.name.lower(): state.id for state in db.scalars(select(State))}; industry_names = {industry.name.lower(): industry.id for industry in db.scalars(select(IndustryType))}
-    imported = skipped = 0
-    for item in db.scalars(select(ComplianceImportRow).where(ComplianceImportRow.import_id == import_id, ComplianceImportRow.valid.is_(True))):
+    imported = skipped = 0; deleted = {}; stored_files: list[str] = []
+    if normalized_mode == "REPLACE":
+        require_compliance_hard_delete_enabled()
+        if (confirmation or "").strip().upper() != "REPLACE":
+            raise HTTPException(422, "Enter REPLACE to confirm complete Compliance Master replacement")
+        existing_rule_ids = list(db.scalars(select(ComplianceRule.id).where(ComplianceRule.organization_id == master_org)))
+        deleted, stored_files = permanently_delete_compliance_rules(db, existing_rule_ids)
+        db.flush()
+    import_rows = db.scalars(
+        select(ComplianceImportRow)
+        .where(ComplianceImportRow.import_id == import_id, ComplianceImportRow.valid.is_(True))
+        .order_by(ComplianceImportRow.row_number)
+    )
+    for item in import_rows:
         row = json.loads(item.payload_json)
-        payload = RuleInput(compliance_id=str(row["Compliance ID"]).strip(), name=str(row["Compliance Name"]).strip(), description=str(row["Description"]) if row.get("Description") else None, act=str(row["Act"]) if row.get("Act") else None, rule_reference=str(row["Rule"]) if row.get("Rule") else None, section=str(row["Section"]) if row.get("Section") else None, compliance_type=str(row["Compliance Type"]) if row.get("Compliance Type") else None, document_type=str(row["Document Type"]) if row.get("Document Type") else None, form_number=str(row["Form Number"]) if row.get("Form Number") else None, legal_description=str(row["Legal Description"]) if row.get("Legal Description") else None, consequence_or_penalty=str(row["Consequence / Penalty"]) if row.get("Consequence / Penalty") else None, version=int(row["Version"]), entity_type=str(row["Entity Type"]).upper(), state_id=state_names.get(str(row.get("State") or "").lower()), industry_type_id=industry_names.get(str(row.get("Industry Type") or "").lower()), frequency=str(row["Frequency"]).upper(), applicable_months=parse_applicable_months(row.get("Applicable Months")), due_date_rule=str(row["Due Date Rule"]).upper(), due_date_offset=int(row["Due Date Offset"]) if row.get("Due Date Offset") not in (None, "") else None, due_date_anchor=str(row["Due Date Anchor"]) if row.get("Due Date Anchor") else None, required_document=str(row["Required Document"]) if row.get("Required Document") else None, risk_level=str(row.get("Risk Level") or "MEDIUM").upper(), effective_from=date.fromisoformat(str(row["Effective From"])), effective_to=date.fromisoformat(str(row["Effective To"])) if row.get("Effective To") else None, active=parse_bool(row.get("Active")))
+        payload = RuleInput(compliance_id=str(row["Compliance ID"]).strip(), name=str(row["Compliance Name"]).strip(), description=str(row["Description"]) if row.get("Description") else None, act=str(row["Act"]).strip() if row.get("Act") else None, rule_reference=str(row["Rule"]).strip() if row.get("Rule") else None, section=str(row["Section"]).strip() if row.get("Section") else None, compliance_type=str(row["Compliance Type"]).strip() if row.get("Compliance Type") else None, document_type=str(row["Document Type"]).strip() if row.get("Document Type") else None, form_number=str(row["Form Number"]).strip() if row.get("Form Number") else None, legal_description=str(row["Legal Description"]) if row.get("Legal Description") else None, consequence_or_penalty=str(row["Consequence / Penalty"]) if row.get("Consequence / Penalty") else None, version=int(row["Version"]), entity_type=str(row["Entity Type"]).strip().upper(), state_id=state_names.get(str(row.get("State") or "").strip().lower()), industry_type_id=industry_names.get(str(row.get("Industry Type") or "").strip().lower()), employee_threshold=int(row["Employee Threshold"]) if row.get("Employee Threshold") not in (None, "") else None, unit_compliance_types=parse_unit_compliance_types(row.get("Unit Compliance Types")), frequency=str(row["Frequency"]).strip().upper(), applicable_months=parse_applicable_months(row.get("Applicable Months")), due_date_rule=str(row["Due Date Rule"]).strip().upper(), due_date_offset=int(row["Due Date Offset"]) if row.get("Due Date Offset") not in (None, "") else None, due_date_anchor=str(row["Due Date Anchor"]).strip() if row.get("Due Date Anchor") else None, required_document=str(row["Required Document"]) if row.get("Required Document") else None, risk_level=str(row.get("Risk Level") or "MEDIUM").strip().upper(), effective_from=date.fromisoformat(str(row["Effective From"])), effective_to=date.fromisoformat(str(row["Effective To"])) if row.get("Effective To") else None, active=parse_bool(row.get("Active")))
         existing_rule = db.scalar(select(ComplianceRule).where(ComplianceRule.organization_id == master_org, ComplianceRule.compliance_id == payload.compliance_id))
         if existing_rule and db.scalar(select(ComplianceRuleVersion).where(ComplianceRuleVersion.rule_id == existing_rule.id, ComplianceRuleVersion.version == payload.version)):
             skipped += 1
             continue
         create_rule_version(db, master_org, user, payload); imported += 1
     record.status = "CONFIRMED"; record.confirmed_at = datetime.now(UTC)
-    audit(db, organization_id=master_org, actor_id=user.id, action="CONFIRM_IMPORT", module="COMPLIANCE_MASTER", entity_type="ComplianceImport", entity_id=record.id, new={"imported": imported, "skipped": skipped})
-    db.commit(); return {"id": record.id, "imported": imported, "skipped": skipped, "error_rows": record.error_rows}
+    audit(db, organization_id=master_org, actor_id=user.id, action="REPLACE_COMPLIANCE_MASTER" if normalized_mode == "REPLACE" else "CONFIRM_IMPORT", module="COMPLIANCE_MASTER", entity_type="ComplianceImport", entity_id=record.id, new={"mode": normalized_mode, "imported": imported, "skipped": skipped, "deleted": deleted})
+    db.commit()
+    for stored_filename in stored_files:
+        delete_stored_file(stored_filename)
+    return {"id": record.id, "mode": normalized_mode, "imported": imported, "skipped": skipped, "deleted": deleted, "error_rows": record.error_rows}
 
 
 @router.get("/compliance-imports")
@@ -2095,17 +2586,81 @@ def list_imports(user: User = Depends(current_user), db: Session = Depends(get_d
     return [model_dict(item, [field.name for field in item.__table__.columns]) for item in db.scalars(select(ComplianceImport).where(ComplianceImport.organization_id == master_org).order_by(ComplianceImport.created_at.desc()))]
 
 
+@router.get("/compliance-generation/subjects")
+def list_generation_subjects(
+    organization_id: str,
+    subject_type: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """List active customer subjects available for a Product Admin run.
+
+    Compliance rules are owned by the hidden platform tenant.  Its seeded QA
+    Units must not accidentally appear as obligation targets, so this endpoint
+    accepts only an explicit, non-system customer organization.
+    """
+    require_platform_admin(user)
+    organization = customer_organization_or_404(db, organization_id)
+    model = SUBJECTS.get(subject_type)
+    if not model:
+        raise HTTPException(422, "Unsupported subject type")
+    rows = db.scalars(
+        select(model)
+        .where(model.organization_id == organization.id, model.status == "ACTIVE")
+        .order_by(model.name, model.id)
+    )
+    return [
+        {"id": row.id, "name": row.name, "code": row.code, "subject_type": subject_type}
+        for row in rows
+    ]
+
+
 @router.post("/compliance-generation/run")
 def run_generation(payload: GenerationRequest, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    org = org_for(user); require_manager(db, user, org); as_of = payload.as_of_date or date.today(); created = []
+    """Generate obligations for one explicit customer organization.
+
+    Product Admins manage the global master from the system tenant, therefore
+    their generation run must name a customer organization rather than using
+    the Product Admin's current (system) organization.  The tenant-manager
+    branch remains for internal/API compatibility, while still forbidding a
+    caller from naming a different tenant.
+    """
+    if payload.subject_id and not payload.subject_type:
+        raise HTTPException(422, "Select a subject type before selecting a subject")
+
+    if user.platform_role == PLATFORM_ADMIN_ROLE:
+        if not payload.organization_id:
+            raise HTTPException(422, "Select a customer organization before generating obligations")
+        organization = customer_organization_or_404(db, payload.organization_id)
+        if organization.status != "ACTIVE":
+            raise HTTPException(422, "Obligations can be generated only for an active organization")
+        org = organization.id
+    else:
+        org = org_for(user)
+        require_manager(db, user, org)
+        if payload.organization_id and payload.organization_id != org:
+            raise HTTPException(403, "You cannot generate obligations for another organization")
+
+    as_of = payload.as_of_date or date.today()
+    created = []
     subject_types = [payload.subject_type] if payload.subject_type else list(SUBJECTS)
     for subject_type in subject_types:
         model = SUBJECTS.get(subject_type)
-        if not model: raise HTTPException(422, "Unsupported subject type")
-        rows = [db.get(model, payload.subject_id)] if payload.subject_id else list(db.scalars(select(model).where(model.organization_id == org)))
+        if not model:
+            raise HTTPException(422, "Unsupported subject type")
+        rows = (
+            [db.get(model, payload.subject_id)]
+            if payload.subject_id
+            else list(db.scalars(select(model).where(model.organization_id == org, model.status == "ACTIVE")))
+        )
         for subject in rows:
-            if subject and subject.organization_id == org and can_access_subject(db, user, org, subject_type, subject.id): created.extend(generate_for_subject(db, org, subject_type, subject.id, as_of, user.id))
-    db.commit(); return {"created": len(created), "instance_ids": [item.id for item in created]}
+            if not subject or subject.organization_id != org:
+                continue
+            if user.platform_role != PLATFORM_ADMIN_ROLE and not can_access_subject(db, user, org, subject_type, subject.id):
+                continue
+            created.extend(generate_for_subject(db, org, subject_type, subject.id, as_of, user.id))
+    db.commit()
+    return {"created": len(created), "instance_ids": [item.id for item in created]}
 
 
 def filtered_instance_rows(
@@ -2143,7 +2698,19 @@ def filtered_instance_rows(
         row = instance_dict(db, instance, detail=False, cache=cache)
         
         if frequency and row["frequency"] != frequency: continue
-        if status and status not in {instance.status, row["display_status"]}: continue
+        # Dashboard cards use a few business groups rather than a single raw
+        # workflow value. Keeping those groups server-side means the count on
+        # a card and its in-place table filter always use identical rules.
+        requested_status = (status or "").upper()
+        if requested_status == "PENDING_ACTION":
+            matches_status = instance.status in {"PENDING", "IN_PROGRESS", "CORRECTION_REQUIRED", "REJECTED"}
+        elif requested_status in {"PENDING_APPROVAL", "AWAITING_REVIEW"}:
+            matches_status = instance.status in {"SUBMITTED", "UNDER_REVIEW"}
+        elif requested_status == "REJECTED":
+            matches_status = instance.status in {"REJECTED", "CORRECTION_REQUIRED"}
+        else:
+            matches_status = not requested_status or requested_status in {instance.status, row["display_status"]}
+        if not matches_status: continue
         if risk_level and row["risk_level"] != risk_level: continue
         if entity_type and instance.subject_type != entity_type: continue
         if compliance_area == "COMPANY" and instance.subject_type != "UNIT": continue
@@ -2168,7 +2735,31 @@ def list_instances(frequency: str | None = None, status: str | None = None, risk
     return list_page(results, page, min(page_size, 100))
 
 
-def assignment_queue(db: Session, user: User, assignment_type: str, statuses: set[str], page: int, page_size: int) -> dict:
+def assignment_queue(
+    db: Session,
+    user: User,
+    assignment_type: str,
+    statuses: set[str],
+    page: int,
+    page_size: int,
+    *,
+    q: str | None = None,
+    status: str | None = None,
+    risk_level: str | None = None,
+    frequency: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    subject_id: str | None = None,
+    include_unpaged: bool = False,
+) -> dict:
+    """Return work in the caller's authorized entity assignments.
+
+    MORAX assigns operational users to Units/Contractors through role scopes.
+    A per-compliance assignment can further identify a named Maker/Checker,
+    but cannot be required for the queue: recurring obligations generated
+    after an entity assignment must be immediately visible to that assignee.
+    The server therefore enforces the trusted entity scope for every row.
+    """
     roles = roles_for(db, user.id)
     required_roles = MAKER_ROLES if assignment_type == "MAKER" else CHECKER_ROLES
     if not roles & required_roles:
@@ -2180,7 +2771,37 @@ def assignment_queue(db: Session, user: User, assignment_type: str, statuses: se
         for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org, ComplianceInstance.status.in_(statuses)).order_by(ComplianceInstance.due_date))
         if can_access_subject(db, user, org, instance.subject_type, instance.subject_id)
     ]
-    return list_page(rows, max(1, page), min(max(1, page_size), 100))
+    filtered = []
+    for row in rows:
+        search = " ".join(str(row.get(key) or "") for key in ("compliance_name", "compliance_id", "act", "rule_reference", "document_type", "subject_name")).lower()
+        if q and q.lower() not in search:
+            continue
+        requested_status = (status or "").upper()
+        if requested_status and requested_status not in {row["status"], row["display_status"]}:
+            continue
+        if risk_level and row["risk_level"] != risk_level.upper():
+            continue
+        if frequency and row["frequency"] != frequency.upper():
+            continue
+        if subject_id and row["subject_id"] != subject_id:
+            # A Contractor selection represents the Contractor and its
+            # registered sites.  The latter keep their own subject IDs so
+            # their recurring obligations remain independent.
+            site = db.get(ContractorSite, row["subject_id"]) if row["subject_type"] == "CONTRACTOR_SITE" else None
+            if not site or site.contractor_id != subject_id:
+                continue
+        due_date = date.fromisoformat(row["due_date"])
+        if date_from and due_date < date_from:
+            continue
+        if date_to and due_date > date_to:
+            continue
+        filtered.append(row)
+    response = list_page(filtered, max(1, page), min(max(1, page_size), 100))
+    if include_unpaged:
+        # Internal-only metadata for accurate summary cards.  The route below
+        # removes it before serializing the API response.
+        response["_unpaged_rows"] = filtered
+    return response
 
 
 @router.get("/compliance-instances/my-maker-work")
@@ -2188,9 +2809,277 @@ def my_maker_work(page: int = 1, page_size: int = 50, user: User = Depends(curre
     return assignment_queue(db, user, "MAKER", {"PENDING", "IN_PROGRESS", "CORRECTION_REQUIRED", "REJECTED"}, page, page_size)
 
 
+@router.get("/compliance-instances/my-submissions")
+def my_submissions(
+    q: str | None = None,
+    status: str | None = None,
+    frequency: str | None = None,
+    timeliness: str | None = None,
+    risk_level: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    sort_by: str = "submitted_at",
+    sort_dir: str = "desc",
+    page: int = 1,
+    page_size: int = 25,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Return a Maker's latest submission per accessible compliance instance.
+
+    ComplianceSubmission remains the authoritative audit history.  This view
+    deliberately folds revisions into one current row so a corrected return
+    appears once, while the detail dialog retains every revision and decision.
+    """
+    if not roles_for(db, user.id) & MAKER_ROLES:
+        raise HTTPException(403, "Maker permission is required")
+    organization_id = org_for(user)
+    submissions = list(db.scalars(
+        select(ComplianceSubmission)
+        .join(ComplianceInstance, ComplianceSubmission.instance_id == ComplianceInstance.id)
+        .where(
+            ComplianceSubmission.submitted_by_id == user.id,
+            ComplianceInstance.organization_id == organization_id,
+        )
+        .order_by(ComplianceSubmission.submitted_at.desc(), ComplianceSubmission.revision.desc())
+    ))
+    latest_by_instance: dict[str, ComplianceSubmission] = {}
+    for submission in submissions:
+        latest_by_instance.setdefault(submission.instance_id, submission)
+
+    cache = build_instance_cache(db, organization_id)
+    rows: list[dict] = []
+    summary_rows: list[dict] = []
+    for instance_id, submission in latest_by_instance.items():
+        instance = db.get(ComplianceInstance, instance_id)
+        if not instance or not can_access_subject(db, user, organization_id, instance.subject_type, instance.subject_id):
+            continue
+        row = instance_dict(db, instance, cache=cache, detail=True)
+        submitted_at = submission.submitted_at
+        filed_late = submitted_at.date() > instance.due_date
+        current_status = instance.status
+        submission_status = "AWAITING_REVIEW" if current_status in {"SUBMITTED", "UNDER_REVIEW"} else current_status
+        row.update({
+            "submission_id": submission.id,
+            "submission_revision": submission.revision,
+            "submitted_date": submitted_at.isoformat(),
+            "filed_late": filed_late,
+            "submission_status": submission_status,
+        })
+        summary_rows.append(row)
+        text = " ".join(str(row.get(key) or "") for key in ("compliance_name", "compliance_id", "act", "rule_reference", "document_type")).lower()
+        if q and q.lower() not in text:
+            continue
+        if status and not (
+            status.upper() == "REJECTED" and submission_status in {"REJECTED", "CORRECTION_REQUIRED"}
+        ) and submission_status != status.upper():
+            continue
+        if frequency and str(row.get("frequency") or "").upper() != frequency.upper():
+            continue
+        if timeliness == "ON_TIME" and filed_late:
+            continue
+        if timeliness == "LATE" and not filed_late:
+            continue
+        if risk_level and str(row.get("risk_level") or "").upper() != risk_level.upper():
+            continue
+        if date_from and submitted_at.date() < date_from:
+            continue
+        if date_to and submitted_at.date() > date_to:
+            continue
+        rows.append(row)
+
+    summary = {
+        "all": len(summary_rows),
+        "awaiting_review": sum(row["submission_status"] == "AWAITING_REVIEW" for row in summary_rows),
+        "approved": sum(row["submission_status"] == "APPROVED" for row in summary_rows),
+        "rejected": sum(row["submission_status"] in {"REJECTED", "CORRECTION_REQUIRED"} for row in summary_rows),
+        "filed_on_time": sum(not row["filed_late"] for row in summary_rows),
+        "filed_late": sum(row["filed_late"] for row in summary_rows),
+    }
+    sort_fields = {
+        "due_date": lambda row: str(row["due_date"]),
+        "submitted_at": lambda row: str(row["submitted_date"]),
+        "risk_level": lambda row: str(row["risk_level"]),
+        "status": lambda row: str(row["submission_status"]),
+        "compliance_name": lambda row: str(row["compliance_name"]),
+    }
+    rows.sort(key=sort_fields.get(sort_by, sort_fields["submitted_at"]), reverse=sort_dir.lower() != "asc")
+    response = list_page(rows, max(1, page), min(max(1, page_size), 100))
+    response["summary"] = summary
+    return response
+
+
 @router.get("/compliance-instances/my-pending-approvals")
-def my_pending_approvals(page: int = 1, page_size: int = 50, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return assignment_queue(db, user, "CHECKER", {"SUBMITTED", "UNDER_REVIEW"}, page, page_size)
+def my_pending_approvals(
+    q: str | None = None,
+    status: str | None = None,
+    risk_level: str | None = None,
+    frequency: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    subject_id: str | None = None,
+    waiting_over_days: int | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    response = assignment_queue(
+        db, user, "CHECKER", {"SUBMITTED", "UNDER_REVIEW"}, page, page_size,
+        q=q, status=status, risk_level=risk_level, frequency=frequency, date_from=date_from, date_to=date_to, subject_id=subject_id, include_unpaged=True,
+    )
+    all_rows = response.pop("_unpaged_rows")
+    submission_by_id: dict[str, ComplianceSubmission | None] = {}
+    for row in all_rows:
+        latest_submission = db.scalar(select(ComplianceSubmission).where(
+            ComplianceSubmission.instance_id == row["id"],
+        ).order_by(ComplianceSubmission.revision.desc()))
+        submission_by_id[row["id"]] = latest_submission
+        if latest_submission:
+            maker = db.get(User, latest_submission.submitted_by_id)
+            row["submitted_at"] = latest_submission.submitted_at.isoformat()
+            row["submitted_by_name"] = maker.name if maker else "Maker"
+            row["submission_revision"] = latest_submission.revision
+            submitted_at = latest_submission.submitted_at
+            # SQLite test databases return naive datetimes even when the
+            # production column is timezone-aware. Treat historic naive data
+            # as UTC so queue waiting duration is stable in both stores.
+            if submitted_at.tzinfo is None:
+                submitted_at = submitted_at.replace(tzinfo=UTC)
+            row["waiting_days"] = max(0, (datetime.now(UTC) - submitted_at).days)
+        else:
+            row["submitted_at"] = None
+            row["submitted_by_name"] = "Not available"
+            row["submission_revision"] = None
+            row["waiting_days"] = 0
+    if waiting_over_days is not None:
+        all_rows = [row for row in all_rows if row.get("waiting_days", 0) > waiting_over_days]
+        response = list_page(all_rows, max(1, page), min(max(1, page_size), 100))
+    # The page items and unpaged rows share the same dictionaries, but retain
+    # this explicit update should list_page ever create row copies.
+    for row in response["items"]:
+        if row.get("submitted_at") is None and row["id"] in submission_by_id:
+            latest_submission = submission_by_id[row["id"]]
+            if latest_submission:
+                maker = db.get(User, latest_submission.submitted_by_id)
+                submitted_at = latest_submission.submitted_at
+                if submitted_at.tzinfo is None:
+                    submitted_at = submitted_at.replace(tzinfo=UTC)
+                row.update({
+                    "submitted_at": latest_submission.submitted_at.isoformat(),
+                    "submitted_by_name": maker.name if maker else "Maker",
+                    "submission_revision": latest_submission.revision,
+                    "waiting_days": max(0, (datetime.now(UTC) - submitted_at).days),
+                })
+    # Only queue records are returned, but the small summary is useful for
+    # the checker dashboard without leaking another user's submissions.
+    response["summary"] = {
+        "pending_review": response["total"],
+        "pending_more_than_3_days": sum(item.get("waiting_days", 0) > 3 for item in all_rows),
+        "overdue": sum(item.get("display_status") == "OVERDUE" for item in all_rows),
+        "due_this_month": sum(date.fromisoformat(item["due_date"]).month == date.today().month and date.fromisoformat(item["due_date"]).year == date.today().year for item in all_rows),
+    }
+    return response
+
+
+@router.get("/compliance-instances/my-review-history")
+def my_review_history(
+    q: str | None = None,
+    decision: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    sort_by: str = "reviewed_at",
+    sort_dir: str = "desc",
+    page: int = 1,
+    page_size: int = 25,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the logged-in Checker's final decisions, newest first.
+
+    A compliance instance can have several revisions.  Each final decision is
+    retained as its own history row, preserving rejection/resubmission audit
+    history rather than replacing it with the current instance state.
+    """
+    roles = roles_for(db, user.id)
+    if not roles & CHECKER_ROLES:
+        raise HTTPException(403, "Checker permission is required")
+    organization_id = org_for(user)
+    cache = build_instance_cache(db, organization_id)
+    decisions = list(db.scalars(select(ComplianceWorkflowHistory).where(
+        ComplianceWorkflowHistory.actor_id == user.id,
+        ComplianceWorkflowHistory.action.in_({"APPROVE", "REJECT", "REQUEST_CORRECTION"}),
+    ).order_by(ComplianceWorkflowHistory.created_at.desc())))
+    rows: list[dict] = []
+    for entry in decisions:
+        instance = db.get(ComplianceInstance, entry.instance_id)
+        if not instance or instance.organization_id != organization_id:
+            continue
+        if not can_access_subject(db, user, organization_id, instance.subject_type, instance.subject_id):
+            continue
+        reviewed_date = entry.created_at.date()
+        normalized_decision = "APPROVED" if entry.action == "APPROVE" else "REJECTED"
+        row = instance_dict(db, instance, cache=cache)
+        text = " ".join(str(row.get(key) or "") for key in ("compliance_name", "compliance_id", "act", "rule_reference", "subject_name")).lower()
+        if q and q.lower() not in text:
+            continue
+        if decision and normalized_decision != decision.upper():
+            continue
+        if date_from and reviewed_date < date_from:
+            continue
+        if date_to and reviewed_date > date_to:
+            continue
+        submission_revision = entry.submission_revision
+        submission_query = select(ComplianceSubmission).where(
+            ComplianceSubmission.instance_id == instance.id,
+        )
+        if submission_revision is not None:
+            submission_query = submission_query.where(ComplianceSubmission.revision == submission_revision)
+        else:
+            # Legacy history created before revision tracking: use the newest
+            # submission that existed when the decision was made, never a
+            # later resubmission.
+            submission_query = submission_query.where(ComplianceSubmission.submitted_at <= entry.created_at)
+        latest_submission = db.scalar(submission_query.order_by(ComplianceSubmission.revision.desc()))
+        maker = db.get(User, latest_submission.submitted_by_id) if latest_submission else None
+        row.update({
+            "decision": normalized_decision,
+            "review_action": entry.action,
+            "review_remarks": entry.comment,
+            "reviewed_at": entry.created_at.isoformat(),
+            "submitted_at": latest_submission.submitted_at.isoformat() if latest_submission else None,
+            "submitted_by_name": maker.name if maker else "Not available",
+            "submission_revision": latest_submission.revision if latest_submission else submission_revision,
+        })
+        if latest_submission:
+            submitted_at = latest_submission.submitted_at
+            reviewed_at = entry.created_at
+            if submitted_at.tzinfo is None:
+                submitted_at = submitted_at.replace(tzinfo=UTC)
+            if reviewed_at.tzinfo is None:
+                reviewed_at = reviewed_at.replace(tzinfo=UTC)
+            row["review_duration_hours"] = max(0, round((reviewed_at - submitted_at).total_seconds() / 3600, 2))
+        else:
+            row["review_duration_hours"] = None
+        rows.append(row)
+    review_durations = [row["review_duration_hours"] for row in rows if row["review_duration_hours"] is not None]
+    summary = {
+        "total_reviewed": len(rows),
+        "approved": sum(row["decision"] == "APPROVED" for row in rows),
+        "rejected": sum(row["decision"] == "REJECTED" for row in rows),
+        "average_review_hours": round(sum(review_durations) / len(review_durations), 2) if review_durations else 0,
+    }
+    sort_fields = {
+        "reviewed_at": lambda row: str(row["reviewed_at"]),
+        "submitted_at": lambda row: str(row["submitted_at"] or ""),
+        "compliance_name": lambda row: str(row["compliance_name"]),
+        "decision": lambda row: str(row["decision"]),
+        "review_duration": lambda row: float(row["review_duration_hours"] or 0),
+    }
+    rows.sort(key=sort_fields.get(sort_by, sort_fields["reviewed_at"]), reverse=sort_dir.lower() != "asc")
+    response = list_page(rows, max(1, page), min(max(1, page_size), 100))
+    response["summary"] = summary
+    return response
 
 
 @router.get("/compliance-instances/grouped")
@@ -2252,10 +3141,10 @@ def list_grouped_instances(
             **group,
             "records": records,
             "compliance_count": len(records),
-            "due_count": sum(row["display_status"] == "DUE" for row in records),
+            "due_count": sum(row["display_status"] in {"UPCOMING", "DUE_SOON", "DUE_TODAY"} for row in records),
             "overdue_count": sum(row["display_status"] == "OVERDUE" for row in records),
-            "awaiting_approval_count": sum(row["display_status"] == "PENDING_FOR_APPROVAL" for row in records),
-            "rejected_count": sum(row["display_status"] == "REJECTED_BY_CHECKER" for row in records),
+            "awaiting_approval_count": sum(row["status"] in {"SUBMITTED", "UNDER_REVIEW"} for row in records),
+            "rejected_count": sum(row["status"] == "REJECTED" for row in records),
         })
     groups.sort(key=lambda group: group["name"].lower())
     completed = sum(row["display_status"] == "COMPLETED" for row in rows)
@@ -2271,12 +3160,16 @@ def list_grouped_instances(
         "document_type_counts": type_counts,
         "status_counts": {
             "total": len(rows),
-            "due": sum(row["display_status"] == "DUE" for row in rows),
+            "due": sum(row["display_status"] in {"UPCOMING", "DUE_SOON", "DUE_TODAY"} for row in rows),
+            "upcoming": sum(row["display_status"] == "UPCOMING" for row in rows),
+            "due_soon": sum(row["display_status"] == "DUE_SOON" for row in rows),
+            "due_today": sum(row["display_status"] == "DUE_TODAY" for row in rows),
             "overdue": sum(row["display_status"] == "OVERDUE" for row in rows),
             "completed": completed,
             "completed_late": completed_late,
-            "rejected": sum(row["display_status"] == "REJECTED_BY_CHECKER" for row in rows),
-            "pending_approval": sum(row["display_status"] == "PENDING_FOR_APPROVAL" for row in rows),
+            "not_applicable": sum(row["display_status"] == "NOT_APPLICABLE" for row in rows),
+            "rejected": sum(row["status"] == "REJECTED" for row in rows),
+            "pending_approval": sum(row["status"] in {"SUBMITTED", "UNDER_REVIEW"} for row in rows),
             "compliance_rate": round(((completed + completed_late) / total_actionable) * 100) if total_actionable else 0,
         },
         "page": safe_page,
@@ -2392,9 +3285,21 @@ def submit_instance(instance_id: str, payload: SubmissionInput, user: User = Dep
     if not roles & MAKER_ROLES: raise HTTPException(403, "Maker permission is required")
     if instance.row_version != payload.row_version:
         raise HTTPException(409, "This compliance was changed by another user; refresh and try again")
+    was_resubmission = instance.status in {"CORRECTION_REQUIRED", "REJECTED"}
     assert_assignment_or_admin(db, instance, user.id, roles, "MAKER"); submit(db, instance, user.id)
-    for assignment in db.query(ComplianceAssignment).filter_by(instance_id=instance.id, assignment_type="CHECKER", active=True):
-        db.add(InAppNotification(organization_id=instance.organization_id, recipient_id=assignment.user_id, notification_type="PENDING_APPROVAL", title="Compliance awaiting your review", body=instance.activity_reference, reference_type="ComplianceInstance", reference_id=instance.id))
+    db.flush()
+    revision = db.scalar(select(func.max(ComplianceSubmission.revision)).where(ComplianceSubmission.instance_id == instance.id))
+    notify_compliance_event(
+        db,
+        instance,
+        recipient_ids=assignment_recipients(db, instance.id, "CHECKER"),
+        notification_type="COMPLIANCE_RESUBMITTED" if was_resubmission else "COMPLIANCE_SUBMITTED",
+        event_type="RESUBMITTED" if was_resubmission else "SUBMITTED",
+        title="Compliance resubmitted for review" if was_resubmission else "Compliance awaiting your review",
+        body=instance.activity_reference,
+        priority="HIGH",
+        submission_revision=revision,
+    )
     commit_or_conflict(db, "This compliance has already been submitted; refresh and try again")
     return instance_dict(db, instance, detail=True)
 
@@ -2406,13 +3311,26 @@ def begin_review(instance_id: str, payload: WorkflowDecision, user: User = Depen
     assert_assignment_or_admin(db, instance, user.id, roles, "CHECKER")
     if instance.status != "SUBMITTED": raise HTTPException(409, "Only submitted compliances can enter review")
     if payload.row_version != instance.row_version: raise HTTPException(409, "This compliance was changed by another user")
-    transition(db, instance, user.id, "BEGIN_REVIEW", "UNDER_REVIEW", payload.comment); db.commit(); return instance_dict(db, instance, detail=True)
+    latest_submission = db.scalar(select(ComplianceSubmission).where(
+        ComplianceSubmission.instance_id == instance.id,
+    ).order_by(ComplianceSubmission.revision.desc()))
+    transition(
+        db,
+        instance,
+        user.id,
+        "BEGIN_REVIEW",
+        "UNDER_REVIEW",
+        payload.comment,
+        submission_revision=latest_submission.revision if latest_submission else None,
+    ); db.commit(); return instance_dict(db, instance, detail=True)
 
 
 def reviewer_action(instance_id: str, payload: WorkflowDecision, target: str, action: str, user: User, db: Session):
     instance = get_instance_or_404(db, user, instance_id); roles = roles_for(db, user.id)
     if not roles & CHECKER_ROLES: raise HTTPException(403, "Checker permission is required")
     assert_assignment_or_admin(db, instance, user.id, roles, "CHECKER")
+    if target in {"REJECTED", "CORRECTION_REQUIRED"} and not payload.comment.strip():
+        raise HTTPException(422, "Remarks are required when rejecting or returning a compliance")
     if instance.status != "UNDER_REVIEW": raise HTTPException(409, "Compliance must be under review")
     if payload.row_version != instance.row_version: raise HTTPException(409, "This compliance was changed by another user")
     latest_submission = db.scalar(select(ComplianceSubmission).where(ComplianceSubmission.instance_id == instance.id).order_by(ComplianceSubmission.revision.desc()))
@@ -2422,12 +3340,48 @@ def reviewer_action(instance_id: str, payload: WorkflowDecision, target: str, ac
         version = db.get(ComplianceRuleVersion, instance.rule_version_id)
         if version.required_document and not db.query(ComplianceEvidence).filter_by(instance_id=instance.id, verification_state="VERIFIED").first():
             raise HTTPException(422, "Required evidence must be verified before approval")
-    transition(db, instance, user.id, action, target, payload.comment)
+    transition(
+        db,
+        instance,
+        user.id,
+        action,
+        target,
+        payload.comment,
+        submission_revision=latest_submission.revision if latest_submission else None,
+    )
     if target in {"CORRECTION_REQUIRED", "REJECTED"}:
-        for assignment in db.query(ComplianceAssignment).filter_by(instance_id=instance.id, assignment_type="MAKER", active=True):
-            db.add(InAppNotification(organization_id=instance.organization_id, recipient_id=assignment.user_id, notification_type=target, title="Compliance requires your attention", body=payload.comment, reference_type="ComplianceInstance", reference_id=instance.id))
+        notify_compliance_event(
+            db,
+            instance,
+            recipient_ids=assignment_recipients(db, instance.id, "MAKER"),
+            notification_type="COMPLIANCE_REJECTED",
+            event_type="REJECTED",
+            title="Compliance requires correction",
+            body=payload.comment,
+            priority="HIGH",
+            submission_revision=latest_submission.revision if latest_submission else None,
+        )
     if target == "APPROVED":
-        instance.approved_at = datetime.now(UTC); instance.approved_by_id = user.id; instance.completion_late = instance.approved_at.date() > instance.due_date
+        # Filing timeliness belongs to the Maker's latest submission, not to
+        # the later Checker decision.  A timely submission approved tomorrow
+        # must remain filed on time in history, dashboards and reports.
+        instance.approved_at = datetime.now(UTC)
+        instance.approved_by_id = user.id
+        instance.completion_late = bool(
+            latest_submission
+            and latest_submission.submitted_at.date() > instance.due_date
+        )
+        notify_compliance_event(
+            db,
+            instance,
+            recipient_ids=assignment_recipients(db, instance.id, "MAKER"),
+            notification_type="COMPLIANCE_APPROVED",
+            event_type="APPROVED",
+            title="Compliance approved",
+            body=instance.activity_reference,
+            priority="NORMAL",
+            submission_revision=latest_submission.revision if latest_submission else None,
+        )
     db.commit(); return instance_dict(db, instance, detail=True)
 
 
@@ -2523,19 +3477,244 @@ def create_contract_expiry_alerts(db: Session, organization_id: str, days_ahead:
         db.commit()
 
 
+def support_ticket_admin(user: User) -> bool:
+    return user.platform_role == PLATFORM_ADMIN_ROLE
+
+
+def support_ticket_or_404(db: Session, user: User, ticket_id: str) -> SupportTicket:
+    ticket = db.get(SupportTicket, ticket_id)
+    if not ticket or (not support_ticket_admin(user) and (ticket.organization_id != org_for(user) or (not is_org_admin(db, user, ticket.organization_id) and ticket.creator_id != user.id))):
+        raise HTTPException(404, "Support ticket not found")
+    return ticket
+
+
+def support_ticket_dict(db: Session, ticket: SupportTicket, detail: bool = False) -> dict:
+    creator = db.get(User, ticket.creator_id)
+    assignee = db.get(User, ticket.assigned_to_id) if ticket.assigned_to_id else None
+    row = model_dict(ticket, [field.name for field in ticket.__table__.columns])
+    row.update({
+        "creator_name": creator.name if creator else "Unknown user",
+        "creator_email": creator.email if creator else "",
+        "assignee_name": assignee.name if assignee else None,
+    })
+    if detail:
+        messages = list(db.scalars(select(SupportTicketMessage).where(SupportTicketMessage.ticket_id == ticket.id).order_by(SupportTicketMessage.created_at)))
+        attachments = list(db.scalars(select(SupportTicketAttachment).where(SupportTicketAttachment.ticket_id == ticket.id).order_by(SupportTicketAttachment.created_at)))
+        row["messages"] = [model_dict(message, [field.name for field in message.__table__.columns]) | {"author_name": (db.get(User, message.author_id).name if db.get(User, message.author_id) else "Unknown user")} for message in messages]
+        row["attachments"] = [model_dict(item, [field.name for field in item.__table__.columns]) for item in attachments]
+        row["activity"] = [model_dict(item, [field.name for field in item.__table__.columns]) for item in db.scalars(select(SupportTicketActivity).where(SupportTicketActivity.ticket_id == ticket.id).order_by(SupportTicketActivity.created_at))]
+    else:
+        row["reply_count"] = db.scalar(select(func.count(SupportTicketMessage.id)).where(SupportTicketMessage.ticket_id == ticket.id)) or 0
+    return row
+
+
+def notify_ticket_admins(db: Session, ticket: SupportTicket, title: str, body: str | None) -> None:
+    for admin in db.scalars(select(User).where(User.platform_role == PLATFORM_ADMIN_ROLE, User.active.is_(True))):
+        emit_notification(
+            db,
+            organization_id=ticket.organization_id,
+            recipient_id=admin.id,
+            notification_type="SUPPORT_TICKET_CREATED",
+            category="SUPPORT",
+            event_type="TICKET_CREATED",
+            priority="HIGH" if ticket.priority in {"HIGH", "URGENT"} else "NORMAL",
+            title=title,
+            body=body,
+            entity_type="SupportTicket",
+            entity_id=ticket.id,
+            reference_type="SupportTicket",
+            reference_id=ticket.id,
+            event_key=f"ticket:{ticket.id}:created:recipient:{admin.id}",
+        )
+
+
+@router.get("/support-tickets")
+def list_support_tickets(q: str | None = None, status: str | None = None, priority: str | None = None, category: str | None = None, issue_type: str | None = None, mine_only: bool = False, hide_closed: bool = False, page: int = 1, page_size: int = 25, sort_by: str = "last_activity_at", sort_dir: str = "desc", user: User = Depends(current_user), db: Session = Depends(get_db)):
+    query = select(SupportTicket)
+    if not support_ticket_admin(user):
+        organization_id = org_for(user)
+        query = query.where(SupportTicket.organization_id == organization_id)
+        if not is_org_admin(db, user, organization_id): query = query.where(SupportTicket.creator_id == user.id)
+    if mine_only: query = query.where(SupportTicket.creator_id == user.id)
+    # Composite ticket dashboard metrics are filtered by the same server-side
+    # definitions used for their counts; raw status filters remain unchanged.
+    metric_status = (status or "").upper()
+    if metric_status == "ACTIVE": query = query.where(SupportTicket.status.in_(["OPEN", "IN_PROGRESS"]))
+    elif metric_status == "RESOLVED_CLOSED": query = query.where(SupportTicket.status.in_(["RESOLVED", "CLOSED"]))
+    elif metric_status == "URGENT_OPEN": query = query.where(SupportTicket.priority.in_(["HIGH", "URGENT"]), SupportTicket.status.not_in(["RESOLVED", "CLOSED"]))
+    elif metric_status: query = query.where(SupportTicket.status == metric_status)
+    if priority: query = query.where(SupportTicket.priority == priority.upper())
+    if category: query = query.where(SupportTicket.category == category)
+    if issue_type: query = query.where(SupportTicket.issue_type == issue_type.upper())
+    if hide_closed: query = query.where(SupportTicket.status.not_in(["RESOLVED", "CLOSED"]))
+    tickets = list(db.scalars(query))
+    rows = [support_ticket_dict(db, ticket) for ticket in tickets]
+    if q:
+        needle = q.lower(); rows = [row for row in rows if needle in " ".join(str(row.get(key) or "") for key in ("ticket_number", "subject", "creator_name", "category", "issue_type")).lower()]
+    rows.sort(key=lambda row: str(row.get(sort_by) or ""), reverse=sort_dir.lower() != "asc")
+    response = list_page(rows, max(1, page), min(max(1, page_size), 100))
+    response["summary"] = {
+        "all": len(rows), "active": sum(row["status"] in {"OPEN", "IN_PROGRESS"} for row in rows),
+        "waiting": sum(row["status"] == "WAITING_ON_CUSTOMER" for row in rows),
+        "urgent": sum(row["priority"] in {"HIGH", "URGENT"} and row["status"] not in {"RESOLVED", "CLOSED"} for row in rows),
+        "closed": sum(row["status"] in {"RESOLVED", "CLOSED"} for row in rows),
+    }
+    return response
+
+
+@router.post("/support-tickets")
+def create_support_ticket(payload: SupportTicketInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    org = org_for(user); year_month = datetime.now(UTC).strftime("%y%m")
+    sequence = (db.scalar(select(func.count(SupportTicket.id)).where(SupportTicket.ticket_number.like(f"SUP-{year_month}-%"))) or 0) + 1
+    ticket = SupportTicket(organization_id=org, ticket_number=f"SUP-{year_month}-{sequence:04d}", subject=payload.subject.strip(), category=payload.category.strip(), issue_type=payload.issue_type, priority=payload.priority, creator_id=user.id)
+    db.add(ticket); db.flush(); db.add(SupportTicketMessage(ticket_id=ticket.id, author_id=user.id, body=payload.description.strip())); db.add(SupportTicketActivity(ticket_id=ticket.id, actor_id=user.id, action="CREATED", detail=f"Ticket created: {payload.issue_type.replace('_', ' ')}")); audit(db, organization_id=org, actor_id=user.id, action="CREATE_SUPPORT_TICKET", module="SUPPORT", entity_type="SupportTicket", entity_id=ticket.id, new={"ticket_number": ticket.ticket_number, "issue_type": payload.issue_type}); notify_ticket_admins(db, ticket, f"New support ticket {ticket.ticket_number}", ticket.subject); db.commit(); return support_ticket_dict(db, ticket, detail=True)
+
+
+@router.get("/support-tickets/{ticket_id}")
+def get_support_ticket(ticket_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    return support_ticket_dict(db, support_ticket_or_404(db, user, ticket_id), detail=True)
+
+
+@router.post("/support-tickets/{ticket_id}/replies")
+def reply_support_ticket(ticket_id: str, payload: SupportTicketReplyInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ticket = support_ticket_or_404(db, user, ticket_id)
+    if ticket.status == "CLOSED": raise HTTPException(409, "This ticket is already closed")
+    message = SupportTicketMessage(ticket_id=ticket.id, author_id=user.id, body=payload.body.strip()); db.add(message); db.flush(); ticket.last_activity_at = datetime.now(UTC); db.add(SupportTicketActivity(ticket_id=ticket.id, actor_id=user.id, action="REPLIED", detail=payload.body.strip()[:250]))
+    recipients = [db.get(User, ticket.creator_id)] if support_ticket_admin(user) else list(db.scalars(select(User).where(User.platform_role == PLATFORM_ADMIN_ROLE, User.active.is_(True))))
+    for recipient in recipients:
+        if recipient and recipient.id != user.id:
+            emit_notification(db, organization_id=ticket.organization_id, recipient_id=recipient.id, notification_type="SUPPORT_TICKET_REPLY", category="SUPPORT", event_type="TICKET_REPLY", priority="NORMAL", title=f"Reply on {ticket.ticket_number}", body=ticket.subject, entity_type="SupportTicket", entity_id=ticket.id, reference_type="SupportTicket", reference_id=ticket.id, event_key=f"ticket:{ticket.id}:reply:{message.id}:recipient:{recipient.id}")
+    db.commit(); return support_ticket_dict(db, ticket, detail=True)
+
+
+@router.patch("/support-tickets/{ticket_id}")
+def update_support_ticket(ticket_id: str, payload: SupportTicketUpdateInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ticket = support_ticket_or_404(db, user, ticket_id)
+    if not support_ticket_admin(user):
+        if payload.status != "OPEN" or ticket.creator_id != user.id: raise HTTPException(403, "Only MORAX Admin can update this ticket")
+    if payload.status: ticket.status = payload.status
+    if payload.issue_type: ticket.issue_type = payload.issue_type
+    if payload.priority: ticket.priority = payload.priority
+    if payload.assigned_to_id is not None:
+        assignee = db.get(User, payload.assigned_to_id) if payload.assigned_to_id else None
+        if assignee and (not assignee.active or assignee.platform_role != PLATFORM_ADMIN_ROLE):
+            raise HTTPException(422, "Tickets can be assigned only to an active MORAX Admin")
+        ticket.assigned_to_id = assignee.id if assignee else None
+    ticket.last_activity_at = datetime.now(UTC)
+    activity_detail = f"Status: {ticket.status}; Priority: {ticket.priority}; Issue type: {ticket.issue_type.replace('_', ' ')}"
+    if payload.assigned_to_id is not None:
+        activity_detail += f"; Assigned to: {assignee.name if assignee else 'Unassigned'}"
+    db.add(SupportTicketActivity(ticket_id=ticket.id, actor_id=user.id, action="UPDATED", detail=activity_detail))
+    event_type = "TICKET_REOPENED" if payload.status == "OPEN" else ("TICKET_RESOLVED" if payload.status == "RESOLVED" else ("TICKET_CLOSED" if payload.status == "CLOSED" else "TICKET_UPDATED"))
+    emit_notification(db, organization_id=ticket.organization_id, recipient_id=ticket.creator_id, notification_type="SUPPORT_TICKET_UPDATE", category="SUPPORT", event_type=event_type, priority="NORMAL", title=f"Ticket {ticket.ticket_number} updated", body=ticket.status.replace("_", " "), entity_type="SupportTicket", entity_id=ticket.id, reference_type="SupportTicket", reference_id=ticket.id, event_key=f"ticket:{ticket.id}:{event_type}:{ticket.status}:{ticket.priority}:{ticket.issue_type}:recipient:{ticket.creator_id}")
+    if ticket.assigned_to_id and ticket.assigned_to_id != user.id:
+        emit_notification(db, organization_id=ticket.organization_id, recipient_id=ticket.assigned_to_id, notification_type="SUPPORT_TICKET_ASSIGNED", category="SUPPORT", event_type="TICKET_ASSIGNED", priority="HIGH" if ticket.priority in {"HIGH", "URGENT"} else "NORMAL", title=f"Ticket {ticket.ticket_number} assigned to you", body=ticket.subject, entity_type="SupportTicket", entity_id=ticket.id, reference_type="SupportTicket", reference_id=ticket.id, event_key=f"ticket:{ticket.id}:assigned:{ticket.assigned_to_id}")
+    db.commit(); return support_ticket_dict(db, ticket, detail=True)
+
+
+@router.post("/support-tickets/{ticket_id}/attachments")
+async def upload_support_ticket_attachment(ticket_id: str, file: UploadFile = File(...), user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ticket = support_ticket_or_404(db, user, ticket_id); stored_name, size, checksum = await save_upload(file); attachment = SupportTicketAttachment(ticket_id=ticket.id, original_filename=file.filename or "attachment", stored_filename=stored_name, content_type=file.content_type, size_bytes=size, uploaded_by_id=user.id); db.add(attachment); ticket.last_activity_at = datetime.now(UTC); db.commit(); return model_dict(attachment, [field.name for field in attachment.__table__.columns])
+
+
+@router.get("/support-ticket-attachments/{attachment_id}/download")
+def download_support_ticket_attachment(attachment_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    attachment = db.get(SupportTicketAttachment, attachment_id)
+    if not attachment: raise HTTPException(404, "Ticket attachment not found")
+    support_ticket_or_404(db, user, attachment.ticket_id)
+    return FileResponse(file_path(attachment.stored_filename), filename=attachment.original_filename, media_type=attachment.content_type or "application/octet-stream")
+
+
+def notification_visible_to_user(db: Session, user: User, notification: InAppNotification) -> bool:
+    """Recheck live entity access so revoked scopes cannot read old alerts."""
+    if notification.recipient_id != user.id:
+        return False
+    if notification.reference_type == "ComplianceInstance" and notification.reference_id:
+        instance = db.get(ComplianceInstance, notification.reference_id)
+        return bool(
+            instance
+            and can_access_subject(db, user, instance.organization_id, instance.subject_type, instance.subject_id)
+        )
+    if notification.reference_type == "SupportTicket" and notification.reference_id:
+        ticket = db.get(SupportTicket, notification.reference_id)
+        return bool(ticket and (support_ticket_admin(user) or ticket.organization_id == org_for(user)))
+    return notification.organization_id == org_for(user) or support_ticket_admin(user)
+
+
 @router.get("/notifications")
-def list_notifications(unread_only: bool = False, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    query = select(InAppNotification).where(InAppNotification.recipient_id == user.id)
-    if unread_only: query = query.where(InAppNotification.read_at.is_(None))
-    return [model_dict(item, [field.name for field in item.__table__.columns]) for item in db.scalars(query.order_by(InAppNotification.created_at.desc()))]
+def list_notifications(
+    unread_only: bool = False,
+    category: str | None = None,
+    priority: str | None = None,
+    q: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    page: int = 1,
+    page_size: int = 25,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    rows = [
+        item for item in db.scalars(
+            select(InAppNotification)
+            .where(InAppNotification.recipient_id == user.id)
+            .order_by(InAppNotification.created_at.desc())
+        )
+        if notification_visible_to_user(db, user, item)
+    ]
+    if unread_only:
+        rows = [item for item in rows if item.read_at is None]
+    if category:
+        rows = [item for item in rows if item.category == category.upper()]
+    if priority:
+        rows = [item for item in rows if item.priority == priority.upper()]
+    if date_from:
+        rows = [item for item in rows if item.created_at.date() >= date_from]
+    if date_to:
+        rows = [item for item in rows if item.created_at.date() <= date_to]
+    if q:
+        needle = q.lower()
+        rows = [item for item in rows if needle in " ".join([item.title, item.body or "", item.category, item.event_type or ""]).lower()]
+    serialized = [model_dict(item, [field.name for field in item.__table__.columns]) for item in rows]
+    response = list_page(serialized, max(1, page), min(max(1, page_size), 100))
+    response["summary"] = {
+        "total": len(rows),
+        "unread": sum(item.read_at is None for item in rows),
+        "action_required": sum(item.read_at is None and item.priority in {"HIGH", "CRITICAL"} for item in rows),
+        "critical": sum(item.priority == "CRITICAL" for item in rows),
+    }
+    return response
+
+
+@router.get("/notifications/summary")
+def notification_summary(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rows = [item for item in db.scalars(select(InAppNotification).where(InAppNotification.recipient_id == user.id)) if notification_visible_to_user(db, user, item)]
+    return {
+        "total": len(rows),
+        "unread": sum(item.read_at is None for item in rows),
+        "action_required": sum(item.read_at is None and item.priority in {"HIGH", "CRITICAL"} for item in rows),
+        "critical": sum(item.priority == "CRITICAL" for item in rows),
+    }
 
 
 @router.post("/notifications/{notification_id}/read")
 def read_notification(notification_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     notification = db.get(InAppNotification, notification_id)
-    if not notification or notification.recipient_id != user.id: raise HTTPException(404, "Notification not found")
-    notification.read_at = datetime.now(UTC)
+    if not notification or not notification_visible_to_user(db, user, notification): raise HTTPException(404, "Notification not found")
+    if notification.read_at is None:
+        notification.read_at = datetime.now(UTC)
     db.commit(); return {"ok": True}
+
+
+@router.post("/notifications/read-all")
+def read_all_notifications(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    updated = 0
+    for notification in db.scalars(select(InAppNotification).where(InAppNotification.recipient_id == user.id, InAppNotification.read_at.is_(None))):
+        if notification_visible_to_user(db, user, notification):
+            notification.read_at = datetime.now(UTC)
+            updated += 1
+    db.commit()
+    return {"ok": True, "updated": updated}
 
 
 @router.delete("/documents/{evidence_id}")
@@ -2602,15 +3781,7 @@ def dashboard_status(user: User = Depends(current_user), db: Session = Depends(g
 
 
 def dashboard_display_status(instance: ComplianceInstance, today_value: date) -> str:
-    if instance.status in {"PENDING", "IN_PROGRESS", "CORRECTION_REQUIRED"}:
-        return "OVERDUE" if instance.due_date < today_value else "DUE"
-    if instance.status in {"SUBMITTED", "UNDER_REVIEW"}:
-        return "PENDING_FOR_APPROVAL"
-    if instance.status == "APPROVED":
-        return "COMPLETED_LATE" if instance.completion_late else "COMPLETED"
-    if instance.status == "NOT_APPLICABLE":
-        return "NOT_APPLICABLE"
-    return "REJECTED_BY_CHECKER"
+    return compliance_display_status(instance, today_value)
 
 
 @router.get("/dashboard/overview")
@@ -2619,6 +3790,12 @@ def dashboard_overview(
     entity_id: str | None = None,
     contractor_id: str | None = None,
     period_key: str | None = None,
+    table_status: str | None = None,
+    table_frequency: str | None = None,
+    table_subject_id: str | None = None,
+    table_q: str | None = None,
+    table_page: int = 1,
+    table_page_size: int = 25,
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ):
@@ -2628,31 +3805,38 @@ def dashboard_overview(
     identifiers. Entity is MORAX's existing compliance subject: Unit,
     Contractor, or Contractor Site.
     """
-    organization_id = org_for(user)
     require_permission(db, user, "dashboard.read")
+    # Product administrators receive an explicit platform projection across
+    # customer tenants. Every other role remains strictly inside its active
+    # organization context.
+    organization_ids = (
+        list(db.scalars(select(Organization.id).where(Organization.is_system.is_(False))))
+        if user.platform_role == PLATFORM_ADMIN_ROLE
+        else [org_for(user)]
+    )
     today_value = date.today()
     units = {
         item.id: item
         for item in db.scalars(
-            select(Unit).where(Unit.organization_id == organization_id)
+            select(Unit).where(Unit.organization_id.in_(organization_ids))
         )
-        if can_access_subject(db, user, organization_id, "UNIT", item.id)
+        if can_access_subject(db, user, item.organization_id, "UNIT", item.id)
     }
     contractors = {
         item.id: item
         for item in db.scalars(
-            select(Contractor).where(Contractor.organization_id == organization_id)
+            select(Contractor).where(Contractor.organization_id.in_(organization_ids))
         )
-        if can_access_subject(db, user, organization_id, "CONTRACTOR", item.id)
+        if can_access_subject(db, user, item.organization_id, "CONTRACTOR", item.id)
     }
     sites = {
         item.id: item
         for item in db.scalars(
             select(ContractorSite).where(
-                ContractorSite.organization_id == organization_id
+                ContractorSite.organization_id.in_(organization_ids)
             )
         )
-        if can_access_subject(db, user, organization_id, "CONTRACTOR_SITE", item.id)
+        if can_access_subject(db, user, item.organization_id, "CONTRACTOR_SITE", item.id)
     }
 
     def site_unit_id(site: ContractorSite) -> str | None:
@@ -2735,11 +3919,11 @@ def dashboard_overview(
     rows: list[dict] = []
     for instance in db.scalars(
         select(ComplianceInstance)
-        .where(ComplianceInstance.organization_id == organization_id)
+        .where(ComplianceInstance.organization_id.in_(organization_ids))
         .order_by(ComplianceInstance.due_date)
     ):
         if not can_access_subject(
-            db, user, organization_id, instance.subject_type, instance.subject_id
+            db, user, instance.organization_id, instance.subject_type, instance.subject_id
         ):
             continue
         subject = (
@@ -2791,6 +3975,7 @@ def dashboard_overview(
                 "period_key": instance.period_key,
                 "due_date": instance.due_date.isoformat(),
                 "status": instance.status,
+                "completion_late": instance.completion_late,
                 "display_status": display_status,
                 "row_version": instance.row_version,
                 "is_overdue": display_status == "OVERDUE",
@@ -2801,24 +3986,84 @@ def dashboard_overview(
             }
         )
 
+    def analytics_status(item: dict) -> str:
+        """Provide one mutually-exclusive analytics segment without changing
+        the separate deadline and workflow status values on the instance."""
+        if item["status"] == "APPROVED":
+            return "COMPLETED_LATE" if item.get("completion_late") else "COMPLETED"
+        if item["status"] in {"CORRECTION_REQUIRED", "REJECTED"}:
+            return "REJECTED_BY_CHECKER"
+        if item["status"] in {"SUBMITTED", "UNDER_REVIEW"}:
+            return "PENDING_FOR_APPROVAL"
+        if item["display_status"] == "OVERDUE":
+            return "OVERDUE"
+        if item["display_status"] == "NOT_APPLICABLE":
+            return "NOT_APPLICABLE"
+        return "DUE"
+
+    for item in rows:
+        item["analytics_status"] = analytics_status(item)
+
+    requested_table_status = (table_status or "").upper()
+    requested_frequency = (table_frequency or "").upper()
+    query_text = (table_q or "").strip().lower()
+
+    def matches_table_selection(item: dict) -> bool:
+        # A contractor summary represents the contractor and any sites below it.
+        # Unit summaries remain an exact unit selection. This keeps the table
+        # selection consistent with the contractor-level analytics aggregate.
+        if table_subject_id and item["subject_id"] != table_subject_id:
+            if item.get("contractor_id") != table_subject_id:
+                return False
+        if requested_frequency and item["frequency"] != requested_frequency:
+            return False
+        if requested_table_status == "TOTAL":
+            pass
+        elif requested_table_status == "COMPLETED_ALL":
+            if item["status"] != "APPROVED":
+                return False
+        elif requested_table_status == "PENDING_ACTION":
+            if item["status"] not in {"PENDING", "IN_PROGRESS", "CORRECTION_REQUIRED", "REJECTED"}:
+                return False
+        elif requested_table_status == "AWAITING_REVIEW":
+            if item["status"] not in {"SUBMITTED", "UNDER_REVIEW"}:
+                return False
+        elif requested_table_status == "REJECTED":
+            if item["status"] not in {"CORRECTION_REQUIRED", "REJECTED"}:
+                return False
+        elif requested_table_status and item["analytics_status"] != requested_table_status and item["display_status"] != requested_table_status:
+            return False
+        if query_text and query_text not in " ".join(
+            str(item.get(field) or "")
+            for field in ("compliance_id", "compliance_name", "subject_name", "frequency")
+        ).lower():
+            return False
+        return True
+
+    table_rows = [item for item in rows if matches_table_selection(item)]
+    table_page = max(1, table_page)
+    table_page_size = min(max(1, table_page_size), 100)
+    table_start = (table_page - 1) * table_page_size
+
     total = len(rows)
     completed = sum(item["status"] == "APPROVED" for item in rows)
     overdue = sum(item["display_status"] == "OVERDUE" for item in rows)
-    due_soon = sum(
-        item["status"] not in {"APPROVED", "NOT_APPLICABLE"}
-        and today_value <= date.fromisoformat(item["due_date"]) <= today_value + timedelta(days=7)
-        for item in rows
-    )
+    due_soon = sum(item["display_status"] == "DUE_SOON" for item in rows)
+    due_today = sum(item["display_status"] == "DUE_TODAY" for item in rows)
+    upcoming_count = sum(item["display_status"] == "UPCOMING" for item in rows)
+    not_applicable = sum(item["display_status"] == "NOT_APPLICABLE" for item in rows)
     pending = sum(
         item["status"] in {"PENDING", "IN_PROGRESS", "CORRECTION_REQUIRED"}
         for item in rows
     )
+    awaiting_review = sum(item["status"] in {"SUBMITTED", "UNDER_REVIEW"} for item in rows)
+    rejected = sum(item["status"] in {"CORRECTION_REQUIRED", "REJECTED"} for item in rows)
     statuses: dict[str, int] = {}
     frequencies: dict[str, int] = {}
     entity_health: dict[str, dict] = {}
     contractor_health: dict[str, dict] = {}
     for item in rows:
-        status = item["display_status"]
+        status = item["analytics_status"]
         statuses[status] = statuses.get(status, 0) + 1
         frequency = item["frequency"] or "UNCONFIGURED"
         frequencies[frequency] = frequencies.get(frequency, 0) + 1
@@ -2829,11 +4074,13 @@ def dashboard_overview(
                 "name": item["subject_name"],
                 "entity_type": item["subject_type"],
                 "total": 0,
+                "due": 0,
                 "completed": 0,
                 "overdue": 0,
             },
         )
         entity["total"] += 1
+        entity["due"] += item["analytics_status"] == "DUE"
         entity["completed"] += item["status"] == "APPROVED"
         entity["overdue"] += item["display_status"] == "OVERDUE"
         if item["contractor_id"]:
@@ -2845,11 +4092,13 @@ def dashboard_overview(
                         "id": contractor.id,
                         "name": contractor.name,
                         "total": 0,
+                        "due": 0,
                         "completed": 0,
                         "overdue": 0,
                     },
                 )
                 contractor_data["total"] += 1
+                contractor_data["due"] += item["analytics_status"] == "DUE"
                 contractor_data["completed"] += item["status"] == "APPROVED"
                 contractor_data["overdue"] += item["display_status"] == "OVERDUE"
 
@@ -2884,9 +4133,14 @@ def dashboard_overview(
             "total": total,
             "completed": completed,
             "pending": pending,
+            "awaiting_review": awaiting_review,
+            "rejected": rejected,
             "overdue": overdue,
             "due_soon": due_soon,
-            "completion_rate": round(completed / total * 100, 1) if total else 0,
+            "due_today": due_today,
+            "upcoming": upcoming_count,
+            "not_applicable": not_applicable,
+            "completion_rate": round(completed / max(1, sum(item["status"] != "NOT_APPLICABLE" for item in rows)) * 100, 1) if total else 0,
         },
         "status_distribution": [
             {"name": name, "value": value}
@@ -2899,6 +4153,12 @@ def dashboard_overview(
         "entity_health": health_rows(entity_health),
         "contractor_health": health_rows(contractor_health),
         "upcoming": upcoming,
+        "table": {
+            "items": table_rows[table_start:table_start + table_page_size],
+            "total": len(table_rows),
+            "page": table_page,
+            "page_size": table_page_size,
+        },
     }
 
 
@@ -2938,7 +4198,7 @@ def dashboard(user: User = Depends(current_user), db: Session = Depends(get_db))
     org = org_for(user); require_permission(db, user, "dashboard.read"); rows = [item for item in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)) if can_access_subject(db, user, org, item.subject_type, item.subject_id)]
     statuses = {key: 0 for key in ["PENDING", "IN_PROGRESS", "SUBMITTED", "UNDER_REVIEW", "CORRECTION_REQUIRED", "REJECTED", "APPROVED"]}
     for row in rows: statuses[row.status] = statuses.get(row.status, 0) + 1
-    overdue = sum(1 for row in rows if row.status != "APPROVED" and row.due_date < date.today())
+    overdue = sum(1 for row in rows if compliance_display_status(row) == "OVERDUE")
     completed_late = sum(1 for row in rows if row.status == "APPROVED" and row.completion_late)
     return {"total": len(rows), "statuses": statuses, "overdue": overdue, "completed_late": completed_late}
 

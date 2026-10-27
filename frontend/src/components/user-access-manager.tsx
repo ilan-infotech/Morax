@@ -19,15 +19,22 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useFieldArray, useForm } from "react-hook-form";
 import { z } from "zod";
 import {
+  Building2,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  Eye,
+  Factory,
+  HardHat,
   KeyRound,
   LogIn,
+  MapPin,
   Pencil,
   Plus,
   Search,
   ShieldCheck,
   UserRoundCog,
+  Wrench,
   X,
 } from "lucide-react";
 import { morax } from "../api/morax";
@@ -87,6 +94,21 @@ function roleLabel(role: string) {
     .toLowerCase()
     .replaceAll("_", " ")
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function roleIcon(role: string) {
+  if (role.endsWith("_ADMIN") || role === "ORGANIZATION_ADMIN") return <ShieldCheck size={13} />;
+  if (role.endsWith("_MAKER")) return <Wrench size={13} />;
+  if (role.endsWith("_CHECKER")) return <CheckCircle2 size={13} />;
+  if (role === "VIEWER") return <Eye size={13} />;
+  return <Search size={13} />;
+}
+
+function entityIcon(scopeType: string) {
+  if (scopeType === "ORGANIZATION") return <Building2 size={14} />;
+  if (scopeType === "UNIT") return <Factory size={14} />;
+  if (scopeType === "CONTRACTOR") return <HardHat size={14} />;
+  return <MapPin size={14} />;
 }
 
 function formatDate(value?: string | null) {
@@ -198,8 +220,11 @@ export function UserAccessManager({
     await queryClient.invalidateQueries({ queryKey: ["users-page"] });
   };
   const createMutation = useMutation({
-    mutationFn: ({ password_confirmation: _passwordConfirmation, ...values }: CreateUserForm) =>
-      morax.createUser({ ...values, mobile: values.mobile || null }),
+    mutationFn: async ({ password_confirmation: _passwordConfirmation, ...values }: CreateUserForm) => {
+      const availability = await morax.emailAvailable(values.email);
+      if (!availability.available) throw new Error("Email ID already exists.");
+      return morax.createUser({ ...values, mobile: values.mobile || null });
+    },
     onSuccess: async () => {
       setNotice("User, password, roles, permissions, and access scope were created.");
       createForm.reset();
@@ -377,7 +402,10 @@ export function UserAccessManager({
           return roles.length ? (
             <div className="user-chip-list">
               {roles.map((role) => (
-                <span className={`user-role-chip ${role.toLowerCase()}`} key={role}>{roleLabel(role)}</span>
+                <span className={`access-token role-access-token ${role.toLowerCase()}`} key={role}>
+                  <span className="access-token-icon">{roleIcon(role)}</span>
+                  <span>{roleLabel(role)}</span>
+                </span>
               ))}
             </div>
           ) : (
@@ -394,11 +422,13 @@ export function UserAccessManager({
           if (!scopes.length) return <span className="muted">No entities</span>;
           return (
             <div className="user-chip-list entity-scope-list">
-              {scopes.map((scope, index) => (
-                <span className="user-entity-chip" title={`${roleLabel(scope.role)} - ${scopeLabel(scope)}`} key={`${scope.scope_type}-${scope.scope_id}-${index}`}>
-                  {roleLabel(scope.role)} · {scopeLabel(scope)}
+              {scopes.slice(0, 2).map((scope, index) => (
+                <span className={`access-token entity-access-token ${scope.scope_type.toLowerCase()}`} title={`${scopeLabel(scope)} - ${roleLabel(scope.role)}`} key={`${scope.scope_type}-${scope.scope_id}-${index}`}>
+                  <span className="access-token-icon">{entityIcon(scope.scope_type)}</span>
+                  <span className="entity-access-copy"><b>{scopeLabel(scope)}</b><small>{roleLabel(scope.role)}</small></span>
                 </span>
               ))}
+              {scopes.length > 2 && <span className="access-more-token" title={`${scopes.length - 2} more assignments`}>+{scopes.length - 2}</span>}
             </div>
           );
         },
@@ -572,15 +602,17 @@ export function UserAccessManager({
             </select>
             entries
           </label>
-          <label className="table-search user-search-control">
-            <span>Search:</span>
-            <Search size={17} aria-hidden="true" />
-            <input
-              aria-label="Search users"
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search name or email…"
-            />
+          <label className="user-search-control">
+            <span>Search users</span>
+            <span className="user-search-input">
+              <Search size={17} aria-hidden="true" />
+              <input
+                aria-label="Search users"
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="Search by name or email…"
+              />
+            </span>
           </label>
           <label className="compact-filter user-status-filter">
             <span>Status</span>

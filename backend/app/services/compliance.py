@@ -28,27 +28,86 @@ from app.services.audit import audit
 SUBJECTS = {"UNIT": Unit, "CONTRACTOR": Contractor, "CONTRACTOR_SITE": ContractorSite}
 
 
+def normalize_frequency(frequency: str | None) -> str:
+    """Return the canonical frequency used for periods and scheduling.
+
+    Imports from older workbooks use both YEARLY/ANNUAL and HALF-YEARLY/
+    HALF_YEARLY.  Keeping that normalization at the scheduling boundary makes
+    old master records safe without treating a repeating rule as ONE_TIME.
+    """
+    value = (frequency or "").strip().upper().replace(" ", "_")
+    return {
+        "YEARLY": "ANNUAL",
+        "HALF-YEARLY": "HALF_YEARLY",
+        "HALF_YEARLY": "HALF_YEARLY",
+    }.get(value, value)
+
+
 def period_for(frequency: str, as_of: date) -> str:
-    frequency = frequency.upper()
+    frequency = normalize_frequency(frequency)
+    if frequency == "DAILY":
+        return as_of.isoformat()
+    if frequency == "WEEKLY":
+        iso_year, iso_week, _ = as_of.isocalendar()
+        return f"{iso_year:04d}-W{iso_week:02d}"
     if frequency == "MONTHLY":
         return f"{as_of.year:04d}-{as_of.month:02d}"
     if frequency == "QUARTERLY":
         return f"{as_of.year:04d}-Q{((as_of.month - 1) // 3) + 1}"
-    if frequency in {"HALF_YEARLY", "HALF-YEARLY"}:
+    if frequency == "HALF_YEARLY":
         return f"{as_of.year:04d}-H{1 if as_of.month <= 6 else 2}"
     if frequency == "ANNUAL":
         return str(as_of.year)
     return "ONCE"
 
 
+def previous_month(as_of: date) -> date:
+    """Return a representative date in the previous calendar month."""
+    first = as_of.replace(day=1)
+    return first - timedelta(days=1)
+
+
+def obligation_period_date(frequency: str, run_date: date) -> date:
+    """Resolve the legal period represented by a generation run.
+
+    Monthly work is created after the wage/compliance month closes. Thus a run
+    in October creates September work whose statutory deadline falls in October.
+    Other frequencies retain their configured/current-period behavior until an
+    approved close-period rule is configured for them.
+    """
+    return previous_month(run_date) if normalize_frequency(frequency) == "MONTHLY" else run_date
+
+
+def period_start(frequency: str, as_of: date) -> date:
+    frequency = normalize_frequency(frequency)
+    if frequency == "DAILY":
+        return as_of
+    if frequency == "WEEKLY":
+        return as_of - timedelta(days=as_of.weekday())
+    if frequency == "MONTHLY":
+        return as_of.replace(day=1)
+    if frequency == "QUARTERLY":
+        month = ((as_of.month - 1) // 3) * 3 + 1
+        return date(as_of.year, month, 1)
+    if frequency == "HALF_YEARLY":
+        return date(as_of.year, 1 if as_of.month <= 6 else 7, 1)
+    if frequency == "ANNUAL":
+        return date(as_of.year, 1, 1)
+    return as_of
+
+
 def period_end(frequency: str, as_of: date) -> date:
-    frequency = frequency.upper()
+    frequency = normalize_frequency(frequency)
+    if frequency == "DAILY":
+        return as_of
+    if frequency == "WEEKLY":
+        return as_of + timedelta(days=6 - as_of.weekday())
     if frequency == "MONTHLY":
         return date(as_of.year, as_of.month, calendar.monthrange(as_of.year, as_of.month)[1])
     if frequency == "QUARTERLY":
         month = ((as_of.month - 1) // 3 + 1) * 3
         return date(as_of.year, month, calendar.monthrange(as_of.year, month)[1])
-    if frequency in {"HALF_YEARLY", "HALF-YEARLY"}:
+    if frequency == "HALF_YEARLY":
         month = 6 if as_of.month <= 6 else 12
         return date(as_of.year, month, calendar.monthrange(as_of.year, month)[1])
     if frequency == "ANNUAL":
@@ -61,7 +120,7 @@ def calculate_due_date(version: ComplianceRuleVersion, as_of: date) -> date:
     offset = version.due_date_offset or 0
     if rule == "FIXED_DAY_OF_MONTH":
         target = period_end(version.frequency, as_of)
-        month = target.month + 1 if version.frequency.upper() == "MONTHLY" else target.month
+        month = target.month + 1 if normalize_frequency(version.frequency) == "MONTHLY" else target.month
         year = target.year + (1 if month == 13 else 0)
         month = 1 if month == 13 else month
         return date(year, month, min(max(offset, 1), calendar.monthrange(year, month)[1]))
@@ -79,10 +138,30 @@ def calculate_due_date(version: ComplianceRuleVersion, as_of: date) -> date:
 
 
 def evaluate(version: ComplianceRuleVersion, criteria: RuleApplicabilityCriteria, subject: object) -> tuple[bool, dict]:
+    worker_count = getattr(subject, "total_employees", None)
+    if worker_count is None:
+        worker_count = getattr(subject, "total_workers", None)
+    required_types: set[str] = set()
+    configured_types = getattr(criteria, "unit_compliance_types_json", None)
+    if configured_types:
+        try:
+            required_types = set(json.loads(configured_types))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            required_types = {"__INVALID_MASTER_VALUE__"}
+    selected_types: set[str] = set()
+    if getattr(subject, "entity_type", None) == "UNIT":
+        try:
+            selected_types = set(json.loads(getattr(subject, "compliance_types_json", None) or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            selected_types = set()
     matches = {
+        # Compliance Type is the first Unit applicability gate. An empty rule
+        # list represents a universal Central/establishment requirement.
+        "unit_compliance_type": not required_types or bool(required_types & selected_types),
         "entity_type": getattr(subject, "entity_type", None) == criteria.entity_type if criteria.entity_type == "UNIT" else criteria.entity_type == getattr(subject, "__subject_type__", None),
         "state": criteria.state_id is None or criteria.state_id == getattr(subject, "state_id", None),
         "industry_type": criteria.industry_type_id is None or criteria.industry_type_id == getattr(subject, "industry_type_id", None),
+        "employee_threshold": criteria.employee_threshold is None or (worker_count is not None and worker_count >= criteria.employee_threshold),
         "applicability_flag": criteria.applicability_flag,
     }
     return all(matches.values()), {"rule_version_id": version.id, "matched": matches, "criteria_notes": criteria.notes}
@@ -105,6 +184,7 @@ def applies_in_month(version: ComplianceRuleVersion, as_of: date) -> bool:
 
 def active_versions(db: Session, organization_id: str, as_of: date):
     master_org = platform_master_organization_id(db)
+    earliest_period_date = previous_month(as_of).replace(day=1)
     return db.query(ComplianceRuleVersion, ComplianceRule, RuleApplicabilityCriteria).join(
         ComplianceRule, ComplianceRule.id == ComplianceRuleVersion.rule_id
     ).join(
@@ -113,7 +193,7 @@ def active_versions(db: Session, organization_id: str, as_of: date):
         ComplianceRule.organization_id == master_org,
         ComplianceRuleVersion.active.is_(True),
         ComplianceRuleVersion.effective_from <= as_of,
-        (ComplianceRuleVersion.effective_to.is_(None)) | (ComplianceRuleVersion.effective_to >= as_of),
+        (ComplianceRuleVersion.effective_to.is_(None)) | (ComplianceRuleVersion.effective_to >= earliest_period_date),
     ).all()
 
 
@@ -127,8 +207,6 @@ def generate_for_subject(db: Session, organization_id: str, subject_type: str, s
     if subject.status != "ACTIVE":
         return []
     compliance_start = getattr(subject, "compliance_start_date", None) or getattr(subject, "effective_date", None)
-    if compliance_start and (as_of < compliance_start or period_end("MONTHLY", as_of) < compliance_start):
-        return []
     setattr(subject, "__subject_type__", subject_type)
     created: list[ComplianceInstance] = []
     for version, rule, criteria in active_versions(db, organization_id, as_of):
@@ -136,7 +214,14 @@ def generate_for_subject(db: Session, organization_id: str, subject_type: str, s
         # in the Master but must not produce an invented legal due date.
         if version.due_date_rule.upper() == "MANUAL":
             continue
-        if not applies_in_month(version, as_of):
+        period_date = obligation_period_date(version.frequency, as_of)
+        period_first = period_start(version.frequency, period_date)
+        period_last = period_end(version.frequency, period_date)
+        if version.effective_from > period_last or (version.effective_to and version.effective_to < period_first):
+            continue
+        if compliance_start and compliance_start > period_last:
+            continue
+        if not applies_in_month(version, period_date):
             continue
         applicable, explanation = evaluate(version, criteria, subject)
         db.add(ApplicabilityEvaluation(
@@ -145,7 +230,7 @@ def generate_for_subject(db: Session, organization_id: str, subject_type: str, s
         ))
         if not applicable:
             continue
-        key = period_for(version.frequency, as_of)
+        key = period_for(version.frequency, period_date)
         existing = db.scalar(select(ComplianceInstance).where(
             ComplianceInstance.rule_version_id == version.id,
             ComplianceInstance.subject_type == subject_type,
@@ -164,8 +249,27 @@ def generate_for_subject(db: Session, organization_id: str, subject_type: str, s
             contractor_id=subject_id if subject_type == "CONTRACTOR" else None,
             contractor_site_id=subject_id if subject_type == "CONTRACTOR_SITE" else None,
             period_key=key,
-            due_date=calculate_due_date(version, as_of),
-            rule_snapshot_json=json.dumps({"compliance_id": rule.compliance_id, "name": version.name, "version": version.version, "frequency": version.frequency, "required_document": version.required_document, "risk_level": version.risk_level}),
+            due_date=calculate_due_date(version, period_date),
+            # Preserve the legal content used to create this period.  The Eye
+            # dialog must be able to show a historical compliance accurately
+            # even when a later Compliance Master version is edited or retired.
+            rule_snapshot_json=json.dumps({
+                "compliance_id": rule.compliance_id,
+                "name": version.name,
+                "version": version.version,
+                "description": version.description,
+                "act": version.act,
+                "rule_reference": version.rule_reference,
+                "section": version.section,
+                "legal_description": version.legal_description,
+                "consequence_or_penalty": version.consequence_or_penalty,
+                "compliance_type": version.compliance_type,
+                "document_type": version.document_type,
+                "form_number": version.form_number,
+                "frequency": version.frequency,
+                "required_document": version.required_document,
+                "risk_level": version.risk_level,
+            }),
             applicability_snapshot_json=json.dumps(explanation),
         )
         db.add(instance)
@@ -174,6 +278,22 @@ def generate_for_subject(db: Session, organization_id: str, subject_type: str, s
         audit(db, organization_id=organization_id, actor_id=actor_id, action="GENERATE_COMPLIANCE", module="COMPLIANCE", entity_type="ComplianceInstance", entity_id=instance.id, new={"rule": rule.compliance_id, "period": key})
         created.append(instance)
     return created
+
+
+def compliance_display_status(instance: ComplianceInstance, today_value: date | None = None) -> str:
+    """Return one date-aware status used by every compliance projection."""
+    today_value = today_value or date.today()
+    if instance.status == "APPROVED":
+        return "COMPLETED_LATE" if instance.completion_late else "COMPLETED"
+    if instance.status == "NOT_APPLICABLE":
+        return "NOT_APPLICABLE"
+    if instance.due_date < today_value:
+        return "OVERDUE"
+    if instance.due_date == today_value:
+        return "DUE_TODAY"
+    if instance.due_date <= today_value + timedelta(days=7):
+        return "DUE_SOON"
+    return "UPCOMING"
 
 
 def instance_assignments(db: Session, instance_id: str, assignment_type: str | None = None):
@@ -198,11 +318,27 @@ def assert_assignment_or_admin(db: Session, instance: ComplianceInstance, user_i
         raise HTTPException(403, f"This compliance is not assigned to you as {assignment_type.lower()}")
 
 
-def transition(db: Session, instance: ComplianceInstance, actor_id: str, action: str, target: str, comment: str | None = None) -> None:
+def transition(
+    db: Session,
+    instance: ComplianceInstance,
+    actor_id: str,
+    action: str,
+    target: str,
+    comment: str | None = None,
+    submission_revision: int | None = None,
+) -> None:
     old = instance.status
     instance.status = target
     instance.row_version += 1
-    db.add(ComplianceWorkflowHistory(instance_id=instance.id, actor_id=actor_id, action=action, from_status=old, to_status=target, comment=comment))
+    db.add(ComplianceWorkflowHistory(
+        instance_id=instance.id,
+        actor_id=actor_id,
+        action=action,
+        from_status=old,
+        to_status=target,
+        comment=comment,
+        submission_revision=submission_revision,
+    ))
     audit(db, organization_id=instance.organization_id, actor_id=actor_id, action=action, module="COMPLIANCE", entity_type="ComplianceInstance", entity_id=instance.id, old={"status": old}, new={"status": target}, reason=comment)
 
 
@@ -217,4 +353,4 @@ def submit(db: Session, instance: ComplianceInstance, actor_id: str) -> None:
     revision = (db.scalar(select(func.max(ComplianceSubmission.revision)).where(ComplianceSubmission.instance_id == instance.id)) or 0) + 1
     db.add(ComplianceSubmission(instance_id=instance.id, revision=revision, submitted_by_id=actor_id, activity_snapshot_json=json.dumps({"filing_reference": instance.activity_reference, "completed_on": str(instance.completed_on) if instance.completed_on else None, "amount": instance.amount, "remarks": instance.remarks})))
     instance.submitted_at = datetime.now(UTC)
-    transition(db, instance, actor_id, "SUBMIT", "SUBMITTED")
+    transition(db, instance, actor_id, "SUBMIT", "SUBMITTED", submission_revision=revision)

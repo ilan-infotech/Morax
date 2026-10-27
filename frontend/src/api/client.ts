@@ -42,7 +42,12 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     return result
   } catch (error) {
     const method = (init.method ?? 'GET').toUpperCase()
-    if (!path.startsWith('/auth/') && method !== 'GET') toast.error('Unable to complete the requested action. Please review the form and try again.')
+    if (!path.startsWith('/auth/') && method !== 'GET') {
+      const message = error instanceof ApiError && error.status < 500
+        ? error.message
+        : 'Unable to complete the requested action. Please try again.'
+      toast.error(message)
+    }
     throw error
   }
 }
@@ -55,6 +60,13 @@ function changeMessage(path: string, method: string) {
           : path.includes('/documents') || path.includes('/evidence') ? 'Document'
             : path.includes('/compliance') ? 'Compliance' : 'Changes'
   if (method === 'DELETE') return `${resource} deleted successfully.`
+  if (/\/compliance-instances\/[^/]+\/submit$/.test(path)) return 'Compliance submitted for Checker review.'
+  if (/\/compliance-instances\/[^/]+\/approve$/.test(path)) return 'Compliance approved successfully.'
+  if (/\/compliance-instances\/[^/]+\/reject$/.test(path)) return 'Compliance rejected successfully.'
+  if (/\/compliance-instances\/[^/]+\/request-correction$/.test(path)) return 'Compliance returned to the Maker for correction.'
+  if (/\/compliance-instances\/[^/]+\/begin-review$/.test(path)) return 'Compliance review started successfully.'
+  if (/\/compliance-instances\/[^/]+\/activity$/.test(path)) return 'Compliance details saved successfully.'
+  if (/\/compliance-instances\/[^/]+\/comments$/.test(path)) return 'Comment added successfully.'
   if (/login-as-organization/.test(path)) return 'Organization session opened successfully.'
   if (/reset-password|\/status$|development-reset/.test(path)) return `${resource} updated successfully.`
   if (method === 'POST' && /upload|documents|evidence/.test(path)) return `${resource} uploaded successfully.`
@@ -76,4 +88,28 @@ export async function download(path: string, filename: string) {
   const link = document.createElement('a')
   link.href = url; link.download = filename; link.click()
   URL.revokeObjectURL(url)
+}
+
+/** Retrieve an authorized binary resource for an in-app preview. */
+export async function fetchBlob(path: string) {
+  const token = getToken()
+  const response = await fetch(`${API_URL}${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+  if (!response.ok) await parseResponse(response)
+  return response.blob()
+}
+
+/** Opens browser-previewable, authorized files without exposing a permanent URL. */
+export async function preview(path: string) {
+  const target = window.open("", "_blank", "noopener")
+  const token = getToken()
+  const response = await fetch(`${API_URL}${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+  if (!response.ok) {
+    target?.close()
+    await parseResponse(response)
+    return
+  }
+  const url = URL.createObjectURL(await response.blob())
+  if (target) target.location.href = url
+  else window.open(url, "_blank", "noopener")
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000)
 }
