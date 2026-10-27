@@ -1,7 +1,6 @@
-import { useDeferredValue, useEffect, useState, useRef } from "react";
+import { useCallback, useDeferredValue, useEffect, useState, useRef } from "react";
 import { createPortal } from "react-dom";
 import ElasticMesh from "./components/ElasticMesh/ElasticMesh";
-import { SpecularCard } from "./components/specular-card";
 import {
   PieChart,
   Pie,
@@ -49,6 +48,7 @@ import {
   ShieldCheck,
   Users as UsersIcon,
   Download,
+  RefreshCw,
   ChevronDown,
   LogOut,
   PanelLeftClose,
@@ -69,6 +69,7 @@ import { MainDashboard } from "./components/filtered-dashboard";
 import { ModernEntities } from "./components/entity-manager";
 import { UserAccessManager } from "./components/user-access-manager";
 import { ComplianceMasterManager } from "./components/compliance-master-manager";
+import { DashboardMetricCard, DashboardSection, EmptyState, InlineError, LoadingSkeleton, WorkspacePageHeader } from "./components/workspace-ui";
 import { DocumentLibrary } from "./components/document-library";
 import { PasswordInput } from "./components/password-input";
 import { SupportTicketManager } from "./components/support-ticket-manager";
@@ -4365,162 +4366,191 @@ function Reports() {
     }[]
   >([]);
   const [error, setError] = useState("");
-  const load = () =>
-    Promise.all([
-      morax.statusChart(),
-      morax.frequencyChart(),
-      morax.entityChart(),
-    ])
-      .then(([s, f, e]) => {
-        setStatus(s);
-        setFrequency(f);
-        setEntities(e);
-      })
-      .catch((err) => setError(message(err)));
-  useEffect(() => {
-    load();
+  const [loading, setLoading] = useState(true);
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const [nextStatus, nextFrequency, nextEntities] = await Promise.all([
+        morax.statusChart(),
+        morax.frequencyChart(),
+        morax.entityChart(),
+      ]);
+      setStatus(nextStatus);
+      setFrequency(nextFrequency);
+      setEntities(nextEntities);
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setLoading(false);
+    }
   }, []);
+  useEffect(() => {
+    void load();
+  }, [load]);
+  const statusEntries = Object.entries(status);
+  const frequencyEntries = Object.entries(frequency);
+  const totalObligations = statusEntries.reduce((total, [, count]) => total + count, 0);
+  const overdueObligations = entities.reduce((total, entity) => total + entity.overdue, 0);
+  const averageCompletion = entities.length
+    ? Math.round(entities.reduce((total, entity) => total + entity.rate, 0) / entities.length)
+    : 0;
+  const statusColors: Record<string, string> = {
+    APPROVED: "#047857",
+    COMPLETED: "#047857",
+    COMPLETED_LATE: "#0f766e",
+    OVERDUE: "#b91c1c",
+    REJECTED: "#b91c1c",
+    DUE_TODAY: "#b45309",
+    DUE_SOON: "#4338ca",
+    UPCOMING: "#2563eb",
+    SUBMITTED: "#0369a1",
+    UNDER_REVIEW: "#0369a1",
+    PENDING_ACTION: "#b45309",
+    PENDING_APPROVAL: "#4338ca",
+    NOT_APPLICABLE: "#64748b",
+  };
+  const statusColor = (name: string, index: number) =>
+    statusColors[name.toUpperCase()] ?? ["#2563eb", "#047857", "#b45309", "#64748b"][index % 4];
+  const exports = [
+    { label: "Compliance status", download: morax.downloadStatusReport },
+    { label: "Overdue", download: morax.downloadOverdueReport },
+    { label: "Completion", download: morax.downloadCompletionReport },
+    { label: "Entity compliance", download: morax.downloadEntityReport },
+  ];
   return (
-    <>
-      <Header title="Compliance reports">
-        <button className="secondary" onClick={load}>
-          Refresh
-        </button>
-      </Header>
-      <ErrorBox text={error} />
-      <Panel>
-        <h2>CSV exports</h2>
-        <div className="action-row" style={{ gap: "1.5rem", flexWrap: "wrap" }}>
-          <button
-            className="button-outline"
-            style={{ color: "#F5F5DC", backgroundColor: "#424B35", borderColor: "#424B35", display: "flex", alignItems: "center", gap: "0.5rem" }}
-            onClick={() =>
-              morax
-                .downloadStatusReport()
-                .catch((err) => setError(message(err)))
-            }
-          >
-            <Download size={16} /> Compliance status
+    <section className="modern-page reports-page">
+      <WorkspacePageHeader
+        eyebrow="INSIGHTS & EXPORTS"
+        title="Compliance reports"
+        description="Review compliance status, frequency, and entity performance. Export detailed reports as CSV."
+        actions={
+          <button className="button-secondary" type="button" onClick={() => void load()} disabled={loading}>
+            <RefreshCw size={16} className={loading ? "spin" : ""} />
+            Refresh
           </button>
-          <button
-            className="button-outline"
-            style={{ color: "#F5F5DC", backgroundColor: "#424B35", borderColor: "#424B35", display: "flex", alignItems: "center", gap: "0.5rem" }}
-            onClick={() =>
-              morax
-                .downloadOverdueReport()
-                .catch((err) => setError(message(err)))
-            }
-          >
-            <Download size={16} /> Overdue
-          </button>
-          <button
-            className="button-outline"
-            style={{ color: "#F5F5DC", backgroundColor: "#424B35", borderColor: "#424B35", display: "flex", alignItems: "center", gap: "0.5rem" }}
-            onClick={() =>
-              morax
-                .downloadCompletionReport()
-                .catch((err) => setError(message(err)))
-            }
-          >
-            <Download size={16} /> Completion
-          </button>
-          <button
-            className="button-outline"
-            style={{ color: "#F5F5DC", backgroundColor: "#424B35", borderColor: "#424B35", display: "flex", alignItems: "center", gap: "0.5rem" }}
-            onClick={() =>
-              morax
-                .downloadEntityReport()
-                .catch((err) => setError(message(err)))
-            }
-          >
-            <Download size={16} /> Entity compliance
-          </button>
-        </div>
-      </Panel>
-      <div className="detail-grid">
-        <SpecularCard tint="#ffffff" textColor="#0f172a" baseColor="#e2e8f0" lineColor="#424B35" style={{ padding: 0, borderRadius: "1rem" }}>
-          <div style={{ padding: "1.5rem", width: "100%", height: "100%" }}>
-            <h2 style={{ margin: "0 0 1rem 0" }}>Status summary</h2>
-            <div style={{ display: "flex", alignItems: "center", gap: "1rem", height: "250px", width: "100%" }}>
-              <div style={{ flex: 1, height: "100%" }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie
-                      data={Object.entries(status).map(([k, v]) => ({ name: k.replaceAll("_", " "), value: v }))}
-                      cx="50%"
-                      cy="50%"
-                      innerRadius={60}
-                      outerRadius={80}
-                      paddingAngle={5}
-                      dataKey="value"
-                    >
-                      {Object.keys(status).map((_, index) => (
-                        <Cell key={`cell-${index}`} fill={["#424B35", "#5C6B4A", "#854D0E", "#2C5234", "#B45309", "#475569"][index % 6]} />
-                      ))}
-                    </Pie>
-                    <Tooltip formatter={(value, name) => [value, name]} />
-                  </PieChart>
-                </ResponsiveContainer>
-              </div>
-              <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: "0.75rem", overflowY: "auto", maxHeight: "100%" }}>
-                {Object.entries(status).map(([k, v], index) => {
-                  const color = ["#424B35", "#5C6B4A", "#854D0E", "#2C5234", "#B45309", "#475569"][index % 6];
-                  return (
-                    <div key={k} style={{ display: "flex", alignItems: "center", gap: "0.5rem", fontSize: "0.85rem", color: "#0f172a" }}>
-                      <span style={{ width: "12px", height: "12px", borderRadius: "50%", backgroundColor: color, flexShrink: 0 }}></span>
-                      <strong style={{ whiteSpace: "nowrap" }}>{k.replaceAll("_", " ")}:</strong>
-                      <span>{v}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        </SpecularCard>
-        <SpecularCard tint="#ffffff" textColor="#0f172a" baseColor="#e2e8f0" lineColor="#424B35" style={{ padding: 0, borderRadius: "1rem" }}>
-          <div style={{ padding: "1.5rem", width: "100%", height: "100%" }}>
-            <h2 style={{ margin: "0 0 1rem 0" }}>Frequency summary</h2>
-            <div style={{ height: "250px", width: "100%" }}>
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={Object.entries(frequency).map(([k, v]) => ({ name: k.replaceAll("_", " "), value: v }))}>
-                  <XAxis dataKey="name" tick={{ fontSize: 12, fill: "#424B35" }} axisLine={false} tickLine={false} />
-                  <YAxis hide />
-                  <Tooltip cursor={{ fill: "#f1f5f9" }} />
-                  <Bar dataKey="value" fill="#424B35" radius={[4, 4, 0, 0]} barSize={40} />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-        </SpecularCard>
-      </div>
-      <Panel>
-        <h2>Entity compliance summary</h2>
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Entity</th>
-                <th>Due</th>
-                <th>Overdue</th>
-                <th>Done</th>
-                <th>Rate</th>
-              </tr>
-            </thead>
-            <tbody>
-              {entities.map((row) => (
-                <tr key={row.entity}>
-                  <td>{row.entity}</td>
-                  <td>{row.due}</td>
-                  <td>{row.overdue}</td>
-                  <td>{row.done}</td>
-                  <td>{row.rate}%</td>
-                </tr>
+        }
+      />
+      <InlineError message={error} />
+      {loading ? (
+        <DashboardSection title="Loading reports">
+          <LoadingSkeleton rows={5} />
+        </DashboardSection>
+      ) : (
+        <>
+          <section className="dashboard-metric-grid reports-metric-grid" aria-label="Report overview">
+            <DashboardMetricCard label="Total obligations" value={totalObligations} helper="Across all reported statuses" />
+            <DashboardMetricCard label="Overdue" value={overdueObligations} helper="Across reported entities" tone="critical" />
+            <DashboardMetricCard label="Entities reported" value={entities.length} helper="Included in entity summary" tone="attention" />
+            <DashboardMetricCard label="Average completion" value={`${averageCompletion}%`} helper="Average entity completion rate" tone="success" />
+          </section>
+
+          <DashboardSection title="CSV exports" description="Download detailed report data for analysis and record keeping." className="reports-export-section">
+            <div className="reports-export-grid">
+              {exports.map(({ label, download }) => (
+                <button
+                  key={label}
+                  className="button-secondary"
+                  type="button"
+                  onClick={() => download().catch((err) => setError(message(err)))}
+                >
+                  <Download size={16} />
+                  {label}
+                </button>
               ))}
-            </tbody>
-          </table>
-        </div>
-      </Panel>
-    </>
+            </div>
+          </DashboardSection>
+
+          <div className="reports-chart-grid">
+            <DashboardSection title="Status summary" description="Obligations by current compliance status." className="reports-chart-section">
+              {statusEntries.length ? (
+                <div className="reports-status-layout">
+                  <div className="reports-chart">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart>
+                        <Pie
+                          data={statusEntries.map(([name, value]) => ({ name: name.replaceAll("_", " "), value }))}
+                          cx="50%"
+                          cy="50%"
+                          innerRadius={58}
+                          outerRadius={86}
+                          paddingAngle={4}
+                          dataKey="value"
+                        >
+                          {statusEntries.map(([name], index) => (
+                            <Cell key={name} fill={statusColor(name, index)} />
+                          ))}
+                        </Pie>
+                        <Tooltip formatter={(value, name) => [value, name]} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="reports-status-legend">
+                    {statusEntries.map(([name, value], index) => (
+                      <div className="reports-legend-item" key={name}>
+                        <span style={{ backgroundColor: statusColor(name, index) }} />
+                        <b>{name.replaceAll("_", " ")}</b>
+                        <strong>{value}</strong>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <EmptyState title="No status data available" description="There are no compliance statuses to report yet." />
+              )}
+            </DashboardSection>
+
+            <DashboardSection title="Frequency summary" description="Obligations by reporting frequency." className="reports-chart-section">
+              {frequencyEntries.length ? (
+                <div className="reports-chart reports-frequency-chart">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={frequencyEntries.map(([name, value]) => ({ name: name.replaceAll("_", " "), value }))} margin={{ top: 8, right: 12, left: 0, bottom: 8 }}>
+                      <XAxis dataKey="name" tick={{ fontSize: 11, fill: "#526345" }} axisLine={false} tickLine={false} />
+                      <YAxis hide />
+                      <Tooltip cursor={{ fill: "#edf3e8" }} />
+                      <Bar dataKey="value" fill="#526345" radius={[5, 5, 0, 0]} barSize={40} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              ) : (
+                <EmptyState title="No frequency data available" description="There are no obligation frequencies to report yet." />
+              )}
+            </DashboardSection>
+          </div>
+
+          <DashboardSection title="Entity compliance summary" description={`${entities.length} entit${entities.length === 1 ? "y" : "ies"} included in this report.`}>
+            {entities.length ? (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Entity</th>
+                      <th>Due</th>
+                      <th>Overdue</th>
+                      <th>Done</th>
+                      <th>Rate</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {entities.map((row) => (
+                      <tr key={row.entity}>
+                        <td>{row.entity}</td>
+                        <td>{row.due}</td>
+                        <td>{row.overdue}</td>
+                        <td>{row.done}</td>
+                        <td>{row.rate}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <EmptyState title="No entity data available" description="Entity compliance summaries will appear here when report data is available." />
+            )}
+          </DashboardSection>
+        </>
+      )}
+    </section>
   );
 }
 

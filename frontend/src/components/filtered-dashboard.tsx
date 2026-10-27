@@ -176,6 +176,10 @@ export function MainDashboard({ user }: { user: User }) {
   const scopedOptions = scopedKind === "CONTRACTOR"
     ? (data?.filters.contractors ?? []).filter((item) => scopedIds.includes(item.id))
     : (data?.filters.units ?? []).filter((item) => scopedIds.includes(item.id));
+  const selectedContractorName = contractorOnly
+    ? data?.filters.contractors.find((item) => item.id === filters.contractor_id)?.name
+      ?? user.contractor_context?.active_contractor_name
+    : undefined;
 
   // A scoped operator must never default to a combined multi-entity view.
   // Persist their last valid choice per account, but only when it is still in
@@ -223,6 +227,7 @@ export function MainDashboard({ user }: { user: User }) {
     <div className="modern-page dashboard-page">
       <WorkspacePageHeader
         title={title}
+        description={selectedContractorName ? `Contractor: ${selectedContractorName}` : undefined}
         actions={
           <button
             className="button-secondary"

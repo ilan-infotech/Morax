@@ -402,7 +402,9 @@ export function ComplianceMasterManager() {
           <h2>Generate obligations</h2>
           <div className="generation-form-grid">
             <label className="generation-organization-field">
-              Customer organization <span className="required">*</span>
+              <span>
+                Customer organization <b className="required-indicator" aria-label="required">*</b>
+              </span>
               <select
                 {...generation.register("organization_id", { required: true })}
                 onChange={(event) => {
@@ -815,6 +817,7 @@ export function ComplianceMasterManager() {
               ? "Add rule version"
               : "Create revised rule version"
           }
+          variant="workspace"
           onClose={() => setFormOpen(false)}
         >
           <form
@@ -826,18 +829,20 @@ export function ComplianceMasterManager() {
               <div className="form-grid">
                 <RuleField
                   label="Compliance ID"
+                  required
                   error={form.formState.errors.compliance_id?.message}
                 >
-                  <input {...form.register("compliance_id")} />
+                  <input {...form.register("compliance_id")} required />
                 </RuleField>
                 <RuleField
                   label="Rule name"
+                  required
                   error={form.formState.errors.name?.message}
                 >
-                  <input {...form.register("name")} />
+                  <input {...form.register("name")} required />
                 </RuleField>
-                <RuleField label="Version">
-                  <input type="number" min="1" {...form.register("version")} />
+                <RuleField label="Version" required>
+                  <input type="number" min="1" {...form.register("version")} required />
                 </RuleField>
                 <RuleField label="Entity type">
                   <select {...form.register("entity_type")}>
@@ -871,9 +876,9 @@ export function ComplianceMasterManager() {
                 </RuleField>
                 {form.watch("entity_type") === "UNIT" && (
                   <RuleField label="Unit Compliance Types" wide>
-                    <div className="checkbox-grid">
+                    <div className="checkbox-group" role="group" aria-label="Unit Compliance Types">
                       {unitComplianceTypes.map((type) => (
-                        <label className="checkbox-option" key={type}>
+                        <label className="inline" key={type}>
                           <input
                             type="checkbox"
                             checked={form.watch("unit_compliance_types").includes(type)}
@@ -894,8 +899,8 @@ export function ComplianceMasterManager() {
             <div className="form-section">
               <h3>Schedule and evidence</h3>
               <div className="form-grid">
-                <RuleField label="Frequency">
-                  <select {...form.register("frequency")}>
+                <RuleField label="Frequency" required>
+                  <select {...form.register("frequency")} required>
                     {frequencies.map((item) => (
                       <option key={item}>{item}</option>
                     ))}
@@ -904,8 +909,8 @@ export function ComplianceMasterManager() {
                 <RuleField label="Applicable months">
                   <input {...form.register("applicable_months")} placeholder="e.g. 6,12 for half-yearly PT" />
                 </RuleField>
-                <RuleField label="Due date method">
-                  <select {...form.register("due_date_rule")}>
+                <RuleField label="Due date method" required>
+                  <select {...form.register("due_date_rule")} required>
                     {dueRules.map((item) => (
                       <option key={item}>{item}</option>
                     ))}
@@ -932,8 +937,8 @@ export function ComplianceMasterManager() {
                     <option>CRITICAL</option>
                   </select>
                 </RuleField>
-                <RuleField label="Effective from">
-                  <input type="date" {...form.register("effective_from")} />
+                <RuleField label="Effective from" required>
+                  <input type="date" {...form.register("effective_from")} required />
                 </RuleField>
                 <RuleField label="Effective to">
                   <input type="date" {...form.register("effective_to")} />
@@ -941,17 +946,19 @@ export function ComplianceMasterManager() {
                 <RuleField label="Required evidence">
                   <input {...form.register("required_document")} />
                 </RuleField>
-                <label className="inline">
-                  <input type="checkbox" {...form.register("active")} /> Active
-                  version
-                </label>
+                <div className="checkbox-group">
+                  <label className="inline">
+                    <input type="checkbox" {...form.register("active")} />
+                    Active version
+                  </label>
+                </div>
               </div>
             </div>
             <div className="form-section">
               <h3>Legal references</h3>
               <div className="form-grid">
-                <RuleField label="Act *" error={form.formState.errors.act?.message}>
-                  <input {...form.register("act")} />
+                <RuleField label="Act" required error={form.formState.errors.act?.message}>
+                  <input {...form.register("act")} required />
                 </RuleField>
                 <RuleField label="Rule reference">
                   <input {...form.register("rule_reference")} />
@@ -1076,15 +1083,30 @@ function MasterSheet({
   title,
   onClose,
   children,
+  variant = "dialog",
 }: {
   title: string;
   onClose: () => void;
   children: React.ReactNode;
+  variant?: "dialog" | "workspace";
 }) {
+  const isWorkspace = variant === "workspace";
   return (
-    <div className="crud-drawer-backdrop" onMouseDown={onClose}>
+    <div
+      className={
+        isWorkspace
+          ? "workspace-form-backdrop compliance-master-form-backdrop"
+          : "crud-drawer-backdrop compliance-master-drawer-backdrop"
+      }
+      role="presentation"
+      onMouseDown={onClose}
+    >
       <section
-        className="crud-drawer"
+        className={
+          isWorkspace
+            ? "workspace-form compliance-master-workspace-form"
+            : "crud-drawer"
+        }
         role="dialog"
         aria-modal="true"
         aria-label={title}
@@ -1092,14 +1114,24 @@ function MasterSheet({
       >
         <div className="drawer-heading">
           <div>
+            {isWorkspace && (
+              <span className="drawer-icon">
+                <BookOpen size={19} />
+              </span>
+            )}
             <div>
               <h2>{title}</h2>
-              <p>
-                Historical versions remain auditable and cannot be overwritten.
-              </p>
+              <p>{isWorkspace
+                ? "Fields marked * are required. Configure applicability, schedule, and legal references for this version."
+                : "Historical versions remain auditable and cannot be overwritten."}</p>
             </div>
           </div>
-          <button type="button" className="icon-action" onClick={onClose}>
+          <button
+            type="button"
+            className="icon-action"
+            onClick={onClose}
+            aria-label="Close form"
+          >
             <X size={18} />
           </button>
         </div>
@@ -1112,16 +1144,18 @@ function RuleField({
   label,
   error,
   wide = false,
+  required = false,
   children,
 }: {
   label: string;
   error?: string;
   wide?: boolean;
+  required?: boolean;
   children: React.ReactNode;
 }) {
   return (
-    <label className={wide ? "wide" : undefined}>
-      <span>{label}</span>
+    <label className={[wide && "wide", error && "has-error"].filter(Boolean).join(" ") || undefined}>
+      <span>{label}{required && <b className="required-indicator" aria-label="required"> *</b>}</span>
       {children}
       {error && <small className="field-error">{error}</small>}
     </label>

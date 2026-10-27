@@ -545,7 +545,14 @@ function ComplianceKpiCard({
     }
   }, [numValue, count]);
 
-  const content = <SpecularCard style={{ display: "flex", gap: "1rem", alignItems: "center", padding: "1.1rem" }}>
+  const content = <SpecularCard
+    className={active ? "metric-specular-card is-active" : "metric-specular-card"}
+    tint={active ? "#F0F6EE" : undefined}
+    baseColor={active ? "#8DAF86" : undefined}
+    lineColor={active ? "#B9D0B7" : undefined}
+    textColor={active ? "#234332" : undefined}
+    style={{ display: "flex", gap: "1rem", alignItems: "center", padding: "1.1rem" }}
+  >
     <span className="compliance-kpi-icon" aria-hidden="true">
       <Icon size={21} />
     </span>
@@ -1734,8 +1741,13 @@ function EnterpriseRecurringWorklist({ complianceArea }: { complianceArea?: "COM
         description={complianceArea === "COMPANY" ? "Manage the company’s own labour-law obligations and filings." : complianceArea === "CONTRACTOR" ? "Manage contractor submissions, documents, and Principal Employer approvals." : "Track. Manage. Stay Compliant."}
         actions={<button className="button-secondary" type="button" onClick={() => grouped.refetch()} disabled={grouped.isFetching}><RefreshCw size={16} className={grouped.isFetching ? "spin" : ""} />Refresh</button>}
       />
+      {complianceArea === "CONTRACTOR" && currentUser.data?.contractor_context?.active_contractor_name && (
+        <p className="contractor-compliance-scope">
+          Contractor: <strong>{currentUser.data.contractor_context.active_contractor_name}</strong>
+        </p>
+      )}
       {pendingApprovals.data && (
-        <DashboardSection title="Pending My Approval" description="Submitted compliances assigned to you as Principal Employer Checker.">
+        <DashboardSection title="Pending My Approval" description="Submitted compliances assigned to you as Principal Employer Checker." className="pending-approval-section">
           {pendingApprovals.data.items.length ? (
             <div className="evidence-list">
               {pendingApprovals.data.items.map((item) => (

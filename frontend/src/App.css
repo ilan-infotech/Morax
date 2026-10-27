@@ -12,9 +12,9 @@
 /* Read-only Eye dialog: intentionally mirrors the compact submit window while
    retaining a single scroll region for longer statutory text. */
 .compliance-view-dialog {
-  width: min(960px, calc(100vw - 2rem));
+  width: min(800px, calc(100vw - 2rem));
   height: auto;
-  max-height: calc(100vh - 1.5rem);
+  max-height: calc(100vh - 2rem);
 }
 
 .compliance-view-dialog .compliance-dialog-hero {
@@ -44,9 +44,84 @@
 
 .compliance-view-dialog .compliance-dialog-body {
   flex: 0 1 auto;
-  max-height: 72vh;
-  padding: 0.72rem 0.85rem;
+  max-height: min(64vh, 560px);
+  padding: 0.85rem 1rem;
   background: #f6f8fc;
+}
+
+.compliance-view-dialog .view-rule-summary h3 {
+  font-size: 1.05rem;
+}
+
+.compliance-view-dialog .view-rule-summary p,
+.compliance-view-dialog .view-section-copy p,
+.compliance-view-dialog .view-accordion p,
+.compliance-view-dialog .view-submission-content p {
+  font-size: 0.86rem;
+  line-height: 1.5;
+}
+
+.compliance-view-dialog .view-compliance-id {
+  font-size: 0.72rem;
+}
+
+.compliance-view-dialog .submit-status-chips .status-badge,
+.compliance-view-dialog .submit-status-chips .risk-label,
+.compliance-view-dialog .submit-status-chips .dialog-pill {
+  min-height: 24px;
+  padding: 0.22rem 0.55rem;
+  font-size: 0.72rem;
+}
+
+.compliance-view-dialog .view-fact-row span,
+.compliance-view-dialog .view-section-copy > span,
+.compliance-view-dialog .view-rule-reference span,
+.compliance-view-dialog .view-assignment-row > span {
+  font-size: 0.68rem;
+}
+
+.compliance-view-dialog .view-fact-row b,
+.compliance-view-dialog .view-rule-reference b,
+.compliance-view-dialog .view-assignment-row b,
+.compliance-view-dialog .view-rule-description-reference {
+  font-size: 0.84rem;
+  line-height: 1.4;
+}
+
+.compliance-view-dialog .view-fact-row > div,
+.compliance-view-dialog .view-section-copy,
+.compliance-view-dialog .view-rule-reference,
+.compliance-view-dialog .view-assignment-row {
+  padding: 0.65rem 0.75rem;
+}
+
+.compliance-view-dialog .view-accordion summary {
+  min-height: 36px;
+  padding: 0.55rem 0.75rem;
+  font-size: 0.74rem;
+}
+
+.compliance-view-dialog .view-accordion > p,
+.compliance-view-dialog .view-submission-content {
+  padding: 0 0.75rem 0.75rem;
+}
+
+.compliance-view-dialog .view-show-more,
+.compliance-view-dialog .button-link,
+.compliance-view-dialog .view-due {
+  font-size: 0.78rem;
+}
+
+.compliance-detail-dialog.compliance-view-dialog {
+  width: min(900px, calc(100vw - 2rem));
+  height: auto;
+  max-height: calc(100vh - 2rem);
+}
+
+.compliance-detail-dialog.compliance-view-dialog .compliance-dialog-body {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow: auto;
 }
 
 .compliance-view-dialog .dialog-footer {
@@ -384,9 +459,14 @@
     max-height: calc(100vh - 1rem);
   }
 
+  .compliance-detail-dialog.compliance-view-dialog {
+    width: calc(100vw - 1rem);
+    max-height: calc(100vh - 1rem);
+  }
+
   .compliance-view-dialog .compliance-dialog-body {
-    max-height: 76vh;
-    padding: 0.6rem;
+    max-height: 68vh;
+    padding: 0.72rem 0.85rem;
   }
 
   .view-detail-grid {
@@ -2247,7 +2327,13 @@ button:disabled {
 .ticket-table { margin-top:.75rem; }.ticket-table td small,.ticket-table td b { display:block; }.ticket-number { color:#314628; font-size:.77rem; }.ticket-category { display:inline-flex; padding:.25rem .5rem; color:#53634d; font-size:.68rem; font-weight:750; background:#edf2e9; border-radius:999px; }.ticket-issue-type { margin-top:.32rem; color:#64748b; font-size:.66rem; font-weight:750; text-transform:capitalize; }.ticket-status { display:inline-flex; padding:.26rem .52rem; font-size:.67rem; font-weight:800; letter-spacing:.01em; border-radius:999px; }.status-open { color:#1d4ed8; background:#dbeafe; }.status-in_progress { color:#92400e; background:#fef3c7; }.status-waiting_on_customer { color:#0369a1; background:#e0f2fe; }.status-resolved { color:#047857; background:#d1fae5; }.status-closed { color:#475569; background:#e2e8f0; }
 .ticket-pagination { display:flex; justify-content:space-between; align-items:center; gap:.7rem; padding-top:.8rem; color:var(--text-secondary); font-size:.75rem; }.ticket-pagination label { display:flex; align-items:center; gap:.35rem; }.ticket-pagination select { min-height:32px; padding:.2rem .35rem; }.ticket-pagination div { display:flex; gap:.35rem; }
 .ticket-detail-dialog { width:min(900px,calc(100vw - 2rem)); }.ticket-detail-meta { display:flex; flex-wrap:wrap; align-items:center; gap:.38rem; margin-top:.42rem; color:var(--text-secondary); font-size:.75rem; }.ticket-detail-summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.65rem; padding:.75rem 1.15rem; background:#f7f8f5; border-bottom:1px solid var(--border); }.ticket-detail-summary div { display:grid; gap:.12rem; }.ticket-detail-summary span { color:var(--text-muted); font-size:.66rem; font-weight:750; text-transform:uppercase; }.ticket-detail-summary b { color:var(--text-primary); font-size:.78rem; }.ticket-conversation { max-height:45vh; }.ticket-conversation article { border:1px solid #e1e7dc; }.ticket-attachments,.ticket-activity { display:grid; gap:.45rem; padding:.7rem; border:1px solid var(--border); border-radius:.6rem; background:#fafbf9; }.ticket-attachments>b { display:flex; align-items:center; gap:.35rem; }.ticket-attachments button { justify-content:flex-start; }.ticket-activity small { color:var(--text-secondary); }.ticket-detail-actions { display:flex; justify-content:flex-end; padding:.75rem 1.15rem; border-top:1px solid var(--border); }
-.support-ticket-form .ticket-upload { display:grid; grid-template-columns:auto auto 1fr; align-items:center; }.support-ticket-form .ticket-upload input { grid-column:1/-1; }.support-ticket-form .ticket-upload .muted { font-weight:500; }
+.support-ticket-form > label:not(.ticket-upload) { align-content:start; }
+.support-ticket-form .support-ticket-field-label { display:block; line-height:1.25; }
+.support-ticket-form :is(input, select, textarea):required { border-left:3px solid #b45309; }
+.support-ticket-form .ticket-upload { display:grid; grid-template-columns:minmax(0,1fr); align-items:start; }
+.support-ticket-form .ticket-upload input { grid-column:1/-1; width:100%; }
+.support-ticket-upload-label { display:flex; flex-wrap:wrap; align-items:center; gap:.4rem; }
+.support-ticket-form .ticket-upload .muted { font-weight:500; }
 @media (max-width: 760px) { .ticket-summary-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }.ticket-filter-bar,.ticket-pagination { align-items:stretch; }.ticket-filter-bar .button-secondary { width:100%; justify-content:center; }.ticket-selects { flex-direction:column; }.ticket-detail-summary { grid-template-columns:1fr; }.ticket-pagination { flex-wrap:wrap; } }
 .sidebar-compliance-group { margin:.15rem 0; }.sidebar-compliance-toggle { display:flex; width:100%; gap:.5rem; align-items:center; padding:.5rem; color:#cbd5e1; text-align:left; background:transparent; border:0; border-radius:.38rem; }.sidebar-compliance-toggle:hover,.sidebar-compliance-group.active>.sidebar-compliance-toggle { color:#f5f5dc; background:#334233; }.sidebar-compliance-toggle svg:last-child { margin-left:auto; transition:transform .18s ease; }.sidebar-compliance-toggle .chevron-up { transform:rotate(180deg); }.sidebar-compliance-children { display:grid; gap:.1rem; padding:.15rem 0 .15rem .8rem; margin-left:.6rem; border-left:1px solid rgb(203 213 225 / 25%); }.sidebar-compliance-children a { font-size:.88rem; }
 .ticket-summary-grid article { display:grid; gap:.18rem; padding:.8rem; background:var(--surface); border:1px solid var(--border); border-radius:.7rem; }
@@ -2895,6 +2981,20 @@ button[type="submit"]:not(.danger):hover {
 }
 
 .recurring-compliance-page {
+  color: var(--text-primary);
+}
+
+.pending-approval-section {
+  margin-bottom: 1.25rem;
+}
+
+.contractor-compliance-scope {
+  margin: -0.5rem 0 1.1rem;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+}
+
+.contractor-compliance-scope strong {
   color: var(--text-primary);
 }
 
@@ -4449,6 +4549,10 @@ textarea:focus-visible {
   background: rgb(15 23 42 / 42%);
 }
 
+.compliance-master-drawer-backdrop {
+  z-index: 300;
+}
+
 .assignment-user-backdrop {
   position: fixed;
   z-index: 200;
@@ -4539,6 +4643,56 @@ textarea:focus-visible {
 .workspace-form .drawer-footer {
   margin: 0 -1.45rem;
   padding: 1rem 1.45rem;
+}
+
+.workspace-form.compliance-master-workspace-form .drawer-heading {
+  align-items: center;
+  background: linear-gradient(180deg, #fff 0%, #fbfcf9 100%);
+}
+
+.workspace-form.compliance-master-workspace-form .drawer-icon {
+  display: grid;
+}
+
+.workspace-form.compliance-master-workspace-form .drawer-heading p {
+  display: block;
+  margin: 0.3rem 0 0;
+  color: #64748b;
+  font-size: 0.76rem;
+  font-weight: 450;
+}
+
+.workspace-form.compliance-master-workspace-form .drawer-heading h2 {
+  font-size: 1.15rem;
+  font-weight: 750;
+}
+
+.workspace-form.compliance-master-workspace-form .entity-form {
+  gap: 1.5rem;
+  padding-bottom: 0;
+}
+
+.workspace-form.compliance-master-workspace-form .form-section {
+  padding: 1rem;
+  background: #fbfcf9;
+  border: 1px solid #e5eadd;
+  border-radius: 0.75rem;
+}
+
+.workspace-form.compliance-master-workspace-form .form-section h3 {
+  padding-bottom: 0.65rem;
+  color: #2a3620;
+  font-size: 0.88rem;
+  border-bottom: 1px solid #e5eadd;
+}
+
+.workspace-form.compliance-master-workspace-form .form-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.workspace-form.compliance-master-workspace-form .drawer-footer {
+  margin-top: 0;
 }
 
 .user-access-tabs {
@@ -4640,7 +4794,8 @@ textarea:focus-visible {
 /* Required inputs are visually distinct before submit, while native browser
    validation continues to provide the accessible field-specific message. */
 .entity-form :is(input, select, textarea):required,
-.form-grid :is(input, select, textarea):required {
+.form-grid :is(input, select, textarea):required,
+.generation-form-grid :is(input, select, textarea):required {
   border-left: 3px solid #b45309;
 }
 
@@ -5392,3 +5547,115 @@ button:disabled {
 
 @media (max-width: 1180px) { .dashboard-premium-analytics { grid-template-columns: repeat(2, minmax(0, 1fr)); }.dashboard-premium-analytics .entity-analytics-card { grid-column: 1 / -1; } }
 @media (max-width: 720px) { .dashboard-premium-analytics { grid-template-columns: 1fr; }.dashboard-premium-analytics .entity-analytics-card { grid-column: auto; }.premium-status-layout { grid-template-columns: 1fr; }.premium-status-legend { grid-template-columns: repeat(2, minmax(0, 1fr)); }.dashboard-records-toolbar { align-items: stretch; flex-direction: column; } }
+
+.reports-page > .dashboard-section,
+.reports-page > .reports-chart-grid {
+  margin-bottom: 1.25rem;
+}
+
+.reports-export-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.reports-export-grid button {
+  justify-content: center;
+  gap: 0.5rem;
+}
+
+.reports-chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.25rem;
+}
+
+.reports-chart-section {
+  min-width: 0;
+}
+
+.reports-status-layout {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(150px, 0.9fr);
+  min-height: 260px;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.reports-chart {
+  width: 100%;
+  height: 260px;
+  min-width: 0;
+}
+
+.reports-frequency-chart {
+  height: 290px;
+}
+
+.reports-status-legend {
+  display: grid;
+  max-height: 260px;
+  gap: 0.35rem;
+  overflow: auto;
+  padding: 0.25rem;
+}
+
+.reports-legend-item {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.55rem;
+  min-width: 0;
+  padding: 0.45rem 0.5rem;
+  color: var(--text-secondary);
+  font-size: 0.73rem;
+  border-radius: 0.45rem;
+}
+
+.reports-legend-item > span {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.reports-legend-item b {
+  overflow: hidden;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.reports-legend-item strong {
+  color: var(--text-primary);
+}
+
+@media (max-width: 980px) {
+  .reports-export-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .reports-chart-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .reports-status-layout {
+    grid-template-columns: minmax(0, 1fr) minmax(120px, 0.8fr);
+  }
+}
+
+@media (max-width: 520px) {
+  .reports-export-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .reports-status-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .reports-status-legend {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
