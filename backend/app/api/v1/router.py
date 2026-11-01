@@ -560,11 +560,12 @@ def list_page(items: list, page: int, page_size: int) -> dict:
 def build_instance_cache(db: Session, org: str) -> dict:
     master_org = platform_master_organization_id(db)
     return {
-        "rules": {r.id: r for r in db.scalars(select(ComplianceRule).where(ComplianceRule.organization_id == master_org))},
-        "versions": {v.id: v for v in db.scalars(select(ComplianceRuleVersion).join(ComplianceRule).where(ComplianceRule.organization_id == master_org))},
+        "rules": {r.id: r for r in db.scalars(select(ComplianceRule).where(ComplianceRule.organization_id.in_([master_org, org])))},
+        "versions": {v.id: v for v in db.scalars(select(ComplianceRuleVersion).join(ComplianceRule).where(ComplianceRule.organization_id.in_([master_org, org])))},
         "UNIT": {u.id: u for u in db.scalars(select(Unit).where(Unit.organization_id == org))},
         "CONTRACTOR": {c.id: c for c in db.scalars(select(Contractor).where(Contractor.organization_id == org))},
         "CONTRACTOR_SITE": {s.id: s for s in db.scalars(select(ContractorSite).where(ContractorSite.organization_id == org))},
+        "states": {s.id: s for s in db.scalars(select(State))},
     }
 
 def entity_page(
@@ -608,8 +609,12 @@ def entity_page(
     ]
     total = len(rows)
     rows = rows[(safe_page - 1) * safe_size : (safe_page - 1) * safe_size + safe_size]
+    cache = {
+        "states": {s.id: s for s in db.scalars(select(State))},
+        "industries": {i.id: i for i in db.scalars(select(IndustryType))},
+    }
     return {
-        "items": [entity_dict(db, row, entity_type) for row in rows],
+        "items": [entity_dict(db, row, entity_type, cache=cache) for row in rows],
         "total": total,
         "page": safe_page,
         "page_size": safe_size,
@@ -1416,11 +1421,15 @@ def change_password(payload: PasswordChangeRequest, user: User = Depends(current
 
 def _profile_entities(db: Session, user: User, organization_id: str) -> list[dict]:
     """Return only entities the current trusted user can actually access."""
+    cache = {
+        "states": {s.id: s for s in db.scalars(select(State))},
+        "industries": {i.id: i for i in db.scalars(select(IndustryType))},
+    }
     entities: list[dict] = []
     for kind, model in (("UNIT", Unit), ("CONTRACTOR", Contractor), ("CONTRACTOR_SITE", ContractorSite)):
         for entity in db.scalars(select(model).where(model.organization_id == organization_id).order_by(model.name)):
             if can_access_subject(db, user, organization_id, kind, entity.id):
-                entities.append(entity_dict(db, entity, kind))
+                entities.append(entity_dict(db, entity, kind, cache=cache))
     return entities
 
 
@@ -1709,7 +1718,11 @@ def list_contractors(paginated: bool = False, page: int = 1, page_size: int = 50
         require_permission(db, user, "entities.read")
     if paginated:
         return entity_page(db, user, Contractor, "CONTRACTOR", org, page, page_size, q, status, sort_by, sort_dir)
-    return [entity_dict(db, row, "CONTRACTOR") for row in db.scalars(select(Contractor).where(Contractor.organization_id == org).order_by(Contractor.name)) if can_access_subject(db, user, org, "CONTRACTOR", row.id)]
+    cache = {
+        "states": {s.id: s for s in db.scalars(select(State))},
+        "industries": {i.id: i for i in db.scalars(select(IndustryType))},
+    }
+    return [entity_dict(db, row, "CONTRACTOR", cache=cache) for row in db.scalars(select(Contractor).where(Contractor.organization_id == org).order_by(Contractor.name)) if can_access_subject(db, user, org, "CONTRACTOR", row.id)]
 
 
 @router.get("/contractors/{contractor_id}")
@@ -2193,7 +2206,11 @@ def list_sites(paginated: bool = False, page: int = 1, page_size: int = 50, q: s
     require_permission(db, user, "entities.read")
     if paginated:
         return entity_page(db, user, ContractorSite, "CONTRACTOR_SITE", org, page, page_size, q, status, sort_by, sort_dir)
-    return [entity_dict(db, row, "CONTRACTOR_SITE") for row in db.scalars(select(ContractorSite).where(ContractorSite.organization_id == org).order_by(ContractorSite.name)) if can_access_subject(db, user, org, "CONTRACTOR_SITE", row.id)]
+    cache = {
+        "states": {s.id: s for s in db.scalars(select(State))},
+        "industries": {i.id: i for i in db.scalars(select(IndustryType))},
+    }
+    return [entity_dict(db, row, "CONTRACTOR_SITE", cache=cache) for row in db.scalars(select(ContractorSite).where(ContractorSite.organization_id == org).order_by(ContractorSite.name)) if can_access_subject(db, user, org, "CONTRACTOR_SITE", row.id)]
 
 
 @router.get("/contractor-sites/{site_id}")
@@ -3093,11 +3110,18 @@ def my_submissions(
     for submission in submissions:
         latest_by_instance.setdefault(submission.instance_id, submission)
 
+    all_instances = {
+        inst.id: inst
+        for inst in db.scalars(
+            select(ComplianceInstance).where(ComplianceInstance.id.in_(list(latest_by_instance.keys())))
+        )
+    } if latest_by_instance else {}
+
     cache = build_instance_cache(db, organization_id)
     rows: list[dict] = []
     summary_rows: list[dict] = []
     for instance_id, submission in latest_by_instance.items():
-        instance = db.get(ComplianceInstance, instance_id)
+        instance = all_instances.get(instance_id)
         if not instance or not can_access_subject(db, user, organization_id, instance.subject_type, instance.subject_id):
             continue
         row = instance_dict(db, instance, cache=cache, detail=True)
@@ -3256,9 +3280,16 @@ def my_review_history(
         ComplianceWorkflowHistory.actor_id == user.id,
         ComplianceWorkflowHistory.action.in_({"APPROVE", "REJECT", "REQUEST_CORRECTION"}),
     ).order_by(ComplianceWorkflowHistory.created_at.desc())))
+    decision_instance_ids = list({entry.instance_id for entry in decisions})
+    all_instances = {
+        inst.id: inst
+        for inst in db.scalars(
+            select(ComplianceInstance).where(ComplianceInstance.id.in_(decision_instance_ids))
+        )
+    } if decision_instance_ids else {}
     rows: list[dict] = []
     for entry in decisions:
-        instance = db.get(ComplianceInstance, entry.instance_id)
+        instance = all_instances.get(entry.instance_id)
         if not instance or instance.organization_id != organization_id:
             continue
         if not can_access_subject(db, user, organization_id, instance.subject_type, instance.subject_id):

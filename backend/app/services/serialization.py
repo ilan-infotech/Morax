@@ -18,7 +18,8 @@ def model_dict(model: Any, fields: list[str]) -> dict[str, Any]:
     return {field: value(getattr(model, field)) for field in fields}
 
 
-def entity_dict(db: Session, entity: Any, kind: str) -> dict[str, Any]:
+def entity_dict(db: Session, entity: Any, kind: str, cache: dict | None = None) -> dict[str, Any]:
+    cache = cache or {}
     fields = [field.name for field in entity.__table__.columns]
     result = model_dict(entity, fields)
     result["entity_type"] = kind
@@ -47,10 +48,10 @@ def entity_dict(db: Session, entity: Any, kind: str) -> dict[str, Any]:
             for maker in contractor_makers
         ]
     if getattr(entity, "state_id", None):
-        state = db.get(State, entity.state_id)
+        state = cache.get("states", {}).get(entity.state_id) or db.get(State, entity.state_id)
         result["state_name"] = state.name if state else None
     if getattr(entity, "industry_type_id", None):
-        industry = db.get(IndustryType, entity.industry_type_id)
+        industry = cache.get("industries", {}).get(entity.industry_type_id) or db.get(IndustryType, entity.industry_type_id)
         result["industry_master_name"] = industry.name if industry else None
         result["industry_name"] = getattr(entity, "other_industry_name", None) or (industry.name if industry else None)
     return result
@@ -96,7 +97,7 @@ def subject_context(db: Session, instance: ComplianceInstance, cache: dict | Non
         or getattr(contractor, "state_id", None)
         or getattr(unit, "state_id", None)
     )
-    state = db.get(State, state_id) if state_id else None
+    state = cache.get("states", {}).get(state_id) or (db.get(State, state_id) if state_id else None)
     return {
         "unit_name": unit.name if unit else None,
         "contractor_name": contractor.name if contractor else None,
