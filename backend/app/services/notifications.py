@@ -223,20 +223,36 @@ def schedule_register_reminders(db: Session, run_date: date | None = None) -> in
         "UNIT": ("UNIT_MAKER", "UNIT_CHECKER"),
         "CONTRACTOR": ("CONTRACTOR_MAKER", "CONTRACTOR_CHECKER"),
     }
+    all_sites = {s.id: s for s in db.scalars(select(ContractorSite))}
+    all_scopes = list(
+        db.scalars(
+            select(UserRoleScope)
+            .join(User, User.id == UserRoleScope.user_id)
+            .where(
+                UserRoleScope.scope_type.in_(["UNIT", "CONTRACTOR"]),
+                UserRoleScope.role.in_(["UNIT_MAKER", "UNIT_CHECKER", "CONTRACTOR_MAKER", "CONTRACTOR_CHECKER"]),
+                User.active.is_(True),
+            )
+        )
+    )
+    role_user_map: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+    for s in all_scopes:
+        role_user_map[(s.scope_type, s.scope_id, s.role)].add(s.user_id)
+
     for register in db.scalars(select(GeneratedRegister).where(GeneratedRegister.status.not_in(["APPROVED", "SUPERSEDED"]))):
         if not register.due_date:
             continue
         scope_type, scope_id = register.entity_type, register.entity_id
         if scope_type == "CONTRACTOR_SITE":
-            site = db.get(ContractorSite, scope_id)
+            site = all_sites.get(scope_id)
             if not site:
                 continue
             scope_type, scope_id = "CONTRACTOR", site.contractor_id
         roles = role_map.get(scope_type)
         if not roles:
             continue
-        maker_ids = set(db.scalars(select(UserRoleScope.user_id).join(User, User.id == UserRoleScope.user_id).where(UserRoleScope.scope_type == scope_type, UserRoleScope.scope_id == scope_id, UserRoleScope.role == roles[0], User.active.is_(True))))
-        checker_ids = set(db.scalars(select(UserRoleScope.user_id).join(User, User.id == UserRoleScope.user_id).where(UserRoleScope.scope_type == scope_type, UserRoleScope.scope_id == scope_id, UserRoleScope.role == roles[1], User.active.is_(True))))
+        maker_ids = role_user_map.get((scope_type, scope_id, roles[0]), set())
+        checker_ids = role_user_map.get((scope_type, scope_id, roles[1]), set())
         days_until_due = (register.due_date - run_date).days
         if register.status in {"GENERATED", "REJECTED"} and days_until_due in {7, 3, 1, 0}:
             stage = {7: "DUE_IN_7_DAYS", 3: "DUE_IN_3_DAYS", 1: "DUE_TOMORROW", 0: "DUE_TODAY"}[days_until_due]
@@ -261,6 +277,21 @@ def schedule_license_reminders(db: Session, run_date: date | None = None) -> int
     run_date = run_date or datetime.now(UTC).date()
     created = 0
     stages = {90: "DUE_IN_90_DAYS", 60: "DUE_IN_60_DAYS", 30: "DUE_IN_30_DAYS", 15: "DUE_IN_15_DAYS", 7: "DUE_IN_7_DAYS", 1: "DUE_TOMORROW", 0: "DUE_TODAY"}
+    all_license_scopes = list(
+        db.scalars(
+            select(UserRoleScope)
+            .join(User, User.id == UserRoleScope.user_id)
+            .where(
+                UserRoleScope.scope_type.in_(["UNIT", "CONTRACTOR"]),
+                UserRoleScope.role.in_(["UNIT_MAKER", "CONTRACTOR_MAKER"]),
+                User.active.is_(True),
+            )
+        )
+    )
+    license_scope_map: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+    for s in all_license_scopes:
+        license_scope_map[(s.scope_type, s.scope_id, s.role)].add(s.user_id)
+
     for license_item in db.scalars(select(LicenseRecord).where(LicenseRecord.archived.is_(False), LicenseRecord.never_expires.is_(False), LicenseRecord.valid_until.is_not(None))):
         if not license_item.valid_until:
             continue
@@ -270,7 +301,7 @@ def schedule_license_reminders(db: Session, run_date: date | None = None) -> int
         recipients = organization_admin_recipients(db, license_item.organization_id)
         role = "UNIT_MAKER" if license_item.entity_type == "UNIT" else "CONTRACTOR_MAKER" if license_item.entity_type == "CONTRACTOR" else None
         if role:
-            recipients.update(db.scalars(select(UserRoleScope.user_id).join(User, User.id == UserRoleScope.user_id).where(UserRoleScope.scope_type == license_item.entity_type, UserRoleScope.scope_id == license_item.entity_id, UserRoleScope.role == role, User.active.is_(True))))
+            recipients.update(license_scope_map.get((license_item.entity_type, license_item.entity_id, role), set()))
         stage = stages.get(days, "OVERDUE")
         for recipient_id in recipients:
             created += int(emit_notification(

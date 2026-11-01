@@ -308,12 +308,15 @@ def entity_assignment_rows(db: Session, organization_id: str, entity_type: str, 
     role_map = ENTITY_ASSIGNMENT_ROLE_MAP[entity_type]
     reverse_roles = {value: key for key, value in role_map.items()}
     rows: list[dict] = []
-    for scope in db.scalars(select(UserRoleScope).where(
+    scopes = list(db.scalars(select(UserRoleScope).where(
         UserRoleScope.scope_type == entity_type,
         UserRoleScope.scope_id == entity_id,
         UserRoleScope.role.in_(set(reverse_roles)),
-    )):
-        assigned_user = db.get(User, scope.user_id)
+    )))
+    user_ids = {scope.user_id for scope in scopes}
+    users = {u.id: u for u in db.scalars(select(User).where(User.id.in_(user_ids)))} if user_ids else {}
+    for scope in scopes:
+        assigned_user = users.get(scope.user_id)
         if assigned_user and assigned_user.organization_id == organization_id:
             rows.append({
                 "user_id": assigned_user.id,
@@ -338,12 +341,14 @@ def replace_entity_assignments(
     entity = entity_for_assignment(db, organization_id, entity_type, entity_id)
     role_map = ENTITY_ASSIGNMENT_ROLE_MAP[entity_type]
     requested: set[tuple[str, str]] = set()
+    user_ids = {assignment.user_id for assignment in assignments}
+    users = {u.id: u for u in db.scalars(select(User).where(User.id.in_(user_ids)))} if user_ids else {}
     for assignment in assignments:
         key = (assignment.user_id, assignment.role)
         if key in requested:
             raise HTTPException(422, "A user can be assigned to an entity role only once")
         requested.add(key)
-        assigned_user = db.get(User, assignment.user_id)
+        assigned_user = users.get(assignment.user_id)
         if not assigned_user or assigned_user.organization_id != organization_id:
             raise HTTPException(422, "Assigned users must belong to the active organization")
         if not assigned_user.active:
@@ -521,14 +526,25 @@ def configure_contractor_assignments(db: Session, contractor: Contractor, maker_
             raise HTTPException(422, "Principal Employer Checker must hold an authorized Unit/Organization Checker scope")
     if not maker and not checker:
         return
-    for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.contractor_id == contractor.id)):
-        for assignment_type, assignee in (("MAKER", maker), ("CHECKER", checker)):
-            if not assignee:
-                continue
-            for prior in db.scalars(select(ComplianceAssignment).where(ComplianceAssignment.instance_id == instance.id, ComplianceAssignment.assignment_type == assignment_type, ComplianceAssignment.active.is_(True))):
+    instances = list(db.scalars(select(ComplianceInstance).where(ComplianceInstance.contractor_id == contractor.id)))
+    instance_ids = [inst.id for inst in instances]
+    if instance_ids:
+        active_assignments = list(db.scalars(
+            select(ComplianceAssignment).where(
+                ComplianceAssignment.instance_id.in_(instance_ids),
+                ComplianceAssignment.active.is_(True),
+            )
+        ))
+        now = datetime.now(UTC)
+        for prior in active_assignments:
+            if (maker and prior.assignment_type == "MAKER") or (checker and prior.assignment_type == "CHECKER"):
                 prior.active = False
-                prior.ended_at = datetime.now(UTC)
-            db.add(ComplianceAssignment(instance_id=instance.id, user_id=assignee.id, assignment_type=assignment_type, assigned_by_id=actor_id))
+                prior.ended_at = now
+        for instance in instances:
+            for assignment_type, assignee in (("MAKER", maker), ("CHECKER", checker)):
+                if not assignee:
+                    continue
+                db.add(ComplianceAssignment(instance_id=instance.id, user_id=assignee.id, assignment_type=assignment_type, assigned_by_id=actor_id))
     for role, assignee in (("Maker", maker), ("Checker", checker)):
         if not assignee:
             continue
@@ -1453,23 +1469,33 @@ def get_my_profile(user: User = Depends(current_user), db: Session = Depends(get
         (item["entity_type"], item["id"])
         for item in entities
     }
-    instances = [
-        instance for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == organization_id))
-        if (instance.subject_type, instance.subject_id) in accessible
-    ]
-    instance_ids = [instance.id for instance in instances]
-    submissions = list(db.scalars(select(ComplianceSubmission).where(
-        ComplianceSubmission.submitted_by_id == user.id,
-        ComplianceSubmission.instance_id.in_(instance_ids or ["__none__"]),
-    )))
+    submissions = list(db.scalars(
+        select(ComplianceSubmission)
+        .where(ComplianceSubmission.submitted_by_id == user.id)
+        .order_by(ComplianceSubmission.submitted_at.desc())
+        .limit(500)
+    ))
     submitted_instance_ids = {submission.instance_id for submission in submissions}
-    reviewed_actions = list(db.scalars(select(ComplianceWorkflowHistory).where(
-        ComplianceWorkflowHistory.actor_id == user.id,
-        ComplianceWorkflowHistory.instance_id.in_(instance_ids or ["__none__"]),
-        ComplianceWorkflowHistory.action.in_(["APPROVE", "REJECT", "REQUEST_CORRECTION"]),
-    )))
-    by_id = {instance.id: instance for instance in instances}
-    maker_instances = [by_id[item] for item in submitted_instance_ids if item in by_id]
+    maker_instances = [
+        inst for inst in db.scalars(select(ComplianceInstance).where(ComplianceInstance.id.in_(list(submitted_instance_ids))))
+        if inst.organization_id == organization_id and (inst.subject_type, inst.subject_id) in accessible
+    ] if submitted_instance_ids else []
+
+    reviewed_actions = list(db.scalars(
+        select(ComplianceWorkflowHistory)
+        .where(
+            ComplianceWorkflowHistory.actor_id == user.id,
+            ComplianceWorkflowHistory.action.in_(["APPROVE", "REJECT", "REQUEST_CORRECTION"]),
+        )
+        .order_by(ComplianceWorkflowHistory.created_at.desc())
+        .limit(500)
+    ))
+    pending_review_count = db.scalar(
+        select(func.count(ComplianceInstance.id)).where(
+            ComplianceInstance.organization_id == organization_id,
+            ComplianceInstance.status.in_(["SUBMITTED", "UNDER_REVIEW"]),
+        )
+    ) or 0
     return {
         "account": {
             "id": user.id, "name": user.name, "email": user.email, "mobile": user.mobile,
@@ -1487,7 +1513,7 @@ def get_my_profile(user: User = Depends(current_user), db: Session = Depends(get
             },
             "checker": {
                 "total_reviewed": len(reviewed_actions),
-                "pending_review": sum(item.status in {"SUBMITTED", "UNDER_REVIEW"} for item in instances),
+                "pending_review": pending_review_count,
                 "approved_by_me": sum(item.action == "APPROVE" for item in reviewed_actions),
                 "rejected_by_me": sum(item.action in {"REJECT", "REQUEST_CORRECTION"} for item in reviewed_actions),
             },
@@ -2834,14 +2860,30 @@ def confirm_import(import_id: str, mode: str = "MERGE", confirmation: str | None
         .where(ComplianceImportRow.import_id == import_id, ComplianceImportRow.valid.is_(True))
         .order_by(ComplianceImportRow.row_number)
     )
+    existing_rules_by_compliance_id = {r.compliance_id: r for r in db.scalars(select(ComplianceRule).where(ComplianceRule.organization_id == master_org))}
+    existing_versions = {
+        (v.rule_id, v.version)
+        for v in db.scalars(
+            select(ComplianceRuleVersion)
+            .join(ComplianceRule, ComplianceRuleVersion.rule_id == ComplianceRule.id)
+            .where(ComplianceRule.organization_id == master_org)
+        )
+    }
     for item in import_rows:
         row = json.loads(item.payload_json)
         payload = RuleInput(compliance_id=str(row["Compliance ID"]).strip(), name=str(row["Compliance Name"]).strip(), description=str(row["Description"]) if row.get("Description") else None, act=str(row["Act"]).strip() if row.get("Act") else None, rule_reference=str(row["Rule"]).strip() if row.get("Rule") else None, section=str(row["Section"]).strip() if row.get("Section") else None, compliance_type=str(row["Compliance Type"]).strip() if row.get("Compliance Type") else None, document_type=str(row["Document Type"]).strip() if row.get("Document Type") else None, form_number=str(row["Form Number"]).strip() if row.get("Form Number") else None, legal_description=str(row["Legal Description"]) if row.get("Legal Description") else None, consequence_or_penalty=str(row["Consequence / Penalty"]) if row.get("Consequence / Penalty") else None, version=int(row["Version"]), entity_type=str(row["Entity Type"]).strip().upper(), state_id=state_names.get(str(row.get("State") or "").strip().lower()), industry_type_id=industry_names.get(str(row.get("Industry Type") or "").strip().lower()), employee_threshold=int(row["Employee Threshold"]) if row.get("Employee Threshold") not in (None, "") else None, unit_compliance_types=parse_unit_compliance_types(row.get("Unit Compliance Types")), frequency=str(row["Frequency"]).strip().upper(), applicable_months=parse_applicable_months(row.get("Applicable Months")), due_date_rule=str(row["Due Date Rule"]).strip().upper(), due_date_offset=int(row["Due Date Offset"]) if row.get("Due Date Offset") not in (None, "") else None, due_date_anchor=str(row["Due Date Anchor"]).strip() if row.get("Due Date Anchor") else None, required_document=str(row["Required Document"]) if row.get("Required Document") else None, risk_level=str(row.get("Risk Level") or "MEDIUM").strip().upper(), effective_from=date.fromisoformat(str(row["Effective From"])), effective_to=date.fromisoformat(str(row["Effective To"])) if row.get("Effective To") else None, active=parse_bool(row.get("Active")))
-        existing_rule = db.scalar(select(ComplianceRule).where(ComplianceRule.organization_id == master_org, ComplianceRule.compliance_id == payload.compliance_id))
-        if existing_rule and db.scalar(select(ComplianceRuleVersion).where(ComplianceRuleVersion.rule_id == existing_rule.id, ComplianceRuleVersion.version == payload.version)):
+        existing_rule = existing_rules_by_compliance_id.get(payload.compliance_id)
+        if existing_rule and (existing_rule.id, payload.version) in existing_versions:
             skipped += 1
             continue
-        create_rule_version(db, master_org, user, payload); imported += 1
+        new_version = create_rule_version(db, master_org, user, payload); imported += 1
+        if not existing_rule:
+            rule_obj = db.get(ComplianceRule, new_version.rule_id)
+            if rule_obj:
+                existing_rules_by_compliance_id[payload.compliance_id] = rule_obj
+                existing_rule = rule_obj
+        if existing_rule:
+            existing_versions.add((existing_rule.id, payload.version))
     record.status = "CONFIRMED"; record.confirmed_at = datetime.now(UTC)
     audit(db, organization_id=master_org, actor_id=user.id, action="REPLACE_COMPLIANCE_MASTER" if normalized_mode == "REPLACE" else "CONFIRM_IMPORT", module="COMPLIANCE_MASTER", entity_type="ComplianceImport", entity_id=record.id, new={"mode": normalized_mode, "imported": imported, "skipped": skipped, "deleted": deleted})
     db.commit()
@@ -2954,13 +2996,20 @@ def filtered_instance_rows(
     
     cache = build_instance_cache(db, org)
 
-    instances = list(
-        db.scalars(
-            select(ComplianceInstance)
-            .where(ComplianceInstance.organization_id == org)
-            .order_by(ComplianceInstance.due_date)
-        )
-    )
+    inst_query = select(ComplianceInstance).where(ComplianceInstance.organization_id == org)
+    if entity_type:
+        inst_query = inst_query.where(ComplianceInstance.subject_type == entity_type)
+    if subject_id:
+        inst_query = inst_query.where(ComplianceInstance.subject_id == subject_id)
+    if compliance_area == "COMPANY":
+        inst_query = inst_query.where(ComplianceInstance.subject_type == "UNIT")
+    elif compliance_area == "CONTRACTOR":
+        inst_query = inst_query.where(ComplianceInstance.subject_type.in_(["CONTRACTOR", "CONTRACTOR_SITE"]))
+    if date_from:
+        inst_query = inst_query.where(ComplianceInstance.due_date >= date_from)
+    if date_to:
+        inst_query = inst_query.where(ComplianceInstance.due_date <= date_to)
+    instances = list(db.scalars(inst_query.order_by(ComplianceInstance.due_date)))
     
     results = []
     for instance in instances:
@@ -3058,7 +3107,7 @@ def assignment_queue(
             # A Contractor selection represents the Contractor and its
             # registered sites.  The latter keep their own subject IDs so
             # their recurring obligations remain independent.
-            site = db.get(ContractorSite, row["subject_id"]) if row["subject_type"] == "CONTRACTOR_SITE" else None
+            site = cache.get("CONTRACTOR_SITE", {}).get(row["subject_id"]) if row["subject_type"] == "CONTRACTOR_SITE" else None
             if not site or site.contractor_id != subject_id:
                 continue
         due_date = date.fromisoformat(row["due_date"])
@@ -3113,6 +3162,7 @@ def my_submissions(
             ComplianceInstance.organization_id == organization_id,
         )
         .order_by(ComplianceSubmission.submitted_at.desc(), ComplianceSubmission.revision.desc())
+        .limit(500)
     ))
     latest_by_instance: dict[str, ComplianceSubmission] = {}
     for submission in submissions:
@@ -3126,6 +3176,15 @@ def my_submissions(
     } if latest_by_instance else {}
 
     cache = build_instance_cache(db, organization_id)
+    if all_instances:
+        assignments_by_inst: dict[str, list[ComplianceAssignment]] = defaultdict(list)
+        for a in db.scalars(select(ComplianceAssignment).where(ComplianceAssignment.instance_id.in_(list(all_instances.keys())), ComplianceAssignment.active.is_(True))):
+            assignments_by_inst[a.instance_id].append(a)
+        evidence_by_inst: dict[str, list[ComplianceEvidence]] = defaultdict(list)
+        for e in db.scalars(select(ComplianceEvidence).where(ComplianceEvidence.instance_id.in_(list(all_instances.keys())))):
+            evidence_by_inst[e.instance_id].append(e)
+        cache["assignments"] = assignments_by_inst
+        cache["evidence"] = evidence_by_inst
     rows: list[dict] = []
     summary_rows: list[dict] = []
     for instance_id, submission in latest_by_instance.items():
@@ -3207,14 +3266,26 @@ def my_pending_approvals(
         q=q, status=status, risk_level=risk_level, frequency=frequency, date_from=date_from, date_to=date_to, subject_id=subject_id, include_unpaged=True,
     )
     all_rows = response.pop("_unpaged_rows")
+    all_instance_ids = [row["id"] for row in all_rows]
     submission_by_id: dict[str, ComplianceSubmission | None] = {}
+    makers_by_id: dict[str, User] = {}
+    if all_instance_ids:
+        all_submissions = list(db.scalars(
+            select(ComplianceSubmission)
+            .where(ComplianceSubmission.instance_id.in_(all_instance_ids))
+            .order_by(ComplianceSubmission.revision.desc())
+        ))
+        for sub in all_submissions:
+            if sub.instance_id not in submission_by_id:
+                submission_by_id[sub.instance_id] = sub
+        maker_user_ids = {sub.submitted_by_id for sub in submission_by_id.values() if sub and sub.submitted_by_id}
+        if maker_user_ids:
+            makers_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(maker_user_ids)))}
+
     for row in all_rows:
-        latest_submission = db.scalar(select(ComplianceSubmission).where(
-            ComplianceSubmission.instance_id == row["id"],
-        ).order_by(ComplianceSubmission.revision.desc()))
-        submission_by_id[row["id"]] = latest_submission
+        latest_submission = submission_by_id.get(row["id"])
         if latest_submission:
-            maker = db.get(User, latest_submission.submitted_by_id)
+            maker = makers_by_id.get(latest_submission.submitted_by_id)
             row["submitted_at"] = latest_submission.submitted_at.isoformat()
             row["submitted_by_name"] = maker.name if maker else "Maker"
             row["submission_revision"] = latest_submission.revision
@@ -3233,13 +3304,11 @@ def my_pending_approvals(
     if waiting_over_days is not None:
         all_rows = [row for row in all_rows if row.get("waiting_days", 0) > waiting_over_days]
         response = list_page(all_rows, max(1, page), min(max(1, page_size), 100))
-    # The page items and unpaged rows share the same dictionaries, but retain
-    # this explicit update should list_page ever create row copies.
     for row in response["items"]:
         if row.get("submitted_at") is None and row["id"] in submission_by_id:
             latest_submission = submission_by_id[row["id"]]
             if latest_submission:
-                maker = db.get(User, latest_submission.submitted_by_id)
+                maker = makers_by_id.get(latest_submission.submitted_by_id)
                 submitted_at = latest_submission.submitted_at
                 if submitted_at.tzinfo is None:
                     submitted_at = submitted_at.replace(tzinfo=UTC)
@@ -3295,6 +3364,15 @@ def my_review_history(
             select(ComplianceInstance).where(ComplianceInstance.id.in_(decision_instance_ids))
         )
     } if decision_instance_ids else {}
+    all_submissions = list(db.scalars(
+        select(ComplianceSubmission).where(ComplianceSubmission.instance_id.in_(decision_instance_ids))
+        .order_by(ComplianceSubmission.revision.desc())
+    )) if decision_instance_ids else []
+    submissions_by_instance: dict[str, list[ComplianceSubmission]] = defaultdict(list)
+    for s in all_submissions:
+        submissions_by_instance[s.instance_id].append(s)
+    submitter_ids = {s.submitted_by_id for s in all_submissions if s.submitted_by_id}
+    makers_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(submitter_ids)))} if submitter_ids else {}
     rows: list[dict] = []
     for entry in decisions:
         instance = all_instances.get(entry.instance_id)
@@ -3315,18 +3393,12 @@ def my_review_history(
         if date_to and reviewed_date > date_to:
             continue
         submission_revision = entry.submission_revision
-        submission_query = select(ComplianceSubmission).where(
-            ComplianceSubmission.instance_id == instance.id,
-        )
+        inst_subs = submissions_by_instance.get(instance.id, [])
         if submission_revision is not None:
-            submission_query = submission_query.where(ComplianceSubmission.revision == submission_revision)
+            latest_submission = next((s for s in inst_subs if s.revision == submission_revision), None)
         else:
-            # Legacy history created before revision tracking: use the newest
-            # submission that existed when the decision was made, never a
-            # later resubmission.
-            submission_query = submission_query.where(ComplianceSubmission.submitted_at <= entry.created_at)
-        latest_submission = db.scalar(submission_query.order_by(ComplianceSubmission.revision.desc()))
-        maker = db.get(User, latest_submission.submitted_by_id) if latest_submission else None
+            latest_submission = next((s for s in inst_subs if s.submitted_at <= entry.created_at), None)
+        maker = makers_by_id.get(latest_submission.submitted_by_id) if latest_submission else None
         row.update({
             "decision": normalized_decision,
             "review_action": entry.action,
@@ -3734,29 +3806,50 @@ def create_contract_expiry_alerts(db: Session, organization_id: str, days_ahead:
     today_value = date.today()
     latest_date = today_value + timedelta(days=days_ahead)
     created = False
-    for contractor in db.scalars(select(Contractor).where(Contractor.organization_id == organization_id, Contractor.status == "ACTIVE")):
+    contractors = list(db.scalars(select(Contractor).where(Contractor.organization_id == organization_id, Contractor.status == "ACTIVE")))
+    if not contractors:
+        return
+
+    admin_user_ids = set(db.scalars(
+        select(UserRoleScope.user_id).where(
+            UserRoleScope.role == "ORGANIZATION_ADMIN",
+            UserRoleScope.scope_type == "ORGANIZATION",
+            UserRoleScope.scope_id == organization_id,
+        )
+    ))
+    unit_checker_scopes = list(db.scalars(
+        select(UserRoleScope).where(
+            UserRoleScope.role.in_({"UNIT_ADMIN", "UNIT_CHECKER"}),
+            UserRoleScope.scope_type == "UNIT",
+        )
+    ))
+    unit_checkers_by_unit: dict[str, set[str]] = defaultdict(set)
+    for s in unit_checker_scopes:
+        unit_checkers_by_unit[s.scope_id].add(s.user_id)
+    all_candidate_user_ids = admin_user_ids | {s.user_id for s in unit_checker_scopes}
+    active_user_ids = set(db.scalars(select(User.id).where(User.id.in_(all_candidate_user_ids), User.active.is_(True)))) if all_candidate_user_ids else set()
+
+    existing_keys = set(db.scalars(
+        select(InAppNotification.reference_id).where(
+            InAppNotification.organization_id == organization_id,
+            InAppNotification.reference_type == "ContractorExpiry",
+        )
+    ))
+
+    for contractor in contractors:
         for alert_type, expiry_date, label in (
             ("CONTRACT_EXPIRY", contractor.contract_end_date, "Contract"),
             ("WORK_ORDER_EXPIRY", contractor.work_order_expiry_date, "Work order"),
         ):
             if not expiry_date or not today_value <= expiry_date <= latest_date:
                 continue
-            recipients = {
-                scope.user_id
-                for scope in db.scalars(select(UserRoleScope).where(
-                    ((UserRoleScope.role == "ORGANIZATION_ADMIN") & (UserRoleScope.scope_type == "ORGANIZATION") & (UserRoleScope.scope_id == organization_id))
-                    | ((UserRoleScope.role.in_({"UNIT_ADMIN", "UNIT_CHECKER"})) & (UserRoleScope.scope_type == "UNIT") & (UserRoleScope.scope_id == contractor.unit_id))
-                ))
-            }
+            recipients = (admin_user_ids | unit_checkers_by_unit.get(contractor.unit_id or "", set())) & active_user_ids
             reference_id = f"{contractor.id}:{expiry_date.isoformat()}"
             for recipient_id in recipients:
-                recipient = db.get(User, recipient_id)
-                if not recipient or not recipient.active:
-                    continue
-                duplicate = db.scalar(select(InAppNotification.id).where(InAppNotification.recipient_id == recipient_id, InAppNotification.notification_type == alert_type, InAppNotification.reference_type == "ContractorExpiry", InAppNotification.reference_id == reference_id))
-                if duplicate:
+                if reference_id in existing_keys:
                     continue
                 db.add(InAppNotification(organization_id=organization_id, recipient_id=recipient_id, notification_type=alert_type, title=f"{label} expires soon", body=f"{contractor.name}: {expiry_date.isoformat()}", reference_type="ContractorExpiry", reference_id=reference_id))
+                existing_keys.add(reference_id)
                 created = True
     if created:
         db.commit()
@@ -3773,9 +3866,11 @@ def support_ticket_or_404(db: Session, user: User, ticket_id: str) -> SupportTic
     return ticket
 
 
-def support_ticket_dict(db: Session, ticket: SupportTicket, detail: bool = False) -> dict:
-    creator = db.get(User, ticket.creator_id)
-    assignee = db.get(User, ticket.assigned_to_id) if ticket.assigned_to_id else None
+def support_ticket_dict(db: Session, ticket: SupportTicket, detail: bool = False, cache: dict | None = None) -> dict:
+    cache = cache or {}
+    users_cache = cache.get("users", {})
+    creator = users_cache.get(ticket.creator_id) or db.get(User, ticket.creator_id)
+    assignee = (users_cache.get(ticket.assigned_to_id) or db.get(User, ticket.assigned_to_id)) if ticket.assigned_to_id else None
     row = model_dict(ticket, [field.name for field in ticket.__table__.columns])
     row.update({
         "creator_name": creator.name if creator else "Unknown user",
@@ -3785,11 +3880,14 @@ def support_ticket_dict(db: Session, ticket: SupportTicket, detail: bool = False
     if detail:
         messages = list(db.scalars(select(SupportTicketMessage).where(SupportTicketMessage.ticket_id == ticket.id).order_by(SupportTicketMessage.created_at)))
         attachments = list(db.scalars(select(SupportTicketAttachment).where(SupportTicketAttachment.ticket_id == ticket.id).order_by(SupportTicketAttachment.created_at)))
-        row["messages"] = [model_dict(message, [field.name for field in message.__table__.columns]) | {"author_name": (db.get(User, message.author_id).name if db.get(User, message.author_id) else "Unknown user")} for message in messages]
+        author_ids = {m.author_id for m in messages if m.author_id}
+        message_users = {u.id: u for u in db.scalars(select(User).where(User.id.in_(author_ids)))} if author_ids else {}
+        row["messages"] = [model_dict(message, [field.name for field in message.__table__.columns]) | {"author_name": (message_users.get(message.author_id).name if message_users.get(message.author_id) else "Unknown user")} for message in messages]
         row["attachments"] = [model_dict(item, [field.name for field in item.__table__.columns]) for item in attachments]
         row["activity"] = [model_dict(item, [field.name for field in item.__table__.columns]) for item in db.scalars(select(SupportTicketActivity).where(SupportTicketActivity.ticket_id == ticket.id).order_by(SupportTicketActivity.created_at))]
     else:
-        row["reply_count"] = db.scalar(select(func.count(SupportTicketMessage.id)).where(SupportTicketMessage.ticket_id == ticket.id)) or 0
+        reply_counts = cache.get("reply_counts", {})
+        row["reply_count"] = reply_counts.get(ticket.id) if ticket.id in reply_counts else (db.scalar(select(func.count(SupportTicketMessage.id)).where(SupportTicketMessage.ticket_id == ticket.id)) or 0)
     return row
 
 
@@ -3832,8 +3930,18 @@ def list_support_tickets(q: str | None = None, status: str | None = None, priori
     if category: query = query.where(SupportTicket.category == category)
     if issue_type: query = query.where(SupportTicket.issue_type == issue_type.upper())
     if hide_closed: query = query.where(SupportTicket.status.not_in(["RESOLVED", "CLOSED"]))
-    tickets = list(db.scalars(query))
-    rows = [support_ticket_dict(db, ticket) for ticket in tickets]
+    tickets = list(db.scalars(query.limit(200)))
+    ticket_ids = [t.id for t in tickets]
+    user_ids = {t.creator_id for t in tickets if t.creator_id} | {t.assigned_to_id for t in tickets if t.assigned_to_id}
+    ticket_cache = {
+        "users": {u.id: u for u in db.scalars(select(User).where(User.id.in_(user_ids)))} if user_ids else {},
+        "reply_counts": dict(db.execute(
+            select(SupportTicketMessage.ticket_id, func.count(SupportTicketMessage.id))
+            .where(SupportTicketMessage.ticket_id.in_(ticket_ids))
+            .group_by(SupportTicketMessage.ticket_id)
+        ).all()) if ticket_ids else {},
+    }
+    rows = [support_ticket_dict(db, ticket, cache=ticket_cache) for ticket in tickets]
     if q:
         needle = q.lower(); rows = [row for row in rows if needle in " ".join(str(row.get(key) or "") for key in ("ticket_number", "subject", "creator_name", "category", "issue_type")).lower()]
     rows.sort(key=lambda row: str(row.get(sort_by) or ""), reverse=sort_dir.lower() != "asc")
@@ -3910,18 +4018,40 @@ def download_support_ticket_attachment(attachment_id: str, user: User = Depends(
     return FileResponse(file_path(attachment.stored_filename), filename=attachment.original_filename, media_type=attachment.content_type or "application/octet-stream")
 
 
-def notification_visible_to_user(db: Session, user: User, notification: InAppNotification) -> bool:
+def _build_notification_caches(db: Session, notifications: list[InAppNotification]) -> tuple[dict[str, ComplianceInstance], dict[str, SupportTicket]]:
+    instance_ids = {n.reference_id for n in notifications if n.reference_type == "ComplianceInstance" and n.reference_id}
+    instances = {inst.id: inst for inst in db.scalars(select(ComplianceInstance).where(ComplianceInstance.id.in_(instance_ids)))} if instance_ids else {}
+    ticket_ids = {n.reference_id for n in notifications if n.reference_type == "SupportTicket" and n.reference_id}
+    tickets = {t.id: t for t in db.scalars(select(SupportTicket).where(SupportTicket.id.in_(ticket_ids)))} if ticket_ids else {}
+    return instances, tickets
+
+
+def notification_visible_to_user(
+    db: Session,
+    user: User,
+    notification: InAppNotification,
+    instance_cache: dict[str, ComplianceInstance] | None = None,
+    ticket_cache: dict[str, SupportTicket] | None = None,
+) -> bool:
     """Recheck live entity access so revoked scopes cannot read old alerts."""
     if notification.recipient_id != user.id:
         return False
     if notification.reference_type == "ComplianceInstance" and notification.reference_id:
-        instance = db.get(ComplianceInstance, notification.reference_id)
+        instance = (
+            instance_cache.get(notification.reference_id)
+            if instance_cache is not None
+            else db.get(ComplianceInstance, notification.reference_id)
+        )
         return bool(
             instance
             and can_access_subject(db, user, instance.organization_id, instance.subject_type, instance.subject_id)
         )
     if notification.reference_type == "SupportTicket" and notification.reference_id:
-        ticket = db.get(SupportTicket, notification.reference_id)
+        ticket = (
+            ticket_cache.get(notification.reference_id)
+            if ticket_cache is not None
+            else db.get(SupportTicket, notification.reference_id)
+        )
         return bool(ticket and (support_ticket_admin(user) or ticket.organization_id == org_for(user)))
     return notification.organization_id == org_for(user) or support_ticket_admin(user)
 
@@ -3939,20 +4069,24 @@ def list_notifications(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ):
-    rows = [
-        item for item in db.scalars(
-            select(InAppNotification)
-            .where(InAppNotification.recipient_id == user.id)
-            .order_by(InAppNotification.created_at.desc())
-        )
-        if notification_visible_to_user(db, user, item)
-    ]
+    query = (
+        select(InAppNotification)
+        .where(InAppNotification.recipient_id == user.id)
+        .order_by(InAppNotification.created_at.desc())
+    )
     if unread_only:
-        rows = [item for item in rows if item.read_at is None]
+        query = query.where(InAppNotification.read_at.is_(None))
     if category:
-        rows = [item for item in rows if item.category == category.upper()]
+        query = query.where(InAppNotification.category == category.upper())
     if priority:
-        rows = [item for item in rows if item.priority == priority.upper()]
+        query = query.where(InAppNotification.priority == priority.upper())
+    query = query.limit(500)
+    items = list(db.scalars(query))
+    instances, tickets = _build_notification_caches(db, items)
+    rows = [
+        item for item in items
+        if notification_visible_to_user(db, user, item, instances, tickets)
+    ]
     if date_from:
         rows = [item for item in rows if item.created_at.date() >= date_from]
     if date_to:
@@ -3973,7 +4107,14 @@ def list_notifications(
 
 @router.get("/notifications/summary")
 def notification_summary(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    rows = [item for item in db.scalars(select(InAppNotification).where(InAppNotification.recipient_id == user.id)) if notification_visible_to_user(db, user, item)]
+    items = list(db.scalars(
+        select(InAppNotification)
+        .where(InAppNotification.recipient_id == user.id)
+        .order_by(InAppNotification.created_at.desc())
+        .limit(500)
+    ))
+    instances, tickets = _build_notification_caches(db, items)
+    rows = [item for item in items if notification_visible_to_user(db, user, item, instances, tickets)]
     return {
         "total": len(rows),
         "unread": sum(item.read_at is None for item in rows),
@@ -3994,8 +4135,14 @@ def read_notification(notification_id: str, user: User = Depends(current_user), 
 @router.post("/notifications/read-all")
 def read_all_notifications(user: User = Depends(current_user), db: Session = Depends(get_db)):
     updated = 0
-    for notification in db.scalars(select(InAppNotification).where(InAppNotification.recipient_id == user.id, InAppNotification.read_at.is_(None))):
-        if notification_visible_to_user(db, user, notification):
+    items = list(db.scalars(
+        select(InAppNotification)
+        .where(InAppNotification.recipient_id == user.id, InAppNotification.read_at.is_(None))
+        .limit(500)
+    ))
+    instances, tickets = _build_notification_caches(db, items)
+    for notification in items:
+        if notification_visible_to_user(db, user, notification, instances, tickets):
             notification.read_at = datetime.now(UTC)
             updated += 1
     db.commit()
@@ -4056,11 +4203,12 @@ def entity_compliance_report(user: User = Depends(current_user), db: Session = D
 def dashboard_status(user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
     require_permission(db, user, "dashboard.read")
-    cache = build_instance_cache(db, org)
     counts: dict[str, int] = {}
+    is_admin = is_org_admin(db, user, org)
+    today_value = date.today()
     for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)):
-        if can_access_subject(db, user, org, instance.subject_type, instance.subject_id):
-            label = instance_dict(db, instance, cache=cache)["display_status"]
+        if is_admin or can_access_subject(db, user, org, instance.subject_type, instance.subject_id):
+            label = compliance_display_status(instance, today_value)
             counts[label] = counts.get(label, 0) + 1
     return counts
 
@@ -4453,10 +4601,19 @@ def dashboard_frequency(user: User = Depends(current_user), db: Session = Depend
     require_permission(db, user, "dashboard.read")
     cache = build_instance_cache(db, org)
     counts: dict[str, int] = {}
+    is_admin = is_org_admin(db, user, org)
     for instance in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)):
-        if can_access_subject(db, user, org, instance.subject_type, instance.subject_id):
-            frequency = instance_dict(db, instance, cache=cache)["frequency"]
-            counts[frequency] = counts.get(frequency, 0) + 1
+        if is_admin or can_access_subject(db, user, org, instance.subject_type, instance.subject_id):
+            version = cache.get("versions", {}).get(instance.rule_version_id)
+            if version and version.frequency:
+                freq = version.frequency
+            else:
+                try:
+                    snap = json.loads(instance.rule_snapshot_json or "{}")
+                    freq = snap.get("frequency") or "UNCONFIGURED"
+                except Exception:
+                    freq = "UNCONFIGURED"
+            counts[freq] = counts.get(freq, 0) + 1
     return counts
 
 
@@ -4480,9 +4637,16 @@ def dashboard_entities(user: User = Depends(current_user), db: Session = Depends
 
 @router.get("/dashboard/summary")
 def dashboard(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    org = org_for(user); require_permission(db, user, "dashboard.read"); rows = [item for item in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)) if can_access_subject(db, user, org, item.subject_type, item.subject_id)]
+    org = org_for(user)
+    require_permission(db, user, "dashboard.read")
+    is_admin = is_org_admin(db, user, org)
+    if is_admin:
+        rows = list(db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)))
+    else:
+        rows = [item for item in db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org)) if can_access_subject(db, user, org, item.subject_type, item.subject_id)]
     statuses = {key: 0 for key in ["PENDING", "IN_PROGRESS", "SUBMITTED", "UNDER_REVIEW", "CORRECTION_REQUIRED", "REJECTED", "APPROVED"]}
-    for row in rows: statuses[row.status] = statuses.get(row.status, 0) + 1
+    for row in rows:
+        statuses[row.status] = statuses.get(row.status, 0) + 1
     overdue = sum(1 for row in rows if compliance_display_status(row) == "OVERDUE")
     completed_late = sum(1 for row in rows if row.status == "APPROVED" and row.completion_late)
     return {"total": len(rows), "statuses": statuses, "overdue": overdue, "completed_late": completed_late}
@@ -4493,5 +4657,15 @@ def audit_logs(page: int = 1, page_size: int = 100, user: User = Depends(current
     org = org_for(user)
     if not can_read_audit(db, user, org):
         raise HTTPException(403, "Organization administrator or organization-scoped auditor permission is required")
-    rows = [model_dict(item, [field.name for field in item.__table__.columns]) for item in db.scalars(select(AuditLog).where(AuditLog.organization_id == org).order_by(AuditLog.created_at.desc()))]
-    return list_page(rows, page, min(page_size, 100))
+    safe_page = max(1, page)
+    safe_size = min(max(1, page_size), 100)
+    total = db.scalar(select(func.count(AuditLog.id)).where(AuditLog.organization_id == org)) or 0
+    query = (
+        select(AuditLog)
+        .where(AuditLog.organization_id == org)
+        .order_by(AuditLog.created_at.desc())
+        .offset((safe_page - 1) * safe_size)
+        .limit(safe_size)
+    )
+    items = [model_dict(item, [field.name for field in item.__table__.columns]) for item in db.scalars(query)]
+    return {"items": items, "total": total, "page": safe_page, "page_size": safe_size}

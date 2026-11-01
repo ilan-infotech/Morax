@@ -87,9 +87,9 @@ def template_config(catalogue: dict) -> dict:
 
 def ensure_catalogue(db: Session, organization_id: str, user_id: str) -> None:
     """Create tenant-owned operational templates once, never legal claims."""
+    existing_codes = set(db.scalars(select(RegisterTemplate.code).where(RegisterTemplate.organization_id == organization_id)))
     for item in REGISTER_CATALOGUE:
-        template = db.scalar(select(RegisterTemplate).where(RegisterTemplate.organization_id == organization_id, RegisterTemplate.code == item["code"]))
-        if template:
+        if item["code"] in existing_codes:
             continue
         template = RegisterTemplate(
             organization_id=organization_id, code=item["code"], name=item["name"],
@@ -101,6 +101,7 @@ def ensure_catalogue(db: Session, organization_id: str, user_id: str) -> None:
             template_id=template.id, version=1, status="PUBLISHED", config_json=json.dumps(template_config(item)),
             published_by_id=user_id, published_at=datetime.now(UTC),
         ))
+        existing_codes.add(item["code"])
     db.commit()
 
 
@@ -111,20 +112,28 @@ def template_dict(db: Session, template: RegisterTemplate, version: RegisterTemp
     return result
 
 
-def register_dict(db: Session, item: GeneratedRegister, detail: bool = False) -> dict:
+def register_dict(db: Session, item: GeneratedRegister, detail: bool = False, cache: dict | None = None) -> dict:
+    cache = cache or {}
+    versions_cache = cache.get("versions", {})
+    templates_cache = cache.get("templates", {})
     result = model_dict(item, [field.name for field in item.__table__.columns])
     result["entity_name"] = entity_name(db, item.entity_type, item.entity_id)
     result["validation_summary"] = json.loads(item.validation_summary_json or "{}")
-    version = db.get(RegisterTemplateVersion, item.template_version_id)
-    template = db.get(RegisterTemplate, version.template_id) if version else None
+    version = versions_cache.get(item.template_version_id) or db.get(RegisterTemplateVersion, item.template_version_id)
+    template = templates_cache.get(version.template_id) if version else None
+    if not template and version:
+        template = db.get(RegisterTemplate, version.template_id)
     result["template_version"] = version.version if version else None
     result["template_name"] = template.name if template else item.register_name
     result["is_overdue"] = bool(item.due_date and item.due_date < date.today() and item.status != "APPROVED")
     if detail:
         result["content"] = json.loads(item.content_json or "{}")
+        histories = list(db.scalars(select(RegisterWorkflowHistory).where(RegisterWorkflowHistory.register_id == item.id).order_by(RegisterWorkflowHistory.created_at)))
+        actor_ids = {h.actor_id for h in histories if h.actor_id}
+        actors = {u.id: u for u in db.scalars(select(User).where(User.id.in_(actor_ids)))} if actor_ids else {}
         result["history"] = [
-            {**model_dict(history, [field.name for field in history.__table__.columns]), "actor_name": (db.get(User, history.actor_id).name if db.get(User, history.actor_id) else "Unknown")}
-            for history in db.scalars(select(RegisterWorkflowHistory).where(RegisterWorkflowHistory.register_id == item.id).order_by(RegisterWorkflowHistory.created_at))
+            {**model_dict(history, [field.name for field in history.__table__.columns]), "actor_name": (actors.get(history.actor_id).name if actors.get(history.actor_id) else "Unknown")}
+            for history in histories
         ]
         result["compliance_links"] = [model_dict(link, [field.name for field in link.__table__.columns]) for link in db.scalars(select(RegisterComplianceLink).where(RegisterComplianceLink.register_id == item.id))]
     return result
@@ -480,7 +489,13 @@ def list_registers(entity_type: str | None = None, entity_id: str | None = None,
     if q: query = query.where((GeneratedRegister.register_name.ilike(f"%{q}%")) | (GeneratedRegister.register_code.ilike(f"%{q}%")))
     permitted = [item for item in db.scalars(query.order_by(GeneratedRegister.updated_at.desc())) if can_access_subject(db, user, org, item.entity_type, item.entity_id)]
     size = min(max(page_size, 1), 100); start = (max(page, 1)-1)*size
-    return {"items": [register_dict(db, item) for item in permitted[start:start+size]], "total": len(permitted), "page": page, "page_size": size}
+    page_items = permitted[start:start+size]
+    version_ids = {item.template_version_id for item in page_items if item.template_version_id}
+    versions = {v.id: v for v in db.scalars(select(RegisterTemplateVersion).where(RegisterTemplateVersion.id.in_(version_ids)))} if version_ids else {}
+    template_ids = {v.template_id for v in versions.values() if v.template_id}
+    templates = {t.id: t for t in db.scalars(select(RegisterTemplate).where(RegisterTemplate.id.in_(template_ids)))} if template_ids else {}
+    reg_cache = {"versions": versions, "templates": templates}
+    return {"items": [register_dict(db, item, cache=reg_cache) for item in page_items], "total": len(permitted), "page": page, "page_size": size}
 
 
 @router.get("/dashboard")

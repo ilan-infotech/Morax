@@ -112,8 +112,9 @@ def get_license(db: Session, user: User, license_id: str) -> LicenseRecord:
 
 
 def ensure_default_types(db: Session, organization_id: str, user_id: str) -> None:
+    existing = set(db.scalars(select(LicenseType.name).where(LicenseType.organization_id == organization_id)))
     for name, category, scope in DEFAULT_LICENSE_TYPES:
-        if not db.scalar(select(LicenseType.id).where(LicenseType.organization_id == organization_id, LicenseType.name == name)):
+        if name not in existing:
             db.add(LicenseType(organization_id=organization_id, name=name, category=category, applicable_entity_type=scope, created_by_id=user_id))
     db.flush()
 
@@ -129,22 +130,34 @@ def assert_type(db: Session, organization_id: str, entity_type: str, license_typ
 
 def auto_link(db: Session, item: LicenseRecord, actor_id: str) -> int:
     """Link explicitly configured matching instances; never complete them."""
-    mappings = db.scalars(select(LicenseComplianceMapping).where(
+    mappings = list(db.scalars(select(LicenseComplianceMapping).where(
         LicenseComplianceMapping.organization_id == item.organization_id,
         LicenseComplianceMapping.license_type_id == item.license_type_id,
         LicenseComplianceMapping.entity_type == item.entity_type,
         LicenseComplianceMapping.evidence_linking_enabled.is_(True),
-    )).all()
+    )))
+    if not mappings:
+        return 0
+    version_ids = [m.compliance_rule_version_id for m in mappings]
+    instances = list(db.scalars(select(ComplianceInstance).where(
+        ComplianceInstance.organization_id == item.organization_id,
+        ComplianceInstance.rule_version_id.in_(version_ids),
+        ComplianceInstance.subject_type == item.entity_type,
+        ComplianceInstance.subject_id == item.entity_id,
+    ).order_by(ComplianceInstance.due_date.desc())))
+    latest_by_version: dict[str, ComplianceInstance] = {}
+    for inst in instances:
+        if inst.rule_version_id not in latest_by_version:
+            latest_by_version[inst.rule_version_id] = inst
+
+    existing_links = set(db.scalars(select(LicenseComplianceLink.compliance_instance_id).where(LicenseComplianceLink.license_id == item.id)))
     made = 0
     for mapping in mappings:
-        instance = db.scalar(select(ComplianceInstance).where(
-            ComplianceInstance.organization_id == item.organization_id,
-            ComplianceInstance.rule_version_id == mapping.compliance_rule_version_id,
-            ComplianceInstance.subject_type == item.entity_type,
-            ComplianceInstance.subject_id == item.entity_id,
-        ).order_by(ComplianceInstance.due_date.desc()).limit(1))
-        if instance and not db.scalar(select(LicenseComplianceLink.id).where(LicenseComplianceLink.license_id == item.id, LicenseComplianceLink.compliance_instance_id == instance.id)):
-            db.add(LicenseComplianceLink(license_id=item.id, compliance_instance_id=instance.id, linked_by_id=actor_id)); made += 1
+        instance = latest_by_version.get(mapping.compliance_rule_version_id)
+        if instance and instance.id not in existing_links:
+            db.add(LicenseComplianceLink(license_id=item.id, compliance_instance_id=instance.id, linked_by_id=actor_id))
+            existing_links.add(instance.id)
+            made += 1
     return made
 
 

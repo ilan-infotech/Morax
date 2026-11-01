@@ -144,8 +144,14 @@ def instance_dict(db: Session, instance: ComplianceInstance, detail: bool = Fals
         "display_status": display_status,
     })
     if detail:
-        assignments = db.query(ComplianceAssignment).filter_by(instance_id=instance.id, active=True).all()
-        evidence = db.query(ComplianceEvidence).filter_by(instance_id=instance.id).all()
+        if "assignments" in cache:
+            assignments = cache["assignments"].get(instance.id, [])
+        else:
+            assignments = db.query(ComplianceAssignment).filter_by(instance_id=instance.id, active=True).all()
+        if "evidence" in cache:
+            evidence = cache["evidence"].get(instance.id, [])
+        else:
+            evidence = db.query(ComplianceEvidence).filter_by(instance_id=instance.id).all()
         result["assignments"] = [model_dict(item, [field.name for field in item.__table__.columns]) for item in assignments]
         result["evidence"] = [model_dict(item, [field.name for field in item.__table__.columns]) for item in evidence]
         result["rule_snapshot"] = snapshot

@@ -209,6 +209,15 @@ def generate_for_subject(db: Session, organization_id: str, subject_type: str, s
     compliance_start = getattr(subject, "compliance_start_date", None) or getattr(subject, "effective_date", None)
     setattr(subject, "__subject_type__", subject_type)
     created: list[ComplianceInstance] = []
+    existing_keys = set(
+        db.execute(
+            select(ComplianceInstance.rule_version_id, ComplianceInstance.period_key).where(
+                ComplianceInstance.subject_type == subject_type,
+                ComplianceInstance.subject_id == subject_id,
+                ComplianceInstance.occurrence_key == "STANDARD",
+            )
+        ).all()
+    )
     for version, rule, criteria in active_versions(db, organization_id, as_of):
         # Checklist imports without a configured scheduling rule are retained
         # in the Master but must not produce an invented legal due date.
@@ -231,14 +240,7 @@ def generate_for_subject(db: Session, organization_id: str, subject_type: str, s
         if not applicable:
             continue
         key = period_for(version.frequency, period_date)
-        existing = db.scalar(select(ComplianceInstance).where(
-            ComplianceInstance.rule_version_id == version.id,
-            ComplianceInstance.subject_type == subject_type,
-            ComplianceInstance.subject_id == subject_id,
-            ComplianceInstance.period_key == key,
-            ComplianceInstance.occurrence_key == "STANDARD",
-        ))
-        if existing:
+        if (version.id, key) in existing_keys:
             continue
         instance = ComplianceInstance(
             organization_id=organization_id,
@@ -276,6 +278,7 @@ def generate_for_subject(db: Session, organization_id: str, subject_type: str, s
         db.flush()
         db.add(ComplianceWorkflowHistory(instance_id=instance.id, actor_id=actor_id, action="GENERATED", to_status="PENDING"))
         audit(db, organization_id=organization_id, actor_id=actor_id, action="GENERATE_COMPLIANCE", module="COMPLIANCE", entity_type="ComplianceInstance", entity_id=instance.id, new={"rule": rule.compliance_id, "period": key})
+        existing_keys.add((version.id, key))
         created.append(instance)
     return created
 
