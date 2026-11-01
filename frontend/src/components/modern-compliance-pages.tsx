@@ -178,7 +178,7 @@ export function ModernDashboard() {
 
   useEffect(() => {
     load();
-  }, []);
+  }, [organizationId]);
 
   const completed = summary?.statuses.APPROVED ?? 0;
   const pending =

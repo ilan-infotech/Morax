@@ -874,7 +874,7 @@ function Layout({
       .organization()
       .then((row) => setOrganizationName(String(row.name ?? "Organization context")))
       .catch(() => setOrganizationName(organizationId ? "Organization context" : ""));
-  }, [organizationId, user.organization_id]);
+  }, [organizationId]);
   return (
     <main className="content">
       <header className="app-topbar">
@@ -2183,7 +2183,7 @@ function Dashboard() {
       .catch((err) => setError(message(err)));
   useEffect(() => {
     load();
-  }, []);
+  }, [organizationId]);
   const metrics = data
     ? [
       ["Total", data.total],
@@ -4436,7 +4436,7 @@ function Reports() {
   }, []);
   useEffect(() => {
     void load();
-  }, [load]);
+  }, []);
   const statusEntries = Object.entries(status);
   const frequencyEntries = Object.entries(frequency);
   const totalObligations = statusEntries.reduce((total, [, count]) => total + count, 0);
