@@ -124,12 +124,14 @@ function dueSoon(instance: Instance) {
 export function ModernDashboard() {
   const { organizationId } = useParams();
   const base = organizationId ? `/app/organizations/${organizationId}` : "/app";
-  const [summary, setSummary] = useState<{
-    total: number;
-    statuses: Record<string, number>;
-    overdue: number;
-    completed_late: number;
-  }>();
+
+  const { data: summary, refetch: refetchSummary } = useQuery({
+    queryKey: ['summary', organizationId],
+    queryFn: () => morax.dashboard(),
+    enabled: !!organizationId,
+    staleTime: 60000,
+  });
+
   const [statusData, setStatusData] = useState<Record<string, number>>({});
   const [frequencyData, setFrequencyData] = useState<Record<string, number>>({});
   const [entityData, setEntityData] = useState<
@@ -143,9 +145,8 @@ export function ModernDashboard() {
     setLoading(true);
     setError("");
     try {
-      const [dashboard, statuses, frequencies, entities, upcomingInstances] =
+      const [statuses, frequencies, entities, upcomingInstances] =
         await Promise.all([
-          morax.dashboard(),
           morax.statusChart(),
           morax.frequencyChart(),
           morax.entityChart(),
@@ -155,7 +156,6 @@ export function ModernDashboard() {
             page_size: "20",
           }),
         ]);
-      setSummary(dashboard);
       setStatusData(statuses);
       setFrequencyData(frequencies);
       setEntityData(entities);
@@ -180,6 +180,10 @@ export function ModernDashboard() {
     load();
   }, [organizationId]);
 
+  const handleRefresh = async () => {
+    await Promise.all([refetchSummary(), load()]);
+  };
+
   const completed = summary?.statuses.APPROVED ?? 0;
   const pending =
     (summary?.statuses.PENDING ?? 0) +
@@ -201,7 +205,7 @@ export function ModernDashboard() {
         title="Compliance dashboard"
         description="A live view of organization obligations, due dates, and attention items."
         actions={
-          <button className="button-secondary" onClick={load} disabled={loading}>
+          <button className="button-secondary" onClick={handleRefresh} disabled={loading}>
             <RefreshCw size={16} className={loading ? "spin" : ""} />
             Refresh
           </button>

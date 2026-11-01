@@ -559,9 +559,17 @@ def list_page(items: list, page: int, page_size: int) -> dict:
 
 def build_instance_cache(db: Session, org: str) -> dict:
     master_org = platform_master_organization_id(db)
+    master_rules = {r.id: r for r in db.scalars(select(ComplianceRule).where(ComplianceRule.organization_id == master_org))}
+    org_rules = {r.id: r for r in db.scalars(select(ComplianceRule).where(ComplianceRule.organization_id == org))}
+    rules = {**master_rules, **org_rules}
+
+    master_versions = {v.id: v for v in db.scalars(select(ComplianceRuleVersion).join(ComplianceRule).where(ComplianceRule.organization_id == master_org))}
+    org_versions = {v.id: v for v in db.scalars(select(ComplianceRuleVersion).join(ComplianceRule).where(ComplianceRule.organization_id == org))}
+    versions = {**master_versions, **org_versions}
+
     return {
-        "rules": {r.id: r for r in db.scalars(select(ComplianceRule).where(ComplianceRule.organization_id.in_([master_org, org])))},
-        "versions": {v.id: v for v in db.scalars(select(ComplianceRuleVersion).join(ComplianceRule).where(ComplianceRule.organization_id.in_([master_org, org])))},
+        "rules": rules,
+        "versions": versions,
         "UNIT": {u.id: u for u in db.scalars(select(Unit).where(Unit.organization_id == org))},
         "CONTRACTOR": {c.id: c for c in db.scalars(select(Contractor).where(Contractor.organization_id == org))},
         "CONTRACTOR_SITE": {s.id: s for s in db.scalars(select(ContractorSite).where(ContractorSite.organization_id == org))},

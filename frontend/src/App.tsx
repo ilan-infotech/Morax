@@ -17,7 +17,7 @@ import Shuffle from "./components/Shuffle/Shuffle";
 import type { FormEvent, ReactNode } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Toaster } from "sonner";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BrowserRouter,
   Link,
@@ -2169,21 +2169,12 @@ function OrganizationLanding({
 function Dashboard() {
   const { organizationId } = useParams();
   const base = organizationId ? `/app/organizations/${organizationId}` : "/app";
-  const [data, setData] = useState<{
-    total: number;
-    statuses: Record<string, number>;
-    overdue: number;
-    completed_late: number;
-  }>();
-  const [error, setError] = useState("");
-  const load = () =>
-    morax
-      .dashboard()
-      .then(setData)
-      .catch((err) => setError(message(err)));
-  useEffect(() => {
-    load();
-  }, [organizationId]);
+  const { data, error, refetch } = useQuery({
+    queryKey: ['summary', organizationId],
+    queryFn: () => morax.dashboard(),
+    enabled: !!organizationId,
+    staleTime: 60000,
+  });
   const metrics = data
     ? [
       ["Total", data.total],
@@ -2197,11 +2188,11 @@ function Dashboard() {
   return (
     <>
       <Header title="Compliance dashboard">
-        <button className="secondary" onClick={load}>
+        <button className="secondary" onClick={() => void refetch()}>
           Refresh
         </button>
       </Header>
-      <ErrorBox text={error} />
+      <ErrorBox text={error ? message(error) : ""} />
       <div className="metric-grid">
         {metrics.map(([label, value]) => (
           <div className="metric" key={String(label)}>
@@ -4335,17 +4326,16 @@ function Documents({ user }: { user: User }) {
 }
 
 function LegacyNotifications() {
-  const [rows, setRows] = useState<Row[]>([]);
-  const [error, setError] = useState("");
+  const { organizationId } = useParams();
   const [unread, setUnread] = useState(false);
-  const load = () =>
-    morax
-      .notifications({ unread_only: unread ? "true" : "" })
-      .then((result) => setRows(result.items))
-      .catch((err) => setError(message(err)));
-  useEffect(() => {
-    load();
-  }, [unread]);
+  const [actionError, setActionError] = useState("");
+  const { data, error, refetch } = useQuery({
+    queryKey: ['notifications', organizationId, unread ? "unread" : "all"],
+    queryFn: () => morax.notifications({ unread_only: unread ? "true" : "" }),
+    enabled: !!organizationId,
+    staleTime: 60000,
+  });
+  const rows = (data?.items ?? []) as Row[];
   return (
     <>
       <Header title="Notifications">
@@ -4358,7 +4348,7 @@ function LegacyNotifications() {
           Unread only
         </label>
       </Header>
-      <ErrorBox text={error} />
+      <ErrorBox text={actionError || (error ? message(error) : "")} />
       {rows.length ? (
         rows.map((row) => (
           <Panel key={String(row.id)}>
@@ -4382,9 +4372,9 @@ function LegacyNotifications() {
                     onClick={async () => {
                       try {
                         await morax.readNotification(String(row.id));
-                        load();
+                        await refetch();
                       } catch (err) {
-                        setError(message(err));
+                        setActionError(message(err));
                       }
                     }}
                   >
