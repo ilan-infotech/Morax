@@ -21,7 +21,10 @@ def upgrade() -> None:
     if "assigned_to_id" not in columns:
         op.add_column(
             "support_tickets",
-            sa.Column("assigned_to_id", sa.String(36), sa.ForeignKey("users.id"), nullable=True),
+            # SQLite cannot add a foreign-key constraint with ALTER TABLE.
+            # The application model owns the relationship; a portable
+            # migration must add this nullable column without an inline FK.
+            sa.Column("assigned_to_id", sa.String(36), nullable=True),
         )
     if "ix_support_tickets_assigned_to_id" not in indexes:
         op.create_index("ix_support_tickets_assigned_to_id", "support_tickets", ["assigned_to_id"])

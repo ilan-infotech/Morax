@@ -518,3 +518,127 @@ class GenerationRequest(BaseModel):
     subject_type: str | None = None
     subject_id: str | None = None
     as_of_date: date | None = None
+
+
+class RegisterTemplateInput(BaseModel):
+    code: str = Field(min_length=2, max_length=30)
+    name: str = Field(min_length=3, max_length=250)
+    category: str = Field(default="STATUTORY_REGISTER", max_length=100)
+    description: str | None = Field(default=None, max_length=4000)
+    entity_scope: str = Field(default="ALL", pattern="^(ALL|UNIT|CONTRACTOR|CONTRACTOR_SITE)$")
+    frequency: str = Field(default="MONTHLY", max_length=30)
+    applicable_legislation: str | None = Field(default=None, max_length=300)
+    applicable_rule: str | None = Field(default=None, max_length=300)
+    form_number: str | None = Field(default=None, max_length=100)
+    jurisdiction: str | None = Field(default=None, max_length=100)
+    effective_from: date | None = None
+    effective_to: date | None = None
+    config: dict = Field(default_factory=dict)
+
+
+class RegisterMappingInput(BaseModel):
+    dataset_type: str = Field(pattern="^(EMPLOYEE|ATTENDANCE|PAYROLL)$")
+    name: str = Field(min_length=2, max_length=150)
+    mapping: dict[str, str] = Field(default_factory=dict)
+
+
+class RegisterGenerationInput(BaseModel):
+    entity_type: str = Field(pattern="^(UNIT|CONTRACTOR|CONTRACTOR_SITE)$")
+    entity_id: str
+    period_key: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    template_version_ids: list[str] = Field(min_length=1, max_length=20)
+    due_date: date | None = None
+
+
+class RegisterDecisionInput(BaseModel):
+    row_version: int
+    remarks: str | None = Field(default=None, max_length=4000)
+
+
+class RegisterComplianceLinkInput(BaseModel):
+    compliance_instance_id: str
+
+
+class LicenseTypeInput(BaseModel):
+    name: str = Field(min_length=2, max_length=200)
+    category: str = Field(default="STATUTORY_LICENSE", max_length=100)
+    description: str | None = Field(default=None, max_length=4000)
+    applicable_entity_type: str = Field(default="ALL", pattern="^(ALL|UNIT|CONTRACTOR|CONTRACTOR_SITE)$")
+    applicable_state: str | None = Field(default=None, max_length=100)
+    issuing_department: str | None = Field(default=None, max_length=200)
+    issuing_authority: str | None = Field(default=None, max_length=200)
+    renewal_required: bool = True
+    default_validity_days: int | None = Field(default=None, ge=1, le=36500)
+    default_reminder_days: int = Field(default=30, ge=0, le=365)
+    applicable_legislation: str | None = Field(default=None, max_length=300)
+    applicable_rule: str | None = Field(default=None, max_length=300)
+    active: bool = True
+
+
+class LicenseInput(BaseModel):
+    entity_type: str = Field(pattern="^(UNIT|CONTRACTOR|CONTRACTOR_SITE)$")
+    entity_id: str = Field(min_length=1, max_length=36)
+    license_type_id: str = Field(min_length=1, max_length=36)
+    license_name: str = Field(min_length=2, max_length=250)
+    license_number: str | None = Field(default=None, max_length=150)
+    issuing_department: str | None = Field(default=None, max_length=200)
+    issuing_authority: str | None = Field(default=None, max_length=200)
+    applicable_state: str | None = Field(default=None, max_length=100)
+    registration_number: str | None = Field(default=None, max_length=150)
+    application_number: str | None = Field(default=None, max_length=150)
+    issue_date: date | None = None
+    valid_from: date
+    valid_until: date | None = None
+    never_expires: bool = False
+    renewal_required: bool = True
+    renewal_frequency: str | None = Field(default=None, max_length=50)
+    reminder_days: int = Field(default=30, ge=0, le=365)
+    remarks: str | None = Field(default=None, max_length=4000)
+
+    @model_validator(mode="after")
+    def license_dates(self) -> "LicenseInput":
+        if self.never_expires and self.valid_until:
+            raise ValueError("Valid Until must be empty when Does Not Expire is selected")
+        if not self.never_expires and not self.valid_until:
+            raise ValueError("Valid Until is required unless Does Not Expire is selected")
+        if self.valid_until and self.valid_until < self.valid_from:
+            raise ValueError("Valid Until cannot be earlier than Valid From")
+        if self.issue_date and self.issue_date > self.valid_from:
+            raise ValueError("Issue Date cannot be later than Valid From")
+        return self
+
+
+class LicenseArchiveInput(BaseModel):
+    reason: str = Field(min_length=3, max_length=1000)
+    row_version: int
+
+
+class LicenseRenewalInput(BaseModel):
+    application_number: str | None = Field(default=None, max_length=150)
+    submitted_on: date | None = None
+    new_license_number: str | None = Field(default=None, max_length=150)
+    new_valid_from: date | None = None
+    new_valid_until: date | None = None
+    never_expires: bool = False
+    remarks: str | None = Field(default=None, max_length=4000)
+    row_version: int | None = None
+
+    @model_validator(mode="after")
+    def renewal_dates(self) -> "LicenseRenewalInput":
+        if self.new_valid_until and not self.new_valid_from:
+            raise ValueError("New Valid From is required when New Valid Until is supplied")
+        if self.never_expires and self.new_valid_until:
+            raise ValueError("New Valid Until must be empty when Does Not Expire is selected")
+        if self.new_valid_from and self.new_valid_until and self.new_valid_until < self.new_valid_from:
+            raise ValueError("New Valid Until cannot be earlier than New Valid From")
+        return self
+
+
+class LicenseComplianceMappingInput(BaseModel):
+    license_type_id: str
+    compliance_rule_version_id: str
+    entity_type: str = Field(pattern="^(UNIT|CONTRACTOR|CONTRACTOR_SITE)$")
+    license_required: bool = True
+    validity_check_required: bool = True
+    renewal_tracking_required: bool = True
+    evidence_linking_enabled: bool = True

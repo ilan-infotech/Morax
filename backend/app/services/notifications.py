@@ -13,7 +13,7 @@ from datetime import UTC, date, datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import ComplianceAssignment, ComplianceInstance, ContractorSite, InAppNotification, User, UserRoleScope
+from app.models import ComplianceAssignment, ComplianceInstance, ContractorSite, GeneratedRegister, InAppNotification, LicenseRecord, User, UserRoleScope
 
 
 def emit_notification(
@@ -207,4 +207,80 @@ def schedule_compliance_reminders(db: Session, run_date: date | None = None) -> 
                 created += notify_compliance_event(db, instance, recipient_ids=overdue_recipients, notification_type="COMPLIANCE_OVERDUE", event_type="OVERDUE", title="Compliance is overdue", body=reference, priority="CRITICAL", event_suffix=run_date.isoformat())
         elif instance.status in {"SUBMITTED", "UNDER_REVIEW"}:
             created += notify_compliance_event(db, instance, recipient_ids=checker_ids, notification_type="PENDING_REVIEW", event_type="REVIEW_REMINDER", title="Compliance is awaiting your review", body=reference, priority="HIGH" if days_until_due <= 0 else "NORMAL", event_suffix=run_date.isoformat())
+    return created
+
+
+def schedule_register_reminders(db: Session, run_date: date | None = None) -> int:
+    """Create idempotent due/overdue alerts for generated registers.
+
+    Register workflow status deliberately remains independent of due-date
+    state.  These notifications therefore do not mutate the register record
+    and cannot turn a pending approval into a different workflow status.
+    """
+    run_date = run_date or datetime.now(UTC).date()
+    created = 0
+    role_map = {
+        "UNIT": ("UNIT_MAKER", "UNIT_CHECKER"),
+        "CONTRACTOR": ("CONTRACTOR_MAKER", "CONTRACTOR_CHECKER"),
+    }
+    for register in db.scalars(select(GeneratedRegister).where(GeneratedRegister.status.not_in(["APPROVED", "SUPERSEDED"]))):
+        if not register.due_date:
+            continue
+        scope_type, scope_id = register.entity_type, register.entity_id
+        if scope_type == "CONTRACTOR_SITE":
+            site = db.get(ContractorSite, scope_id)
+            if not site:
+                continue
+            scope_type, scope_id = "CONTRACTOR", site.contractor_id
+        roles = role_map.get(scope_type)
+        if not roles:
+            continue
+        maker_ids = set(db.scalars(select(UserRoleScope.user_id).join(User, User.id == UserRoleScope.user_id).where(UserRoleScope.scope_type == scope_type, UserRoleScope.scope_id == scope_id, UserRoleScope.role == roles[0], User.active.is_(True))))
+        checker_ids = set(db.scalars(select(UserRoleScope.user_id).join(User, User.id == UserRoleScope.user_id).where(UserRoleScope.scope_type == scope_type, UserRoleScope.scope_id == scope_id, UserRoleScope.role == roles[1], User.active.is_(True))))
+        days_until_due = (register.due_date - run_date).days
+        if register.status in {"GENERATED", "REJECTED"} and days_until_due in {7, 3, 1, 0}:
+            stage = {7: "DUE_IN_7_DAYS", 3: "DUE_IN_3_DAYS", 1: "DUE_TOMORROW", 0: "DUE_TODAY"}[days_until_due]
+            for recipient_id in maker_ids:
+                created += int(emit_notification(db, organization_id=register.organization_id, recipient_id=recipient_id, notification_type=f"REGISTER_{stage}", category="REGISTER", event_type=stage, priority="HIGH" if days_until_due <= 1 else "NORMAL", title="Register generation is due", body=f"{register.register_name} ({register.period_key})", entity_type=register.entity_type, entity_id=register.entity_id, reference_type="GeneratedRegister", reference_id=register.id, event_key=f"register:{register.id}:v{register.version}:{stage}:{run_date}:{recipient_id}") is not None)
+        elif days_until_due < 0:
+            recipients = maker_ids | checker_ids | organization_admin_recipients(db, register.organization_id)
+            for recipient_id in recipients:
+                created += int(emit_notification(db, organization_id=register.organization_id, recipient_id=recipient_id, notification_type="REGISTER_OVERDUE", category="REGISTER", event_type="OVERDUE", priority="CRITICAL", title="Register is overdue", body=f"{register.register_name} ({register.period_key})", entity_type=register.entity_type, entity_id=register.entity_id, reference_type="GeneratedRegister", reference_id=register.id, event_key=f"register:{register.id}:v{register.version}:OVERDUE:{run_date}:{recipient_id}") is not None)
+        elif register.status == "SUBMITTED":
+            for recipient_id in checker_ids:
+                created += int(emit_notification(db, organization_id=register.organization_id, recipient_id=recipient_id, notification_type="REGISTER_PENDING_REVIEW", category="REGISTER", event_type="REVIEW_REMINDER", priority="HIGH", title="Register is awaiting review", body=f"{register.register_name} ({register.period_key})", entity_type=register.entity_type, entity_id=register.entity_id, reference_type="GeneratedRegister", reference_id=register.id, event_key=f"register:{register.id}:v{register.version}:REVIEW:{run_date}:{recipient_id}") is not None)
+    return created
+
+
+def schedule_license_reminders(db: Session, run_date: date | None = None) -> int:
+    """Create idempotent expiry reminders for expiring, non-archived licenses.
+
+    A completed renewal changes the current validity dates, so future reminder
+    stages use the new expiry and historical events remain audit evidence.
+    """
+    run_date = run_date or datetime.now(UTC).date()
+    created = 0
+    stages = {90: "DUE_IN_90_DAYS", 60: "DUE_IN_60_DAYS", 30: "DUE_IN_30_DAYS", 15: "DUE_IN_15_DAYS", 7: "DUE_IN_7_DAYS", 1: "DUE_TOMORROW", 0: "DUE_TODAY"}
+    for license_item in db.scalars(select(LicenseRecord).where(LicenseRecord.archived.is_(False), LicenseRecord.never_expires.is_(False), LicenseRecord.valid_until.is_not(None))):
+        if not license_item.valid_until:
+            continue
+        days = (license_item.valid_until - run_date).days
+        if days not in stages and days >= 0:
+            continue
+        recipients = organization_admin_recipients(db, license_item.organization_id)
+        role = "UNIT_MAKER" if license_item.entity_type == "UNIT" else "CONTRACTOR_MAKER" if license_item.entity_type == "CONTRACTOR" else None
+        if role:
+            recipients.update(db.scalars(select(UserRoleScope.user_id).join(User, User.id == UserRoleScope.user_id).where(UserRoleScope.scope_type == license_item.entity_type, UserRoleScope.scope_id == license_item.entity_id, UserRoleScope.role == role, User.active.is_(True))))
+        stage = stages.get(days, "OVERDUE")
+        for recipient_id in recipients:
+            created += int(emit_notification(
+                db, organization_id=license_item.organization_id, recipient_id=recipient_id,
+                notification_type=f"LICENSE_{stage}", category="LICENSE", event_type=stage,
+                priority="CRITICAL" if days < 0 else "HIGH" if days <= 7 else "NORMAL",
+                title="License is overdue" if days < 0 else "License expiry reminder",
+                body=f"{license_item.license_name} expires {license_item.valid_until.isoformat()}",
+                entity_type=license_item.entity_type, entity_id=license_item.entity_id,
+                reference_type="LicenseRecord", reference_id=license_item.id,
+                event_key=f"license:{license_item.id}:v{license_item.row_version}:{stage}:{run_date}:{recipient_id}",
+            ) is not None)
     return created

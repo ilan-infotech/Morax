@@ -1,6 +1,5 @@
-import { useCallback, useDeferredValue, useEffect, useState, useRef } from "react";
+import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useState, useRef } from "react";
 import { createPortal } from "react-dom";
-import ElasticMesh from "./components/ElasticMesh/ElasticMesh";
 import {
   PieChart,
   Pie,
@@ -57,27 +56,41 @@ import {
   Eye,
   EyeOff,
   MessageSquarePlus,
+  FileSpreadsheet,
   KeyRound,
   UserRound,
+  ListChecks,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { setToken } from "./api/client";
 import { morax } from "./api/morax";
 import type { Evidence, Instance, Master, RoleScope, User } from "./api/morax";
-import { CheckerDashboard, ModernWorklist, MyReviewHistory, MySubmissions, PendingReviews } from "./components/modern-compliance-pages";
-import { MainDashboard } from "./components/filtered-dashboard";
-import { ModernEntities } from "./components/entity-manager";
-import { UserAccessManager } from "./components/user-access-manager";
-import { ComplianceMasterManager } from "./components/compliance-master-manager";
 import { DashboardMetricCard, DashboardSection, EmptyState, InlineError, LoadingSkeleton, WorkspacePageHeader } from "./components/workspace-ui";
-import { DocumentLibrary } from "./components/document-library";
 import { PasswordInput } from "./components/password-input";
-import { SupportTicketManager } from "./components/support-ticket-manager";
 import { NotificationBell, NotificationsPage } from "./components/notification-center";
 import { ChangePasswordPage, ProfileManager } from "./components/profile-manager";
 import "./App.css";
 
+// Operational workspaces are only needed after sign-in and on their matching
+// route. Loading them on demand keeps the initial Netlify download small.
+const MainDashboard = lazy(() => import("./components/filtered-dashboard").then(({ MainDashboard }) => ({ default: MainDashboard })));
+const ModernWorklist = lazy(() => import("./components/modern-compliance-pages").then(({ ModernWorklist }) => ({ default: ModernWorklist })));
+const CheckerDashboard = lazy(() => import("./components/modern-compliance-pages").then(({ CheckerDashboard }) => ({ default: CheckerDashboard })));
+const MySubmissions = lazy(() => import("./components/modern-compliance-pages").then(({ MySubmissions }) => ({ default: MySubmissions })));
+const PendingReviews = lazy(() => import("./components/modern-compliance-pages").then(({ PendingReviews }) => ({ default: PendingReviews })));
+const MyReviewHistory = lazy(() => import("./components/modern-compliance-pages").then(({ MyReviewHistory }) => ({ default: MyReviewHistory })));
+const ModernEntities = lazy(() => import("./components/entity-manager").then(({ ModernEntities }) => ({ default: ModernEntities })));
+const UserAccessManager = lazy(() => import("./components/user-access-manager").then(({ UserAccessManager }) => ({ default: UserAccessManager })));
+const ComplianceMasterManager = lazy(() => import("./components/compliance-master-manager").then(({ ComplianceMasterManager }) => ({ default: ComplianceMasterManager })));
+const DocumentLibrary = lazy(() => import("./components/document-library").then(({ DocumentLibrary }) => ({ default: DocumentLibrary })));
+const SupportTicketManager = lazy(() => import("./components/support-ticket-manager").then(({ SupportTicketManager }) => ({ default: SupportTicketManager })));
+const RegistersManager = lazy(() => import("./components/registers-manager").then(({ RegistersManager }) => ({ default: RegistersManager })));
+const LicenseManager = lazy(() => import("./components/license-manager").then(({ LicenseManager }) => ({ default: LicenseManager })));
+
 type Row = Record<string, unknown>;
+// Public assets need Vite's configured base path when the application is
+// deployed below /morax rather than at the web-server root.
+const moraxLogoUrl = `${import.meta.env.BASE_URL}Mora_Final_Logo-01_3.png`;
 const today = () => new Date().toISOString().slice(0, 10);
 const message = (error: unknown, fallback = "Request failed") =>
   error instanceof Error ? error.message : fallback;
@@ -334,6 +347,9 @@ function Login({ done }: { done: (user: User) => void }) {
         />
       </div>
       <div className="login-intro">
+        <div className="login-brand-logo" aria-label="MORAX">
+          <img src={moraxLogoUrl} alt="MORAX" />
+        </div>
         <div className="eyebrow" style={{ margin: 0, padding: 0 }}>
           <GradientText colors={['#FFFFFF', '#D9EAD3', '#B6D7A8']}>
             MORAX · LABOUR COMPLIANCE
@@ -397,6 +413,8 @@ type WorkspaceFeature =
   | "reports"
   | "audit"
   | "settings"
+  | "registers"
+  | "licenses"
   | "platform.organizations";
 
 type WorkspaceLink = {
@@ -407,6 +425,15 @@ type WorkspaceLink = {
 
 const links: WorkspaceLink[] = [
   { label: "Dashboard", path: "dashboard", feature: "dashboard" },
+  { label: "Registers Dashboard", path: "registers/dashboard", feature: "registers" },
+  { label: "Employee Master", path: "registers/employees", feature: "registers" },
+  { label: "Attendance", path: "registers/attendance", feature: "registers" },
+  { label: "Salary & Payroll", path: "registers/payroll", feature: "registers" },
+  { label: "Generate Registers", path: "registers/generate", feature: "registers" },
+  { label: "Register Library", path: "registers/library", feature: "registers" },
+  { label: "Register Reviews", path: "registers/reviews", feature: "registers" },
+  { label: "Register Templates", path: "registers/templates", feature: "registers" },
+  { label: "Licenses", path: "licenses", feature: "licenses" },
   {
     label: "Company Compliance",
     path: "compliances/company",
@@ -452,6 +479,15 @@ const links: WorkspaceLink[] = [
 
 const navIcons: Record<string, LucideIcon> = {
   Dashboard: LayoutDashboard,
+  "Registers Dashboard": FileSpreadsheet,
+  "Employee Master": UsersIcon,
+  Attendance: ListChecks,
+  "Salary & Payroll": FileSpreadsheet,
+  "Generate Registers": FileSpreadsheet,
+  "Register Library": FileArchive,
+  "Register Reviews": ClipboardCheck,
+  "Register Templates": SettingsIcon,
+  Licenses: FileText,
   "Company Compliance": CalendarClock,
   "My Submissions": ClipboardList,
   "Pending Reviews": ClipboardCheck,
@@ -471,6 +507,14 @@ const navIcons: Record<string, LucideIcon> = {
   "Organization settings": SettingsIcon,
   Organizations: Building2,
 };
+
+const canManageRegisters = (user: User) =>
+  user.platform_role === "MORAX_ADMIN" ||
+  user.roles.some((role) => ["ORGANIZATION_ADMIN", "UNIT_ADMIN", "CONTRACTOR_ADMIN"].includes(role));
+const canUploadRegisters = (user: User) =>
+  canManageRegisters(user) || user.roles.some((role) => ["UNIT_MAKER", "CONTRACTOR_MAKER"].includes(role));
+const canReviewRegisters = (user: User) =>
+  canManageRegisters(user) || user.roles.some((role) => ["UNIT_CHECKER", "CONTRACTOR_CHECKER"].includes(role));
 
 function WorkspaceNavLink({ label, to, collapsed }: { label: string; to: string; collapsed?: boolean }) {
   const Icon = navIcons[label] ?? FileText;
@@ -519,6 +563,7 @@ function fallbackFeatures(user: User): WorkspaceFeature[] {
     "documents",
     "notifications",
     "settings",
+    "licenses",
   ];
   if (
     user.roles.some((role) => ["UNIT_ADMIN"].includes(role))
@@ -556,7 +601,7 @@ function workspaceLinks(user: User) {
     return links.filter((link) => ["dashboard", "compliance_master", "notifications", "audit"].includes(link.feature));
   }
   if (isContractorOnlyUser(user)) {
-    return links.filter((link) => ["dashboard", "compliances/contractor", "notifications", "support-tickets"].includes(link.path) || (link.path === "submissions" && isMaker) || (["pending-reviews", "review-history"].includes(link.path) && isChecker));
+    return links.filter((link) => ["dashboard", "compliances/contractor", "notifications", "support-tickets", "licenses"].includes(link.path) || (link.path === "submissions" && isMaker) || (["pending-reviews", "review-history"].includes(link.path) && isChecker));
   }
   return links.filter((link) => features.has(link.feature) && (link.path !== "submissions" || isMaker) && (!["pending-reviews", "review-history"].includes(link.path) || isChecker));
 }
@@ -847,7 +892,8 @@ function Layout({
       </header>
       <ImpersonationBanner user={user} endImpersonation={endImpersonation} onChangeContractor={onChangeContractor} />
       <ContractorWorkspaceBanner user={user} onChangeContractor={onChangeContractor} />
-      <Routes>
+      <Suspense fallback={<LoadingSkeleton rows={6} />}>
+        <Routes>
         <Route
           path="dashboard"
           element={
@@ -857,6 +903,8 @@ function Layout({
           }
         />
         <Route path="compliances/:kind" element={<ComplianceRoute user={user} />} />
+        <Route path="registers/:view?" element={<FeatureGate user={user} feature="registers"><RegistersManager user={user} /></FeatureGate>} />
+        <Route path="licenses/:view?" element={<FeatureGate user={user} feature="licenses"><LicenseManager user={user} /></FeatureGate>} />
         <Route path="submissions" element={<FeatureGate user={user} feature="compliances.recurring"><MySubmissions /></FeatureGate>} />
         <Route path="pending-reviews" element={<FeatureGate user={user} feature="compliances.recurring"><PendingReviews /></FeatureGate>} />
         <Route path="review-history" element={<FeatureGate user={user} feature="compliances.recurring"><MyReviewHistory /></FeatureGate>} />
@@ -927,8 +975,9 @@ function Layout({
             </FeatureGate>
           }
         />
-        <Route path="*" element={<Navigate to={defaultWorkspacePath(user)} replace />} />
-      </Routes>
+          <Route path="*" element={<Navigate to={defaultWorkspacePath(user)} replace />} />
+        </Routes>
+      </Suspense>
     </main>
   );
 }
@@ -1734,7 +1783,7 @@ function OrganizationLanding({
           </div>
           <form className="form-grid organization-form" onSubmit={save}>
             <label>
-              Organization name
+              <span className="organization-field-label">Organization name <span className="required-indicator" aria-hidden="true">*</span></span>
               <input
                 value={form.organization_name}
                 onChange={(e) =>
@@ -1757,7 +1806,7 @@ function OrganizationLanding({
             {!editing && (
               <>
                 <label>
-                  Organization Admin name
+                  <span className="organization-field-label">Organization Admin name <span className="required-indicator" aria-hidden="true">*</span></span>
                   <input
                     value={form.organization_admin_name}
                     onChange={(e) =>
@@ -1767,7 +1816,7 @@ function OrganizationLanding({
                   />
                 </label>
                 <label>
-                  Organization Admin email
+                  <span className="organization-field-label">Organization Admin email <span className="required-indicator" aria-hidden="true">*</span></span>
                   <input
                     type="email"
                     value={form.organization_admin_email}
@@ -1778,7 +1827,7 @@ function OrganizationLanding({
                   />
                 </label>
                 <label>
-                  Organization Admin password
+                  <span className="organization-field-label">Organization Admin password <span className="required-indicator" aria-hidden="true">*</span></span>
                   <PasswordInput
                     value={form.organization_admin_password}
                     onChange={(e) =>
@@ -1790,7 +1839,7 @@ function OrganizationLanding({
                   />
                 </label>
                 <label>
-                  Confirm Organization Admin password
+                  <span className="organization-field-label">Confirm Organization Admin password <span className="required-indicator" aria-hidden="true">*</span></span>
                   <PasswordInput
                     value={form.organization_admin_password_confirmation}
                     onChange={(e) =>
@@ -1843,7 +1892,7 @@ function OrganizationLanding({
               />
             </label>
             <label>
-              State
+              <span className="organization-field-label">State <span className="required-indicator" aria-hidden="true">*</span></span>
               <select
                 value={form.state_id}
                 onChange={(e) => setForm({ ...form, state_id: e.target.value, city: "" })}
@@ -1856,7 +1905,7 @@ function OrganizationLanding({
               </select>
             </label>
             <label>
-              City / District
+              <span className="organization-field-label">City / District <span className="required-indicator" aria-hidden="true">*</span></span>
               <select
                 value={form.city}
                 onChange={(e) => setForm({ ...form, city: e.target.value })}
@@ -1881,7 +1930,7 @@ function OrganizationLanding({
               {locationCitiesError && <small className="field-error">{locationCitiesError}</small>}
             </label>
             <label>
-              Pincode
+              <span className="organization-field-label">Pincode <span className="required-indicator" aria-hidden="true">*</span></span>
               <input
                 value={form.pincode}
                 onChange={(e) => setForm({ ...form, pincode: e.target.value })}
@@ -1893,7 +1942,7 @@ function OrganizationLanding({
               />
             </label>
             <label>
-              Compliance start
+              <span className="organization-field-label">Compliance start <span className="required-indicator" aria-hidden="true">*</span></span>
               <input
                 type="date"
                 value={form.compliance_start_date}
@@ -1904,7 +1953,7 @@ function OrganizationLanding({
               />
             </label>
             <label>
-              Primary contact
+              <span className="organization-field-label">Primary contact <span className="required-indicator" aria-hidden="true">*</span></span>
               <input
                 value={form.primary_contact_name}
                 onChange={(e) =>
@@ -1914,7 +1963,7 @@ function OrganizationLanding({
               />
             </label>
             <label>
-              Contact email
+              <span className="organization-field-label">Contact email <span className="required-indicator" aria-hidden="true">*</span></span>
               <input
                 type="email"
                 value={form.primary_contact_email}
@@ -1925,7 +1974,7 @@ function OrganizationLanding({
               />
             </label>
             <label>
-              Contact phone
+              <span className="organization-field-label">Contact phone <span className="required-indicator" aria-hidden="true">*</span></span>
               <input
                 value={form.primary_contact_phone}
                 onChange={(e) =>
@@ -1950,7 +1999,7 @@ function OrganizationLanding({
               </select>
             </label>}
             <label className="wide">
-              Registered address
+              <span className="organization-field-label">Registered address <span className="required-indicator" aria-hidden="true">*</span></span>
               <textarea
                 value={form.registered_address}
                 onChange={(e) =>
@@ -4919,30 +4968,33 @@ function GlobalSidebar({ user, logout, collapsed, setCollapsed }: { user: User; 
   const visibleLinks = workspaceLinks(user);
   const complianceLinks = visibleLinks.filter((link) => ["compliances/company", "compliances/contractor", "compliances/one-time"].includes(link.path));
   const entityLinks = visibleLinks.filter((link) => ["entities/units", "entities/contractors"].includes(link.path));
+  const registerLinks = visibleLinks.filter((link) => {
+    if (!link.path.startsWith("registers/")) return false;
+    if (link.path === "registers/templates") return canManageRegisters(user);
+    if (["registers/employees", "registers/attendance", "registers/payroll", "registers/generate"].includes(link.path)) return canUploadRegisters(user);
+    if (link.path === "registers/reviews") return canReviewRegisters(user);
+    return true;
+  });
   // Sites remain available by direct authorized route, but are intentionally
   // removed from the primary sidebar to keep operational navigation compact.
-  const otherLinks = visibleLinks.filter((link) => !["compliances/company", "compliances/contractor", "compliances/one-time", "entities/units", "entities/contractors", "entities/sites"].includes(link.path));
+  const otherLinks = visibleLinks.filter((link) => !["compliances/company", "compliances/contractor", "compliances/one-time", "entities/units", "entities/contractors", "entities/sites"].includes(link.path) && !link.path.startsWith("registers/"));
   const complianceActive = complianceLinks.some((link) => location.pathname === `${prefix}/${link.path}`);
   const entitiesActive = entityLinks.some((link) => location.pathname === `${prefix}/${link.path}`);
+  const registersActive = registerLinks.some((link) => location.pathname === `${prefix}/${link.path}`);
   const [complianceOpen, setComplianceOpen] = useState(complianceActive);
   const [entitiesOpen, setEntitiesOpen] = useState(entitiesActive);
+  const [registersOpen, setRegistersOpen] = useState(registersActive);
   useEffect(() => { if (complianceActive) setComplianceOpen(true); }, [complianceActive]);
   useEffect(() => { if (entitiesActive) setEntitiesOpen(true); }, [entitiesActive]);
+  useEffect(() => { if (registersActive) setRegistersOpen(true); }, [registersActive]);
 
   return (
     <aside className={collapsed ? "collapsed" : ""}>
-      <div className="brand" style={{ display: 'flex', alignItems: 'center', justifyContent: collapsed ? 'center' : 'space-between', width: '100%', marginBottom: collapsed ? '2rem' : '1.5rem', flexDirection: collapsed ? 'column' : 'row', gap: collapsed ? '1rem' : '0' }}>
-        {!collapsed && (
-          <div style={{ width: "140px", height: "140px", display: "block", margin: "-10px 0 0 -10px", borderRadius: "0.35rem", overflow: "hidden" }}>
-            <ElasticMesh image="/morax/Mora_Final_Logo-01_3.png" interaction="hover" stiffness={0.15} damping={0.15} showGrid={false} color1="#172A1B" color2="#172A1B" />
-          </div>
-        )}
-        {collapsed && (
-          <div style={{ width: "40px", height: "40px", display: "block", borderRadius: "0.35rem", overflow: "hidden" }}>
-            <ElasticMesh image="/morax/Mora_Final_Logo-01_3.png" interaction="hover" stiffness={0.15} damping={0.15} showGrid={false} color1="#172A1B" color2="#172A1B" />
-          </div>
-        )}
-        <button onClick={() => setCollapsed(!collapsed)} style={{ background: 'transparent', border: 'none', color: '#cbd5e1', cursor: 'pointer', padding: '6px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '6px' }} className="hover:bg-slate-800 hover:text-white transition-colors" title={collapsed ? "Expand sidebar" : "Collapse sidebar"}>
+      <div className={`brand ${collapsed ? "brand-collapsed" : ""}`}>
+        <div className="sidebar-logo-container">
+          <img src={moraxLogoUrl} alt="MORAX" />
+        </div>
+        <button onClick={() => setCollapsed(!collapsed)} className="sidebar-collapse-button" title={collapsed ? "Expand sidebar" : "Collapse sidebar"}>
           {collapsed ? <PanelLeftOpen size={20} /> : <PanelLeftClose size={20} />}
         </button>
       </div>
@@ -4970,6 +5022,12 @@ function GlobalSidebar({ user, logout, collapsed, setCollapsed }: { user: User; 
             <Building2 size={18} /><span>Entities</span><ChevronDown size={16} className={entitiesOpen ? "chevron-up" : ""} />
           </button>
           {entitiesOpen && <div className="sidebar-compliance-children">{entityLinks.map(({ label, path }) => <WorkspaceNavLink key={path} label={label} to={prefix + "/" + path} />)}</div>}
+        </div>)}
+        {registerLinks.length > 0 && (collapsed ? registerLinks.map(({ label, path }) => <WorkspaceNavLink key={path} label={label} to={prefix + "/" + path} collapsed />) : <div className={`sidebar-compliance-group ${registersActive ? "active" : ""}`}>
+          <button type="button" className="sidebar-compliance-toggle" onClick={() => setRegistersOpen((open) => !open)} aria-expanded={registersOpen}>
+            <FileSpreadsheet size={18} /><span>Registers</span><ChevronDown size={16} className={registersOpen ? "chevron-up" : ""} />
+          </button>
+          {registersOpen && <div className="sidebar-compliance-children">{registerLinks.filter(({ path }) => path !== "registers/templates" || canManageRegisters(user)).map(({ label, path }) => <WorkspaceNavLink key={path} label={label} to={prefix + "/" + path} />)}</div>}
         </div>)}
         {otherLinks.slice(1).map(({ label, path }) => (
           <WorkspaceNavLink key={path} label={label} to={prefix + "/" + path} collapsed={collapsed} />

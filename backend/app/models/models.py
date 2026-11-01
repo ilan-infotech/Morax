@@ -156,6 +156,32 @@ class Contractor(Timestamped, Base):
         return self.male_workers + self.female_workers
 
 
+class ContractorImport(Timestamped, Base):
+    """A tenant-owned, auditable staging area for contractor Excel imports."""
+    __tablename__ = "contractor_imports"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    uploaded_by_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="VALIDATED", nullable=False, index=True)
+    total_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    valid_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    imported_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ContractorImportRow(Base):
+    __tablename__ = "contractor_import_rows"
+    __table_args__ = (UniqueConstraint("import_id", "row_number", name="uq_contractor_import_row"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    import_id: Mapped[str] = mapped_column(ForeignKey("contractor_imports.id", ondelete="CASCADE"), nullable=False, index=True)
+    row_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    errors_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    valid: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+
 class ContractorSite(Timestamped, Base):
     __tablename__ = "contractor_sites"
     __table_args__ = (UniqueConstraint("contractor_id", "code", name="uq_site_contractor_code"),)
@@ -560,3 +586,294 @@ class SupportTicketActivity(Base):
     action: Mapped[str] = mapped_column(String(80), nullable=False)
     detail: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# Statutory Registers are an operational data domain.  They deliberately do
+# not reuse ComplianceInstance: generation/workflow state and a statutory
+# compliance deadline are independent concerns.  An approved register may be
+# linked to an instance as evidence, but never completes it by itself.
+class RegisterTemplate(Timestamped, Base):
+    __tablename__ = "register_templates"
+    __table_args__ = (UniqueConstraint("organization_id", "code", name="uq_register_template_org_code"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    # NULL denotes a MORAX catalogue template; a value denotes a tenant clone.
+    organization_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id"), index=True)
+    code: Mapped[str] = mapped_column(String(30), nullable=False)
+    name: Mapped[str] = mapped_column(String(250), nullable=False)
+    category: Mapped[str] = mapped_column(String(100), default="STATUTORY_REGISTER", nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    entity_scope: Mapped[str] = mapped_column(String(30), default="ALL", nullable=False)
+    frequency: Mapped[str] = mapped_column(String(30), default="MONTHLY", nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    created_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+
+
+class RegisterTemplateVersion(Timestamped, Base):
+    __tablename__ = "register_template_versions"
+    __table_args__ = (UniqueConstraint("template_id", "version", name="uq_register_template_version"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    template_id: Mapped[str] = mapped_column(ForeignKey("register_templates.id", ondelete="CASCADE"), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="DRAFT", nullable=False, index=True)
+    applicable_legislation: Mapped[str | None] = mapped_column(String(300))
+    applicable_rule: Mapped[str | None] = mapped_column(String(300))
+    form_number: Mapped[str | None] = mapped_column(String(100))
+    jurisdiction: Mapped[str | None] = mapped_column(String(100))
+    effective_from: Mapped[date | None] = mapped_column(Date)
+    effective_to: Mapped[date | None] = mapped_column(Date)
+    # Declarative JSON only: columns, source datasets, required fields and
+    # supported calculations.  It is never evaluated as uploaded code.
+    config_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+
+
+class RegisterColumnMapping(Timestamped, Base):
+    __tablename__ = "register_column_mappings"
+    __table_args__ = (UniqueConstraint("organization_id", "dataset_type", "name", "version", name="uq_register_mapping_version"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    dataset_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(150), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    mapping_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+
+
+class RegisterUploadBatch(Timestamped, Base):
+    __tablename__ = "register_upload_batches"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    entity_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    entity_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    dataset_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    period_key: Mapped[str | None] = mapped_column(String(7), index=True)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    stored_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    checksum_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    mapping_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="VALIDATED", nullable=False, index=True)
+    total_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    valid_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    warning_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    validation_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    uploaded_by_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RegisterEmployee(Timestamped, Base):
+    __tablename__ = "register_employees"
+    __table_args__ = (UniqueConstraint("organization_id", "entity_type", "entity_id", "employee_id", name="uq_register_employee_subject_code"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    entity_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    entity_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    employee_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    employee_name: Mapped[str] = mapped_column(String(250), nullable=False)
+    date_of_joining: Mapped[date | None] = mapped_column(Date)
+    date_of_exit: Mapped[date | None] = mapped_column(Date)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    data_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    source_batch_id: Mapped[str | None] = mapped_column(ForeignKey("register_upload_batches.id"), index=True)
+
+
+class RegisterAttendance(Timestamped, Base):
+    __tablename__ = "register_attendance"
+    __table_args__ = (UniqueConstraint("organization_id", "entity_type", "entity_id", "employee_id", "attendance_date", name="uq_register_attendance_day"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    entity_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    entity_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    employee_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    attendance_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    working_hours: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    overtime_hours: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    data_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    source_batch_id: Mapped[str | None] = mapped_column(ForeignKey("register_upload_batches.id"), index=True)
+
+
+class RegisterPayroll(Timestamped, Base):
+    __tablename__ = "register_payroll"
+    __table_args__ = (UniqueConstraint("organization_id", "entity_type", "entity_id", "employee_id", "period_key", name="uq_register_payroll_period"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    entity_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    entity_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    employee_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    period_key: Mapped[str] = mapped_column(String(7), nullable=False, index=True)
+    gross_earnings: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    total_deductions: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    net_pay: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    data_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    source_batch_id: Mapped[str | None] = mapped_column(ForeignKey("register_upload_batches.id"), index=True)
+
+
+class GeneratedRegister(Timestamped, Base):
+    __tablename__ = "generated_registers"
+    __table_args__ = (UniqueConstraint("organization_id", "entity_type", "entity_id", "template_version_id", "period_key", "version", name="uq_generated_register_version"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    entity_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    entity_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    template_version_id: Mapped[str] = mapped_column(ForeignKey("register_template_versions.id"), nullable=False, index=True)
+    register_code: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    register_name: Mapped[str] = mapped_column(String(250), nullable=False)
+    period_key: Mapped[str] = mapped_column(String(7), nullable=False, index=True)
+    due_date: Mapped[date | None] = mapped_column(Date, index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="GENERATED", nullable=False, index=True)
+    employee_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    validation_summary_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    content_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    generated_by_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+    row_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    supersedes_id: Mapped[str | None] = mapped_column(ForeignKey("generated_registers.id"), index=True)
+
+
+class RegisterWorkflowHistory(Base):
+    __tablename__ = "register_workflow_history"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    register_id: Mapped[str] = mapped_column(ForeignKey("generated_registers.id", ondelete="CASCADE"), nullable=False, index=True)
+    actor_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    action: Mapped[str] = mapped_column(String(40), nullable=False)
+    from_status: Mapped[str | None] = mapped_column(String(30))
+    to_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    remarks: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class RegisterComplianceLink(Timestamped, Base):
+    __tablename__ = "register_compliance_links"
+    __table_args__ = (UniqueConstraint("register_id", "compliance_instance_id", name="uq_register_compliance_link"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    register_id: Mapped[str] = mapped_column(ForeignKey("generated_registers.id", ondelete="CASCADE"), nullable=False, index=True)
+    compliance_instance_id: Mapped[str] = mapped_column(ForeignKey("compliance_instances.id", ondelete="CASCADE"), nullable=False, index=True)
+    linked_by_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    evidence_id: Mapped[str | None] = mapped_column(ForeignKey("compliance_evidence.id"))
+
+
+# License Management is intentionally independent from ComplianceInstance.
+# A license can be linked as evidence for an obligation, but its validity and
+# renewal lifecycle must never mutate the compliance workflow automatically.
+class LicenseType(Timestamped, Base):
+    __tablename__ = "license_types"
+    __table_args__ = (UniqueConstraint("organization_id", "name", name="uq_license_type_org_name"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    # NULL is reserved for a MORAX catalogue definition; tenants can clone it.
+    organization_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id"), index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    category: Mapped[str] = mapped_column(String(100), default="STATUTORY_LICENSE", nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    applicable_entity_type: Mapped[str] = mapped_column(String(30), default="ALL", nullable=False)
+    applicable_state: Mapped[str | None] = mapped_column(String(100))
+    issuing_department: Mapped[str | None] = mapped_column(String(200))
+    issuing_authority: Mapped[str | None] = mapped_column(String(200))
+    renewal_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    default_validity_days: Mapped[int | None] = mapped_column(Integer)
+    default_reminder_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
+    applicable_legislation: Mapped[str | None] = mapped_column(String(300))
+    applicable_rule: Mapped[str | None] = mapped_column(String(300))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    created_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+
+
+class LicenseRecord(Timestamped, Base):
+    __tablename__ = "license_records"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "entity_type", "entity_id", "license_type_id", "license_number", "revision", name="uq_license_revision"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    entity_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    entity_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    license_type_id: Mapped[str] = mapped_column(ForeignKey("license_types.id"), nullable=False, index=True)
+    license_name: Mapped[str] = mapped_column(String(250), nullable=False)
+    license_number: Mapped[str | None] = mapped_column(String(150), index=True)
+    issuing_department: Mapped[str | None] = mapped_column(String(200))
+    issuing_authority: Mapped[str | None] = mapped_column(String(200))
+    applicable_state: Mapped[str | None] = mapped_column(String(100))
+    registration_number: Mapped[str | None] = mapped_column(String(150))
+    application_number: Mapped[str | None] = mapped_column(String(150))
+    issue_date: Mapped[date | None] = mapped_column(Date)
+    valid_from: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    valid_until: Mapped[date | None] = mapped_column(Date, index=True)
+    never_expires: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    renewal_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    renewal_frequency: Mapped[str | None] = mapped_column(String(50))
+    reminder_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
+    renewal_status: Mapped[str] = mapped_column(String(30), default="NOT_STARTED", nullable=False, index=True)
+    remarks: Mapped[str | None] = mapped_column(Text)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+    archive_reason: Mapped[str | None] = mapped_column(Text)
+    revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_by_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    updated_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+    row_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+
+class LicenseDocument(Timestamped, Base):
+    __tablename__ = "license_documents"
+    __table_args__ = (UniqueConstraint("license_id", "version", name="uq_license_document_version"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    license_id: Mapped[str] = mapped_column(ForeignKey("license_records.id", ondelete="CASCADE"), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    stored_filename: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    content_type: Mapped[str | None] = mapped_column(String(150))
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64))
+    uploaded_by_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="ACTIVE", nullable=False)
+
+
+class LicenseRenewal(Timestamped, Base):
+    __tablename__ = "license_renewals"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    license_id: Mapped[str] = mapped_column(ForeignKey("license_records.id", ondelete="CASCADE"), nullable=False, index=True)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    previous_valid_from: Mapped[date | None] = mapped_column(Date)
+    previous_valid_until: Mapped[date | None] = mapped_column(Date)
+    application_number: Mapped[str | None] = mapped_column(String(150))
+    submitted_on: Mapped[date | None] = mapped_column(Date)
+    new_license_number: Mapped[str | None] = mapped_column(String(150))
+    new_valid_from: Mapped[date | None] = mapped_column(Date)
+    new_valid_until: Mapped[date | None] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(30), default="IN_PROGRESS", nullable=False, index=True)
+    remarks: Mapped[str | None] = mapped_column(Text)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    completed_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+    row_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    __table_args__ = (UniqueConstraint("license_id", "sequence", name="uq_license_renewal_sequence"),)
+
+
+class LicenseComplianceMapping(Timestamped, Base):
+    __tablename__ = "license_compliance_mappings"
+    __table_args__ = (UniqueConstraint("license_type_id", "compliance_rule_version_id", "entity_type", name="uq_license_compliance_mapping"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    license_type_id: Mapped[str] = mapped_column(ForeignKey("license_types.id", ondelete="CASCADE"), nullable=False, index=True)
+    compliance_rule_version_id: Mapped[str] = mapped_column(ForeignKey("compliance_rule_versions.id", ondelete="CASCADE"), nullable=False, index=True)
+    entity_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    license_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    validity_check_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    renewal_tracking_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    evidence_linking_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class LicenseComplianceLink(Timestamped, Base):
+    __tablename__ = "license_compliance_links"
+    __table_args__ = (UniqueConstraint("license_id", "compliance_instance_id", name="uq_license_compliance_link"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    license_id: Mapped[str] = mapped_column(ForeignKey("license_records.id", ondelete="CASCADE"), nullable=False, index=True)
+    compliance_instance_id: Mapped[str] = mapped_column(ForeignKey("compliance_instances.id", ondelete="CASCADE"), nullable=False, index=True)
+    linked_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))

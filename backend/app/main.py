@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 
 from app.api.v1.router import router
+from app.api.v1.registers import router as registers_router
+from app.api.v1.licenses import router as licenses_router
 from app.core.config import settings
 from app.core.security import hash_password
 from app.db.session import SessionLocal
@@ -28,7 +30,7 @@ from app.models import (
 )
 from app.services.qa_dataset import seed_qa_demo_workspace
 from app.services.compliance import generate_for_subject
-from app.services.notifications import schedule_compliance_reminders
+from app.services.notifications import schedule_compliance_reminders, schedule_register_reminders, schedule_license_reminders
 
 
 logger = logging.getLogger("uvicorn.info")
@@ -406,7 +408,7 @@ def generate_scheduled_compliance_notifications(run_date: date | None = None) ->
     """
     db = SessionLocal()
     try:
-        created = schedule_compliance_reminders(db, run_date)
+        created = schedule_compliance_reminders(db, run_date) + schedule_register_reminders(db, run_date) + schedule_license_reminders(db, run_date)
         db.commit()
         return created
     except Exception:
@@ -432,6 +434,8 @@ async def compliance_scheduler() -> None:
 app = FastAPI(title=settings.app_name, version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.include_router(router, prefix=settings.api_v1_prefix)
+app.include_router(registers_router, prefix=settings.api_v1_prefix)
+app.include_router(licenses_router, prefix=settings.api_v1_prefix)
 
 
 def ensure_database_schema() -> None:
@@ -523,8 +527,14 @@ async def startup() -> None:
     import sys, traceback
     try:
         settings.upload_path.mkdir(parents=True, exist_ok=True)
-        ensure_database_schema()
-        seed_baseline()
+        if settings.startup_schema_bootstrap:
+            ensure_database_schema()
+        else:
+            logger.info("Skipping runtime schema bootstrap; migrations are managed by deployment.")
+        if settings.startup_seed_baseline:
+            seed_baseline()
+        else:
+            logger.info("Skipping runtime baseline seed; production data is already initialized.")
         global _compliance_scheduler_task
         _compliance_scheduler_task = asyncio.create_task(compliance_scheduler())
     except Exception as exc:

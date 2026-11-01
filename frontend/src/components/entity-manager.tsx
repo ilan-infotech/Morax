@@ -25,11 +25,13 @@ import {
   Building2,
   ChevronLeft,
   ChevronRight,
+  Download,
   Edit3,
   MapPin,
   Plus,
   Search,
   Trash2,
+  Upload,
   UsersRound,
   X,
 } from "lucide-react";
@@ -41,6 +43,7 @@ import { PasswordInput } from "./password-input";
 type Row = Record<string, unknown>;
 type EntityKind = "units" | "contractors" | "sites";
 type ContractorMakerLogin = { id: string; name: string; email: string; active: boolean };
+type ContractorImportPreview = { id: string; total_rows: number; valid_rows: number; error_rows: number; rows: { row_number: number; valid: boolean; data: Record<string, unknown>; errors: { field: string; message: string }[] }[] };
 
 type EntityForm = {
   name: string;
@@ -269,6 +272,11 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Row | null>(null);
   const [notice, setNotice] = useState("");
+  const [contractorImportOpen, setContractorImportOpen] = useState(false);
+  const [contractorImportFile, setContractorImportFile] = useState<File | null>(null);
+  const [contractorImportPreview, setContractorImportPreview] = useState<ContractorImportPreview | null>(null);
+  const [contractorImportBusy, setContractorImportBusy] = useState(false);
+  const [contractorImportError, setContractorImportError] = useState("");
   const [entityAssignments, setEntityAssignments] = useState<FormAssignment[]>([]);
   const [newUserOpen, setNewUserOpen] = useState(false);
   const [newEntityUser, setNewEntityUser] = useState<{
@@ -810,14 +818,19 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
           </p>
         </div>
         {canManage && (
-          <button type="button" className="primary-action" onClick={openCreate}>
-            <Plus size={17} /> Add {meta.singular}
-          </button>
+          <div className="action-row">
+            {kind === "contractors" && <button type="button" className="secondary" onClick={() => { setContractorImportOpen(true); setContractorImportError(""); }}>
+              <Upload size={17} /> Import Contractors
+            </button>}
+            <button type="button" className="primary-action" onClick={openCreate}>
+              <Plus size={17} /> Add {meta.singular}
+            </button>
+          </div>
         )}
       </header>
 
       {notice && (
-        /^(Created|Updated|Unit deleted|Contractor deleted|Contractor site deleted)/.test(notice) ? (
+        /^(Created|Updated|Imported|Unit deleted|Contractor deleted|Contractor site deleted)/.test(notice) ? (
           <div className="alert success" role="status">{notice}</div>
         ) : (
           <InlineError message={notice} />
@@ -1667,6 +1680,58 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
           </section>
         </div>,
         document.body,
+      )}
+      {contractorImportOpen && createPortal(
+        <div className="assignment-user-backdrop" role="presentation" onMouseDown={() => !contractorImportBusy && setContractorImportOpen(false)}>
+          <section className="crud-drawer assignment-user-drawer contractor-import-drawer" role="dialog" aria-modal="true" aria-labelledby="contractor-import-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="drawer-heading">
+              <div>
+                <span className="drawer-icon"><Upload size={19} /></span>
+                <div><h2 id="contractor-import-title">Import Contractors</h2><p>Upload a workbook, review validation, then import only the ready rows.</p></div>
+              </div>
+              <button type="button" className="icon-action" disabled={contractorImportBusy} onClick={() => setContractorImportOpen(false)} aria-label="Close contractor import"><X size={18} /></button>
+            </div>
+            <div className="entity-form contractor-import-form">
+              {contractorImportError && <InlineError message={contractorImportError} />}
+              <div className="import-template-note">
+                <p><b>Required:</b> Contractor Name, Contractor Code, Principal Employer Code, and Maker Email.</p>
+                <button type="button" className="text-action" onClick={() => morax.downloadContractorImportTemplate()}><Download size={15} /> Download Excel template</button>
+              </div>
+              <Field label="Contractor workbook" required>
+                <input type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => { setContractorImportFile(event.target.files?.[0] ?? null); setContractorImportPreview(null); setContractorImportError(""); }} />
+              </Field>
+              <div className="action-row">
+                <button type="button" className="secondary" disabled={!contractorImportFile || contractorImportBusy} onClick={async () => {
+                  if (!contractorImportFile) return;
+                  setContractorImportBusy(true); setContractorImportError("");
+                  try {
+                    const summary = await morax.validateContractorImport(contractorImportFile);
+                    const details = await morax.previewContractorImport(summary.id);
+                    setContractorImportPreview({ ...summary, rows: details.rows });
+                  } catch (error) { setContractorImportError(error instanceof Error ? error.message : "Could not validate the contractor workbook."); }
+                  finally { setContractorImportBusy(false); }
+                }}>{contractorImportBusy ? "Validating…" : "Validate workbook"}</button>
+                {contractorImportPreview && <button type="button" className="primary-action" disabled={!contractorImportPreview.valid_rows || contractorImportBusy} onClick={async () => {
+                  setContractorImportBusy(true); setContractorImportError("");
+                  try {
+                    const result = await morax.confirmContractorImport(contractorImportPreview.id);
+                    await invalidateEntities(); setPage(1); setNotice(`Imported ${result.imported} contractor(s); ${result.invalid} invalid row(s) were not imported.`); setContractorImportOpen(false);
+                  } catch (error) { setContractorImportError(error instanceof Error ? error.message : "Could not import contractors."); }
+                  finally { setContractorImportBusy(false); }
+                }}>{contractorImportBusy ? "Importing…" : `Import ${contractorImportPreview.valid_rows} ready row(s)`}</button>}
+              </div>
+              {contractorImportPreview && <>
+                <div className={`import-validation-summary ${contractorImportPreview.error_rows ? "has-errors" : "valid"}`}><b>{contractorImportPreview.valid_rows} ready · {contractorImportPreview.error_rows} need correction</b><span>{contractorImportPreview.total_rows} total rows</span></div>
+                {contractorImportPreview.error_rows > 0 && <button type="button" className="text-action" onClick={() => morax.downloadContractorImportReport(contractorImportPreview.id)}><Download size={15} /> Download validation report</button>}
+                <div className="contractor-import-preview" aria-live="polite">
+                  {contractorImportPreview.rows.slice(0, 8).map((row) => <div className={row.valid ? "valid" : "invalid"} key={row.row_number}><b>Row {row.row_number}</b><span>{row.valid ? `${String(row.data.name ?? "Contractor")} is ready` : row.errors.map((error) => `${error.field}: ${error.message}`).join(" · ")}</span></div>)}
+                  {contractorImportPreview.rows.length > 8 && <small>Showing the first 8 rows. Download the validation report for all row results.</small>}
+                </div>
+              </>}
+            </div>
+            <footer className="drawer-footer"><button type="button" className="secondary" disabled={contractorImportBusy} onClick={() => setContractorImportOpen(false)}>Close</button></footer>
+          </section>
+        </div>, document.body,
       )}
     </section>
   );

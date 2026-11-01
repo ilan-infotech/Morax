@@ -18,7 +18,7 @@ from app.db.session import get_db
 from app.models import (
     ApplicabilityEvaluation, AuditLog, AuthSession, City, ComplianceAssignment, ComplianceComment, ComplianceEvidence, ComplianceImport, ContractorDocument, InAppNotification,
     ComplianceImportError, ComplianceImportRow, ComplianceInstance, ComplianceRule, ComplianceRuleVersion, ComplianceSubmission,
-    ComplianceWorkflowHistory, Contractor, ContractorSite, IndustryType, Organization, RuleApplicabilityCriteria,
+    ComplianceWorkflowHistory, Contractor, ContractorImport, ContractorImportRow, ContractorSite, IndustryType, Organization, RuleApplicabilityCriteria,
     State, SupportTicket, SupportTicketActivity, SupportTicketAttachment, SupportTicketMessage, Unit, User, UserActivation, UserPermissionGrant, UserRoleScope,
 )
 from app.schemas import (
@@ -1729,8 +1729,7 @@ def get_contractor(contractor_id: str, user: User = Depends(current_user), db: S
     return entity_dict(db, contractor, "CONTRACTOR")
 
 
-@router.post("/contractors")
-def create_contractor(payload: ContractorInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def create_contractor_record(payload: ContractorInput, user: User, db: Session, *, commit: bool = True):
     org = org_for(user); require_permission(db, user, "entities.manage")
     state_was_supplied = bool(payload.state_id)
     payload.code = (payload.code or "").strip().upper() or (
@@ -1801,8 +1800,255 @@ def create_contractor(payload: ContractorInput, user: User = Depends(current_use
     generate_for_subject(db, org, "CONTRACTOR", contractor.id, date.today(), user.id)
     configure_contractor_assignments(db, contractor, contractor_maker.id if contractor_maker else None, payload.checker_user_id, user.id)
     audit(db, organization_id=org, actor_id=user.id, action="CREATE_CONTRACTOR", module="ENTITIES", entity_type="Contractor", entity_id=contractor.id, new={"name": contractor.name})
-    commit_or_conflict(db, "Contractor and Contractor Maker could not be saved")
+    if commit:
+        commit_or_conflict(db, "Contractor and Contractor Maker could not be saved")
+    else:
+        db.flush()
     return entity_dict(db, contractor, "CONTRACTOR") | ({"contractor_maker_user_id": contractor_maker.id} if contractor_maker else {})
+
+
+@router.post("/contractors")
+def create_contractor(payload: ContractorInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    return create_contractor_record(payload, user, db)
+
+
+CONTRACTOR_IMPORT_HEADERS = [
+    "Contractor Name", "Contractor Code", "Principal Employer Code", "Maker Email",
+    "State Code", "City / District", "Contractor Type", "Industry Code", "Contact Email",
+    "Contact Phone", "Address", "Pincode", "GSTIN", "PAN", "LIN", "Male Workers",
+    "Female Workers", "Contract Start Date", "Contract End Date", "Compliance Start Date",
+    "Work Order Expiry Date", "Status",
+]
+CONTRACTOR_IMPORT_REQUIRED_HEADERS = {"Contractor Name", "Contractor Code", "Principal Employer Code", "Maker Email"}
+
+
+def contractor_import_for(db: Session, user: User, import_id: str) -> ContractorImport:
+    require_permission(db, user, "entities.manage")
+    record = db.get(ContractorImport, import_id)
+    if not record or record.organization_id != org_for(user):
+        raise HTTPException(404, "Contractor import not found")
+    return record
+
+
+def import_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value).strip()
+
+
+def import_date(value: object, field: str, errors: list[dict[str, str]]) -> str | None:
+    text = import_text(value)
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        errors.append({"field": field, "message": "Use an ISO date in YYYY-MM-DD format"})
+        return None
+
+
+def import_nonnegative_int(value: object, field: str, errors: list[dict[str, str]]) -> int:
+    text = import_text(value)
+    if not text:
+        return 0
+    try:
+        number = int(text)
+        if number < 0:
+            raise ValueError
+        return number
+    except ValueError:
+        errors.append({"field": field, "message": "Use a whole number that is zero or greater"})
+        return 0
+
+
+def contractor_import_payload(
+    db: Session, organization_id: str, source: dict[str, object], seen_codes: set[str], pending_workers: dict[str, int],
+) -> tuple[dict, list[dict[str, str]]]:
+    """Resolve friendly template values to trusted IDs before a row can import."""
+    errors: list[dict[str, str]] = []
+    value = lambda key: import_text(source.get(key))
+    name, code, unit_code, maker_email = value("Contractor Name"), value("Contractor Code").upper(), value("Principal Employer Code").upper(), value("Maker Email").lower()
+    for field, item in (("Contractor Name", name), ("Contractor Code", code), ("Principal Employer Code", unit_code), ("Maker Email", maker_email)):
+        if not item:
+            errors.append({"field": field, "message": "Value is required"})
+    if code:
+        if code in seen_codes:
+            errors.append({"field": "Contractor Code", "message": "Duplicate Contractor Code in this workbook"})
+        seen_codes.add(code)
+        if db.scalar(select(Contractor.id).where(Contractor.organization_id == organization_id, Contractor.code == code)):
+            errors.append({"field": "Contractor Code", "message": "A contractor with this code already exists in this organization"})
+    unit = db.scalar(select(Unit).where(Unit.organization_id == organization_id, func.upper(Unit.code) == unit_code, Unit.status == "ACTIVE")) if unit_code else None
+    if unit_code and not unit:
+        errors.append({"field": "Principal Employer Code", "message": "No active Unit with this code exists in the organization"})
+    maker = db.scalar(select(User).where(User.organization_id == organization_id, func.lower(User.email) == maker_email, User.active.is_(True))) if maker_email else None
+    if maker_email and not maker:
+        errors.append({"field": "Maker Email", "message": "Use an existing active user in this organization"})
+
+    state_code = value("State Code").upper()
+    state = None
+    if state_code:
+        state = db.scalar(select(State).where(or_(func.upper(State.code) == state_code, func.upper(State.name) == state_code)))
+        if not state:
+            errors.append({"field": "State Code", "message": "State code is not configured"})
+    if not state and unit:
+        state = db.get(State, unit.state_id)
+    if not state:
+        errors.append({"field": "State Code", "message": "Supply a valid State Code when the Principal Employer has no State"})
+    industry_code = value("Industry Code").upper()
+    industry = db.scalar(select(IndustryType).where(func.upper(IndustryType.code) == industry_code)) if industry_code else None
+    if industry_code and not industry:
+        errors.append({"field": "Industry Code", "message": "Industry code is not configured"})
+    if industry and industry.code.upper() == "OTHER":
+        errors.append({"field": "Industry Code", "message": "Other industry requires manual configuration and cannot be bulk imported"})
+    contact_email = value("Contact Email").lower() or None
+    if contact_email and email_is_in_use(db, contact_email):
+        errors.append({"field": "Contact Email", "message": "Email ID already exists"})
+    male_workers = import_nonnegative_int(source.get("Male Workers"), "Male Workers", errors)
+    female_workers = import_nonnegative_int(source.get("Female Workers"), "Female Workers", errors)
+    status = (value("Status") or "ACTIVE").upper()
+    if status not in {"ACTIVE", "INACTIVE"}:
+        errors.append({"field": "Status", "message": "Use ACTIVE or INACTIVE"})
+    row = {
+        "name": name, "code": code, "unit_id": unit.id if unit else "", "maker_user_id": maker.id if maker else None,
+        "state_id": state.id if state else None, "city": value("City / District") or None,
+        "contractor_type": value("Contractor Type") or None, "industry_type_id": industry.id if industry else None,
+        "contact_email": contact_email, "contact_phone": value("Contact Phone") or None,
+        "address": value("Address") or None, "pincode": value("Pincode") or None, "gstin": value("GSTIN") or None,
+        "pan": value("PAN") or None, "lin": value("LIN") or None, "male_workers": male_workers,
+        "female_workers": female_workers, "contract_start_date": import_date(source.get("Contract Start Date"), "Contract Start Date", errors),
+        "contract_end_date": import_date(source.get("Contract End Date"), "Contract End Date", errors),
+        "compliance_start_date": import_date(source.get("Compliance Start Date"), "Compliance Start Date", errors),
+        "work_order_expiry_date": import_date(source.get("Work Order Expiry Date"), "Work Order Expiry Date", errors), "status": status,
+    }
+    if unit and not errors and status == "ACTIVE" and unit.worker_limit is not None:
+        allocated = sum(item.total_workers for item in db.scalars(select(Contractor).where(Contractor.organization_id == organization_id, Contractor.unit_id == unit.id, Contractor.status == "ACTIVE")))
+        proposed = male_workers + female_workers
+        if allocated + pending_workers.get(unit.id, 0) + proposed > unit.worker_limit:
+            errors.append({"field": "Male Workers/Female Workers", "message": f"Worker limit exceeded for {unit.code}"})
+        else:
+            pending_workers[unit.id] = pending_workers.get(unit.id, 0) + proposed
+    try:
+        if not errors:
+            row = ContractorInput(**row).model_dump(mode="json", exclude_none=True)
+            # Assignment fields are intentionally excluded from ordinary API
+            # serialization, but the staged import needs the trusted Maker ID
+            # resolved during validation in order to use the normal create flow.
+            row["maker_user_id"] = maker.id if maker else None
+    except Exception as exc:
+        errors.append({"field": "Contractor details", "message": str(exc).split("\n")[-1]})
+    return row, errors
+
+
+@router.get("/contractor-imports/template")
+def contractor_import_template(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_permission(db, user, "entities.manage")
+    workbook = Workbook(); sheet = workbook.active; sheet.title = "Contractors"
+    sheet.append(CONTRACTOR_IMPORT_HEADERS)
+    sheet.append(["Example Contracting Pvt Ltd", "ECP-001", "UNIT-001", "maker@example.com", "KA", "Bengaluru", "Manpower", "", "", "", "", "", "", "", "", 10, 5, "2026-04-01", "2027-03-31", "2026-04-01", "", "ACTIVE"])
+    for cell in sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF"); cell.fill = PatternFill("solid", fgColor="234332"); cell.alignment = Alignment(horizontal="center")
+    sheet.freeze_panes = "A2"
+    for column in sheet.columns:
+        sheet.column_dimensions[column[0].column_letter].width = min(32, max(14, max(len(import_text(cell.value)) for cell in column) + 2))
+    instructions = workbook.create_sheet("Instructions")
+    instructions["A1"] = "Required columns: Contractor Name, Contractor Code, Principal Employer Code, and Maker Email. Dates use YYYY-MM-DD. Maker Email must already belong to an active organization user."
+    instructions["A1"].alignment = Alignment(wrap_text=True); instructions["A1"].font = Font(italic=True, color="526044")
+    instructions.column_dimensions["A"].width = 130
+    output = io.BytesIO(); workbook.save(output); output.seek(0)
+    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=morax-contractor-import-template.xlsx"})
+
+
+@router.post("/contractor-imports/validate")
+async def validate_contractor_import(file: UploadFile = File(...), user: User = Depends(current_user), db: Session = Depends(get_db)):
+    organization_id = org_for(user); require_permission(db, user, "entities.manage")
+    if not (file.filename or "").lower().endswith(".xlsx"):
+        raise HTTPException(422, "Contractor import must be an .xlsx file")
+    content = await file.read()
+    if not content or len(content) > 10 * 1024 * 1024:
+        raise HTTPException(422, "Upload a non-empty Excel file no larger than 10 MB")
+    try:
+        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        sheet = workbook["Contractors"] if "Contractors" in workbook.sheetnames else workbook.active
+        headers = [import_text(cell.value) for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
+    except Exception as exc:
+        raise HTTPException(422, "The uploaded file is not a valid Excel workbook") from exc
+    missing = CONTRACTOR_IMPORT_REQUIRED_HEADERS - set(headers)
+    if missing:
+        raise HTTPException(422, f"Missing required headers: {', '.join(sorted(missing))}")
+    record = ContractorImport(organization_id=organization_id, uploaded_by_id=user.id, original_filename=file.filename or "contractors.xlsx")
+    db.add(record); db.flush(); total = valid = errors = 0; seen_codes: set[str] = set(); pending_workers: dict[str, int] = {}
+    for row_number, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+        if not any(import_text(value) for value in values):
+            continue
+        raw = {headers[index]: values[index] for index in range(min(len(headers), len(values)))}
+        normalized, row_errors = contractor_import_payload(db, organization_id, raw, seen_codes, pending_workers)
+        db.add(ContractorImportRow(import_id=record.id, row_number=row_number, payload_json=json.dumps(normalized, default=str), errors_json=json.dumps(row_errors), valid=not row_errors))
+        total += 1; valid += int(not row_errors); errors += int(bool(row_errors))
+    record.total_rows, record.valid_rows, record.error_rows = total, valid, errors
+    audit(db, organization_id=organization_id, actor_id=user.id, action="VALIDATE_CONTRACTOR_IMPORT", module="ENTITIES", entity_type="ContractorImport", entity_id=record.id, new={"total": total, "valid": valid, "errors": errors})
+    db.commit()
+    return {"id": record.id, "total_rows": total, "valid_rows": valid, "error_rows": errors}
+
+
+@router.get("/contractor-imports/{import_id}/preview")
+def contractor_import_preview(import_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    record = contractor_import_for(db, user, import_id)
+    rows = [
+        {"row_number": row.row_number, "valid": row.valid, "data": json.loads(row.payload_json), "errors": json.loads(row.errors_json)}
+        for row in db.scalars(select(ContractorImportRow).where(ContractorImportRow.import_id == record.id).order_by(ContractorImportRow.row_number))
+    ]
+    return {"import": model_dict(record, [field.name for field in record.__table__.columns]), "rows": rows}
+
+
+def safe_excel_cell(value: object) -> object:
+    text = import_text(value)
+    return f"'{text}" if text.startswith(("=", "+", "-", "@")) else text
+
+
+@router.get("/contractor-imports/{import_id}/validation-report.xlsx")
+def contractor_import_validation_report(import_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    record = contractor_import_for(db, user, import_id)
+    workbook = Workbook(); sheet = workbook.active; sheet.title = "Validation report"
+    sheet.append(["Row", "Result", "Field", "Message", "Contractor Name", "Contractor Code"])
+    for cell in sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF"); cell.fill = PatternFill("solid", fgColor="234332")
+    for row in db.scalars(select(ContractorImportRow).where(ContractorImportRow.import_id == record.id).order_by(ContractorImportRow.row_number)):
+        payload, row_errors = json.loads(row.payload_json), json.loads(row.errors_json)
+        entries = row_errors or [{"field": "", "message": "Ready to import"}]
+        for error in entries:
+            sheet.append([row.row_number, "INVALID" if row_errors else "VALID", safe_excel_cell(error.get("field")), safe_excel_cell(error.get("message")), safe_excel_cell(payload.get("name")), safe_excel_cell(payload.get("code"))])
+    sheet.freeze_panes = "A2"
+    for column in sheet.columns:
+        sheet.column_dimensions[column[0].column_letter].width = min(48, max(12, max(len(import_text(cell.value)) for cell in column) + 2))
+    output = io.BytesIO(); workbook.save(output); output.seek(0)
+    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=contractor-import-errors-{record.id}.xlsx"})
+
+
+@router.post("/contractor-imports/{import_id}/confirm")
+def confirm_contractor_import(import_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    record = contractor_import_for(db, user, import_id)
+    if record.status != "VALIDATED":
+        raise HTTPException(409, "This contractor import has already been applied")
+    rows = list(db.scalars(select(ContractorImportRow).where(ContractorImportRow.import_id == record.id, ContractorImportRow.valid.is_(True)).order_by(ContractorImportRow.row_number)))
+    if not rows:
+        raise HTTPException(422, "No valid contractor rows are available to import")
+    try:
+        for row in rows:
+            create_contractor_record(ContractorInput(**json.loads(row.payload_json)), user, db, commit=False)
+        record.status, record.imported_rows, record.confirmed_at = "CONFIRMED", len(rows), datetime.now(UTC)
+        audit(db, organization_id=record.organization_id, actor_id=user.id, action="CONFIRM_CONTRACTOR_IMPORT", module="ENTITIES", entity_type="ContractorImport", entity_id=record.id, new={"imported": len(rows), "invalid": record.error_rows})
+        db.commit()
+    except HTTPException as exc:
+        db.rollback()
+        raise HTTPException(409, f"The organization data changed after validation. Revalidate the workbook before importing. ({exc.detail})") from exc
+    except Exception:
+        db.rollback()
+        raise
+    return {"id": record.id, "imported": len(rows), "invalid": record.error_rows}
 
 
 @router.patch("/contractors/{contractor_id}")

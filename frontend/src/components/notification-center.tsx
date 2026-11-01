@@ -21,6 +21,7 @@ const notificationIcon = (item: Notification) => item.category === "SUPPORT" ? <
 function notificationTarget(item: Notification, prefix: string) {
   if (item.reference_type === "ComplianceInstance") return `${prefix}/compliances/detail/${item.reference_id}`;
   if (item.reference_type === "SupportTicket") return `${prefix}/support-tickets?ticket=${encodeURIComponent(String(item.reference_id))}`;
+  if (item.reference_type === "GeneratedRegister") return `${prefix}/registers/library?register=${encodeURIComponent(String(item.reference_id))}`;
   return `${prefix}/notifications`;
 }
 

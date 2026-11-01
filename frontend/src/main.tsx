@@ -8,8 +8,10 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       retry: 1,
-      staleTime: 30_000,
-      refetchOnMount: 'always',
+      // Requests cross Netlify, Render, and Turso. Reuse recently fetched
+      // views instead of issuing a new request whenever a route remounts.
+      staleTime: 60_000,
+      refetchOnMount: true,
       refetchOnWindowFocus: false,
     },
   },

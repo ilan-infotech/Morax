@@ -1,10 +1,28 @@
 .venv/
-backend/.env
-backend/morax.db
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Local databases, uploads, and test output
+backend/*.db
+backend/*.db-*
 backend/uploads/
-backend/__pycache__/
-backend/app/**/__pycache__/
-backend/.pytest_cache/
+
+# Python caches and coverage output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Frontend dependencies and build/cache output
 frontend/node_modules/
 frontend/dist/
-*.pyc
+frontend/.vite/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -167,9 +167,10 @@ export function MainDashboard({ user }: { user: User }) {
       table_page: String(tableFilters.page),
       table_page_size: "25",
     }),
-    staleTime: 0,
-    refetchOnWindowFocus: true,
-    refetchInterval: 30_000,
+    // The page has a manual Refresh action. Polling this full dashboard and
+    // refetching it on every tab focus creates expensive duplicate requests.
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
   });
   const data = overview.data;
   const summary = data?.summary;

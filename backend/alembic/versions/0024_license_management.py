@@ -1,0 +1,43 @@
+"""Add tenant-scoped License Management storage.
+
+Revision ID: 0024_license_management
+Revises: 0023_statutory_registers
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+
+revision = "0024_license_management"
+down_revision = "0023_statutory_registers"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    existing = set(sa.inspect(op.get_bind()).get_table_names())
+    required = {"license_types", "license_records", "license_documents", "license_renewals", "license_compliance_mappings", "license_compliance_links"}
+    if required.issubset(existing):
+        return
+    op.create_table("license_types",
+        sa.Column("id", sa.String(36), primary_key=True), sa.Column("organization_id", sa.String(36), sa.ForeignKey("organizations.id"), index=True),
+        sa.Column("name", sa.String(200), nullable=False), sa.Column("category", sa.String(100), nullable=False, server_default="STATUTORY_LICENSE"), sa.Column("description", sa.Text()),
+        sa.Column("applicable_entity_type", sa.String(30), nullable=False, server_default="ALL"), sa.Column("applicable_state", sa.String(100)), sa.Column("issuing_department", sa.String(200)), sa.Column("issuing_authority", sa.String(200)),
+        sa.Column("renewal_required", sa.Boolean(), nullable=False, server_default=sa.true()), sa.Column("default_validity_days", sa.Integer()), sa.Column("default_reminder_days", sa.Integer(), nullable=False, server_default="30"),
+        sa.Column("applicable_legislation", sa.String(300)), sa.Column("applicable_rule", sa.String(300)), sa.Column("active", sa.Boolean(), nullable=False, server_default=sa.true(), index=True), sa.Column("created_by_id", sa.String(36), sa.ForeignKey("users.id")),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()), sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.UniqueConstraint("organization_id", "name", name="uq_license_type_org_name"),
+    )
+    op.create_table("license_records",
+        sa.Column("id", sa.String(36), primary_key=True), sa.Column("organization_id", sa.String(36), sa.ForeignKey("organizations.id"), nullable=False, index=True), sa.Column("entity_type", sa.String(30), nullable=False, index=True), sa.Column("entity_id", sa.String(36), nullable=False, index=True), sa.Column("license_type_id", sa.String(36), sa.ForeignKey("license_types.id"), nullable=False, index=True),
+        sa.Column("license_name", sa.String(250), nullable=False), sa.Column("license_number", sa.String(150), index=True), sa.Column("issuing_department", sa.String(200)), sa.Column("issuing_authority", sa.String(200)), sa.Column("applicable_state", sa.String(100)), sa.Column("registration_number", sa.String(150)), sa.Column("application_number", sa.String(150)), sa.Column("issue_date", sa.Date()), sa.Column("valid_from", sa.Date(), nullable=False, index=True), sa.Column("valid_until", sa.Date(), index=True), sa.Column("never_expires", sa.Boolean(), nullable=False, server_default=sa.false()), sa.Column("renewal_required", sa.Boolean(), nullable=False, server_default=sa.true()), sa.Column("renewal_frequency", sa.String(50)), sa.Column("reminder_days", sa.Integer(), nullable=False, server_default="30"), sa.Column("renewal_status", sa.String(30), nullable=False, server_default="NOT_STARTED", index=True), sa.Column("remarks", sa.Text()), sa.Column("archived", sa.Boolean(), nullable=False, server_default=sa.false(), index=True), sa.Column("archived_at", sa.DateTime(timezone=True)), sa.Column("archived_by_id", sa.String(36), sa.ForeignKey("users.id")), sa.Column("archive_reason", sa.Text()), sa.Column("revision", sa.Integer(), nullable=False, server_default="1"), sa.Column("created_by_id", sa.String(36), sa.ForeignKey("users.id"), nullable=False), sa.Column("updated_by_id", sa.String(36), sa.ForeignKey("users.id")), sa.Column("row_version", sa.Integer(), nullable=False, server_default="1"), sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()), sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.UniqueConstraint("organization_id", "entity_type", "entity_id", "license_type_id", "license_number", "revision", name="uq_license_revision"),
+    )
+    op.create_table("license_documents", sa.Column("id", sa.String(36), primary_key=True), sa.Column("license_id", sa.String(36), sa.ForeignKey("license_records.id", ondelete="CASCADE"), nullable=False, index=True), sa.Column("version", sa.Integer(), nullable=False), sa.Column("original_filename", sa.String(255), nullable=False), sa.Column("stored_filename", sa.String(255), nullable=False, unique=True), sa.Column("content_type", sa.String(150)), sa.Column("size_bytes", sa.Integer(), nullable=False), sa.Column("checksum_sha256", sa.String(64)), sa.Column("uploaded_by_id", sa.String(36), sa.ForeignKey("users.id"), nullable=False), sa.Column("status", sa.String(30), nullable=False, server_default="ACTIVE"), sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()), sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()), sa.UniqueConstraint("license_id", "version", name="uq_license_document_version"))
+    op.create_table("license_renewals", sa.Column("id", sa.String(36), primary_key=True), sa.Column("license_id", sa.String(36), sa.ForeignKey("license_records.id", ondelete="CASCADE"), nullable=False, index=True), sa.Column("sequence", sa.Integer(), nullable=False), sa.Column("previous_valid_from", sa.Date()), sa.Column("previous_valid_until", sa.Date()), sa.Column("application_number", sa.String(150)), sa.Column("submitted_on", sa.Date()), sa.Column("new_license_number", sa.String(150)), sa.Column("new_valid_from", sa.Date()), sa.Column("new_valid_until", sa.Date()), sa.Column("status", sa.String(30), nullable=False, server_default="IN_PROGRESS", index=True), sa.Column("remarks", sa.Text()), sa.Column("completed_at", sa.DateTime(timezone=True)), sa.Column("created_by_id", sa.String(36), sa.ForeignKey("users.id"), nullable=False), sa.Column("completed_by_id", sa.String(36), sa.ForeignKey("users.id")), sa.Column("row_version", sa.Integer(), nullable=False, server_default="1"), sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()), sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()), sa.UniqueConstraint("license_id", "sequence", name="uq_license_renewal_sequence"))
+    op.create_table("license_compliance_mappings", sa.Column("id", sa.String(36), primary_key=True), sa.Column("organization_id", sa.String(36), sa.ForeignKey("organizations.id"), nullable=False, index=True), sa.Column("license_type_id", sa.String(36), sa.ForeignKey("license_types.id", ondelete="CASCADE"), nullable=False, index=True), sa.Column("compliance_rule_version_id", sa.String(36), sa.ForeignKey("compliance_rule_versions.id", ondelete="CASCADE"), nullable=False, index=True), sa.Column("entity_type", sa.String(30), nullable=False), sa.Column("license_required", sa.Boolean(), nullable=False, server_default=sa.true()), sa.Column("validity_check_required", sa.Boolean(), nullable=False, server_default=sa.true()), sa.Column("renewal_tracking_required", sa.Boolean(), nullable=False, server_default=sa.true()), sa.Column("evidence_linking_enabled", sa.Boolean(), nullable=False, server_default=sa.true()), sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()), sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()), sa.UniqueConstraint("license_type_id", "compliance_rule_version_id", "entity_type", name="uq_license_compliance_mapping"))
+    op.create_table("license_compliance_links", sa.Column("id", sa.String(36), primary_key=True), sa.Column("license_id", sa.String(36), sa.ForeignKey("license_records.id", ondelete="CASCADE"), nullable=False, index=True), sa.Column("compliance_instance_id", sa.String(36), sa.ForeignKey("compliance_instances.id", ondelete="CASCADE"), nullable=False, index=True), sa.Column("linked_by_id", sa.String(36), sa.ForeignKey("users.id")), sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()), sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()), sa.UniqueConstraint("license_id", "compliance_instance_id", name="uq_license_compliance_link"))
+
+
+def downgrade() -> None:
+    raise NotImplementedError("Downgrade is not supported for production data migrations")

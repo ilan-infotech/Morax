@@ -2,7 +2,7 @@ from datetime import timezone, datetime
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import or_, select
+from sqlalchemy import event, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.security import decode_access_token
@@ -34,6 +34,14 @@ ROLE_PERMISSIONS = {
         "compliance_master.manage",
         "settings.read",
         "settings.manage",
+        "registers.read",
+        "registers.upload",
+        "registers.generate",
+        "registers.review",
+        "registers.template.manage",
+        "licenses.read",
+        "licenses.manage",
+        "licenses.config.manage",
     },
     "ORGANIZATION_ADMIN": {
         "dashboard.read",
@@ -48,6 +56,14 @@ ROLE_PERMISSIONS = {
         "users.manage",
         "settings.read",
         "settings.manage",
+        "registers.read",
+        "registers.upload",
+        "registers.generate",
+        "registers.review",
+        "registers.template.manage",
+        "licenses.read",
+        "licenses.manage",
+        "licenses.config.manage",
     },
     "UNIT_ADMIN": {
         "dashboard.read",
@@ -58,6 +74,12 @@ ROLE_PERMISSIONS = {
         "reports.read",
         "entities.read",
         "settings.read",
+        "registers.read",
+        "registers.upload",
+        "registers.generate",
+        "registers.review",
+        "licenses.read",
+        "licenses.manage",
     },
     "UNIT_MAKER": {
         "dashboard.read",
@@ -66,12 +88,22 @@ ROLE_PERMISSIONS = {
         "documents.read",
         "documents.upload",
         "settings.read",
+        "registers.read",
+        "registers.upload",
+        "registers.generate",
+        "licenses.read",
+        "licenses.manage",
     },
     "CONTRACTOR_MAKER": {
         "dashboard.read",
         "compliance.read",
         "compliance.make",
         "documents.upload",
+        "registers.read",
+        "registers.upload",
+        "registers.generate",
+        "licenses.read",
+        "licenses.manage",
     },
     "UNIT_CHECKER": {
         "dashboard.read",
@@ -80,6 +112,9 @@ ROLE_PERMISSIONS = {
         "documents.read",
         "documents.verify",
         "settings.read",
+        "registers.read",
+        "registers.review",
+        "licenses.read",
     },
     "CONTRACTOR_ADMIN": {
         "dashboard.read",
@@ -87,18 +122,29 @@ ROLE_PERMISSIONS = {
         "compliance.manage",
         "documents.manage",
         "documents.upload",
+        "registers.read",
+        "registers.upload",
+        "registers.generate",
+        "registers.review",
+        "licenses.read",
+        "licenses.manage",
     },
     "CONTRACTOR_CHECKER": {
         "dashboard.read",
         "compliance.read",
         "compliance.check",
         "documents.verify",
+        "registers.read",
+        "registers.review",
+        "licenses.read",
     },
     "VIEWER": {
         "dashboard.read",
         "compliance.read",
         "documents.read",
         "settings.read",
+        "registers.read",
+        "licenses.read",
     },
     "AUDITOR": {
         "dashboard.read",
@@ -107,6 +153,8 @@ ROLE_PERMISSIONS = {
         "reports.read",
         "audit.read",
         "settings.read",
+        "registers.read",
+        "licenses.read",
     },
 }
 
@@ -138,6 +186,8 @@ FEATURE_PERMISSIONS = {
     "reports": "reports.read",
     "audit": "audit.read",
     "settings": "settings.read",
+    "registers": "registers.read",
+    "licenses": "licenses.read",
 }
 
 BASE_FEATURES = {
@@ -147,6 +197,8 @@ BASE_FEATURES = {
     "documents",
     "notifications",
     "settings",
+    "registers",
+    "licenses",
 }
 ADMIN_FEATURES = BASE_FEATURES | {
     "entities.units",
@@ -155,6 +207,8 @@ ADMIN_FEATURES = BASE_FEATURES | {
     "users",
     "reports",
     "audit",
+    "registers",
+    "licenses",
 }
 MANAGER_FEATURES = BASE_FEATURES | {"reports"}
 AUDITOR_FEATURES = BASE_FEATURES | {"reports", "audit"}
@@ -193,8 +247,28 @@ def current_user(
     return user
 
 
+@event.listens_for(Session, "after_flush")
+def clear_access_lookup_cache(session: Session, _flush_context) -> None:
+    """Keep per-request authorization lookups correct after access changes."""
+    changed = (*session.new, *session.dirty, *session.deleted)
+    if not any(isinstance(row, (UserRoleScope, UserPermissionGrant)) for row in changed):
+        return
+    for key in tuple(session.info):
+        if key.startswith("morax.scopes:") or key.startswith("morax.permission_grants:"):
+            session.info.pop(key, None)
+
+
 def scopes_for(db: Session, user_id: str) -> list[UserRoleScope]:
-    return list(db.scalars(select(UserRoleScope).where(UserRoleScope.user_id == user_id)))
+    # A single request can evaluate subject access hundreds of times (for
+    # example while producing a dashboard).  The SQLAlchemy Session is scoped
+    # to that request, so it is safe to reuse this immutable-in-practice lookup
+    # and avoid a round trip to Turso for every access check.
+    cache_key = f"morax.scopes:{user_id}"
+    if cache_key not in db.info:
+        db.info[cache_key] = list(
+            db.scalars(select(UserRoleScope).where(UserRoleScope.user_id == user_id))
+        )
+    return db.info[cache_key]
 
 
 def roles_for(db: Session, user_id: str) -> set[str]:
@@ -262,7 +336,16 @@ def contractor_context_for_user(
 
 
 def permission_grants_for(db: Session, user_id: str) -> set[str]:
-    return set(db.scalars(select(UserPermissionGrant.permission).where(UserPermissionGrant.user_id == user_id)))
+    cache_key = f"morax.permission_grants:{user_id}"
+    if cache_key not in db.info:
+        db.info[cache_key] = set(
+            db.scalars(
+                select(UserPermissionGrant.permission).where(
+                    UserPermissionGrant.user_id == user_id
+                )
+            )
+        )
+    return db.info[cache_key]
 
 
 def platform_master_organization_id(db: Session) -> str:
@@ -308,6 +391,8 @@ def permissions_for(user: User, scopes: list[UserRoleScope], grants: set[str] | 
         permissions &= {
             "compliance.read", "compliance.make", "compliance.check", "compliance.manage",
             "documents.upload", "documents.verify", "documents.manage",
+            "registers.read", "registers.upload", "registers.generate", "registers.review",
+            "licenses.read", "licenses.manage",
         }
     return permissions
 
@@ -323,7 +408,7 @@ def features_for(user: User, scopes: list[UserRoleScope], grants: set[str] | Non
         # compliance records and documents needed inside that experience.
         # Contractor users receive a deliberately narrow dashboard. Its data is
         # still constrained by the selected, authorized contractor context.
-        return ["dashboard", "compliances.recurring", "notifications"]
+        return ["dashboard", "compliances.recurring", "notifications", "registers", "licenses"]
     permissions = permissions_for(user, scopes, grants)
     features = {
         feature
