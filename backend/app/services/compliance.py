@@ -137,34 +137,60 @@ def calculate_due_date(version: ComplianceRuleVersion, as_of: date) -> date:
     raise HTTPException(422, f"Unsupported due-date rule: {version.due_date_rule}")
 
 
-def evaluate(version: ComplianceRuleVersion, criteria: RuleApplicabilityCriteria, subject: object) -> tuple[bool, dict]:
+def _json_string_set(value: str | None, *, invalid_marker: str | None = None) -> set[str]:
+    """Read controlled list fields without making malformed historical data match."""
+    if not value:
+        return set()
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {invalid_marker} if invalid_marker else set()
+    if not isinstance(decoded, list):
+        return {invalid_marker} if invalid_marker else set()
+    return {item.strip() for item in decoded if isinstance(item, str) and item.strip()}
+
+
+def evaluate(
+    version: ComplianceRuleVersion,
+    criteria: RuleApplicabilityCriteria,
+    subject: object,
+    *,
+    include_unit_compliance_type: bool = True,
+) -> tuple[bool, dict]:
     worker_count = getattr(subject, "total_employees", None)
     if worker_count is None:
         worker_count = getattr(subject, "total_workers", None)
-    required_types: set[str] = set()
-    configured_types = getattr(criteria, "unit_compliance_types_json", None)
-    if configured_types:
-        try:
-            required_types = set(json.loads(configured_types))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            required_types = {"__INVALID_MASTER_VALUE__"}
+    required_types = _json_string_set(
+        getattr(criteria, "unit_compliance_types_json", None),
+        invalid_marker="__INVALID_MASTER_VALUE__",
+    )
     selected_types: set[str] = set()
-    if getattr(subject, "entity_type", None) == "UNIT":
-        try:
-            selected_types = set(json.loads(getattr(subject, "compliance_types_json", None) or "[]"))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            selected_types = set()
+    if (
+        getattr(subject, "entity_type", None) == "UNIT"
+        or getattr(subject, "__subject_type__", None) == "UNIT"
+    ):
+        selected_types = _json_string_set(getattr(subject, "compliance_types_json", None))
     matches = {
-        # Compliance Type is the first Unit applicability gate. An empty rule
-        # list represents a universal Central/establishment requirement.
-        "unit_compliance_type": not required_types or bool(required_types & selected_types),
+        # Unit Compliance Type is deliberately excluded from the main Unit
+        # applicability pass.  It is used only to find optional add-on rules
+        # before candidates are merged in generate_for_subject.
+        "unit_compliance_type": (
+            not include_unit_compliance_type
+            or not required_types
+            or bool(required_types & selected_types)
+        ),
         "entity_type": getattr(subject, "entity_type", None) == criteria.entity_type if criteria.entity_type == "UNIT" else criteria.entity_type == getattr(subject, "__subject_type__", None),
         "state": criteria.state_id is None or criteria.state_id == getattr(subject, "state_id", None),
         "industry_type": criteria.industry_type_id is None or criteria.industry_type_id == getattr(subject, "industry_type_id", None),
         "employee_threshold": criteria.employee_threshold is None or (worker_count is not None and worker_count >= criteria.employee_threshold),
         "applicability_flag": criteria.applicability_flag,
     }
-    return all(matches.values()), {"rule_version_id": version.id, "matched": matches, "criteria_notes": criteria.notes}
+    return all(matches.values()), {
+        "rule_version_id": version.id,
+        "matched": matches,
+        "criteria_notes": criteria.notes,
+        "unit_compliance_type_mode": "MATCH" if include_unit_compliance_type else "IGNORED_FOR_MAIN",
+    }
 
 
 def applies_in_month(version: ComplianceRuleVersion, as_of: date) -> bool:
@@ -218,7 +244,35 @@ def generate_for_subject(db: Session, organization_id: str, subject_type: str, s
             )
         ).all()
     )
-    for version, rule, criteria in active_versions(db, organization_id, as_of):
+    active_rules = active_versions(db, organization_id, as_of)
+    if subject_type == "UNIT":
+        # Main compliance is selected without any Unit Compliance Type gate.
+        # Rules that declare one or more Unit Compliance Types are optional
+        # add-ons: matching selected types add them to the baseline rather
+        # than narrowing it.
+        selected_types = _json_string_set(getattr(subject, "compliance_types_json", None))
+        candidates: dict[tuple[str, str], tuple[ComplianceRuleVersion, ComplianceRule, RuleApplicabilityCriteria, bool]] = {
+            (rule.id, version.id): (version, rule, criteria, False)
+            for version, rule, criteria in active_rules
+            if not _json_string_set(
+                criteria.unit_compliance_types_json,
+                invalid_marker="__INVALID_MASTER_VALUE__",
+            )
+        }
+        if selected_types:
+            for version, rule, criteria in active_rules:
+                configured_types = _json_string_set(
+                    criteria.unit_compliance_types_json,
+                    invalid_marker="__INVALID_MASTER_VALUE__",
+                )
+                if configured_types & selected_types:
+                    candidates.setdefault((rule.id, version.id), (version, rule, criteria, True))
+        rule_candidates = list(candidates.values())
+    else:
+        # Contractor and Contractor Site applicability remains unchanged.
+        rule_candidates = [(*row, True) for row in active_rules]
+
+    for version, rule, criteria, match_unit_compliance_type in rule_candidates:
         # Checklist imports without a configured scheduling rule are retained
         # in the Master but must not produce an invented legal due date.
         if version.due_date_rule.upper() == "MANUAL":
@@ -232,7 +286,12 @@ def generate_for_subject(db: Session, organization_id: str, subject_type: str, s
             continue
         if not applies_in_month(version, period_date):
             continue
-        applicable, explanation = evaluate(version, criteria, subject)
+        applicable, explanation = evaluate(
+            version,
+            criteria,
+            subject,
+            include_unit_compliance_type=match_unit_compliance_type,
+        )
         db.add(ApplicabilityEvaluation(
             organization_id=organization_id, subject_type=subject_type, subject_id=subject_id,
             rule_version_id=version.id, applicable=applicable, explanation_json=json.dumps(explanation),
@@ -280,6 +339,81 @@ def generate_for_subject(db: Session, organization_id: str, subject_type: str, s
         audit(db, organization_id=organization_id, actor_id=actor_id, action="GENERATE_COMPLIANCE", module="COMPLIANCE", entity_type="ComplianceInstance", entity_id=instance.id, new={"rule": rule.compliance_id, "period": key})
         existing_keys.add((version.id, key))
         created.append(instance)
+    return created
+
+
+def generate_history_for_subject(
+    db: Session,
+    organization_id: str,
+    subject_type: str,
+    subject_id: str,
+    as_of: date,
+    actor_id: str | None = None,
+) -> list[ComplianceInstance]:
+    """Backfill applicable periods from an entity's compliance start date.
+
+    Entity creation and later edits must not discard obligations that became
+    due before the current scheduler run.  We generate only relevant calendar
+    boundaries for each active frequency and rely on the stable
+    rule-version/period key in ``generate_for_subject`` for idempotency.
+    The scheduled job intentionally continues to call the current-period
+    function directly.
+    """
+    model = SUBJECTS.get(subject_type)
+    if not model:
+        raise HTTPException(422, "Unsupported compliance subject type")
+    subject = db.get(model, subject_id)
+    if not subject or subject.organization_id != organization_id:
+        raise HTTPException(404, "Compliance subject not found")
+    if subject.status != "ACTIVE":
+        return []
+    start = getattr(subject, "compliance_start_date", None) or getattr(subject, "effective_date", None)
+    if not start or start > as_of:
+        return generate_for_subject(db, organization_id, subject_type, subject_id, as_of, actor_id)
+
+    frequencies = {
+        normalize_frequency(version.frequency)
+        for version, _rule, _criteria in active_versions(db, organization_id, as_of)
+    }
+    run_dates = {start, as_of}
+
+    def add_days(step: timedelta) -> None:
+        cursor = start
+        while cursor <= as_of:
+            run_dates.add(cursor)
+            cursor += step
+
+    if "DAILY" in frequencies:
+        add_days(timedelta(days=1))
+    if "WEEKLY" in frequencies:
+        cursor = start + timedelta(days=(7 - start.weekday()) % 7)
+        while cursor <= as_of:
+            run_dates.add(cursor)
+            cursor += timedelta(days=7)
+    if "MONTHLY" in frequencies:
+        cursor = start.replace(day=1)
+        while cursor <= as_of:
+            run_dates.add(cursor)
+            cursor = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
+    if "QUARTERLY" in frequencies:
+        cursor = date(start.year, ((start.month - 1) // 3) * 3 + 1, 1)
+        while cursor <= as_of:
+            run_dates.add(cursor)
+            month = cursor.month + 3
+            cursor = date(cursor.year + (month > 12), ((month - 1) % 12) + 1, 1)
+    if "HALF_YEARLY" in frequencies:
+        cursor = date(start.year, 1 if start.month <= 6 else 7, 1)
+        while cursor <= as_of:
+            run_dates.add(cursor)
+            month = cursor.month + 6
+            cursor = date(cursor.year + (month > 12), ((month - 1) % 12) + 1, 1)
+    if "ANNUAL" in frequencies:
+        for year in range(start.year, as_of.year + 1):
+            run_dates.add(date(year, 1, 1))
+
+    created: list[ComplianceInstance] = []
+    for run_date in sorted(run_dates):
+        created.extend(generate_for_subject(db, organization_id, subject_type, subject_id, run_date, actor_id))
     return created
 
 

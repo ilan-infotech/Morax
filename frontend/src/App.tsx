@@ -53,8 +53,6 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   X,
-  Eye,
-  EyeOff,
   MessageSquarePlus,
   FileSpreadsheet,
   KeyRound,
@@ -325,7 +323,6 @@ export function UserProfileDropdown({ user, logout, organizationName }: { user: 
 function Login({ done }: { done: (user: User) => void }) {
   const [email, setEmail] = useState("admin@morax.example.com");
   const [password, setPassword] = useState("Admin@123");
-  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -374,22 +371,12 @@ function Login({ done }: { done: (user: User) => void }) {
         </label>
         <label>
           Password
-          <span className="password-input">
-            <input
-              type={showPassword ? "text" : "password"}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-            <button
-              type="button"
-              className="password-visibility-toggle"
-              onClick={() => setShowPassword((visible) => !visible)}
-              aria-label={showPassword ? "Hide password" : "Show password"}
-              title={showPassword ? "Hide password" : "Show password"}
-            >
-              {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
-            </button>
-          </span>
+          <PasswordInput
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete="current-password"
+            required
+          />
         </label>
         <ErrorBox text={error} />
         <button>Sign in</button>
@@ -1040,20 +1027,11 @@ function Organizations({ user }: { user: User }) {
     }
     try {
       if (!editing) {
-        const availability = await morax.emailAvailable(form.organization_admin_email);
+        const availability = await morax.emailAvailable(form.organization_admin_email, undefined, undefined, true);
         if (!availability.available) {
           setError("Email ID already exists.");
           return;
         }
-      }
-      const contactAvailability = await morax.emailAvailable(
-        form.primary_contact_email,
-        editing ? "ORGANIZATION" : undefined,
-        editing || undefined,
-      );
-      if (!contactAvailability.available) {
-        setError("Email ID already exists.");
-        return;
       }
       const request = payload(form);
       delete request.organization_admin_password_confirmation;
@@ -1151,11 +1129,11 @@ function Organizations({ user }: { user: User }) {
               </label>
               <label>
                 Organization Admin password
-                <input type="password" value={form.organization_admin_password} onChange={(e) => setForm({ ...form, organization_admin_password: e.target.value })} minLength={8} autoComplete="new-password" required />
+                <PasswordInput value={form.organization_admin_password} onChange={(e) => setForm({ ...form, organization_admin_password: e.target.value })} minLength={8} autoComplete="new-password" required />
               </label>
               <label>
                 Confirm Organization Admin password
-                <input type="password" value={form.organization_admin_password_confirmation} onChange={(e) => setForm({ ...form, organization_admin_password_confirmation: e.target.value })} minLength={8} autoComplete="new-password" required />
+                <PasswordInput value={form.organization_admin_password_confirmation} onChange={(e) => setForm({ ...form, organization_admin_password_confirmation: e.target.value })} minLength={8} autoComplete="new-password" required />
               </label>
             </>
           )}
@@ -1393,6 +1371,7 @@ function OrganizationLanding({
   const [deleteCode, setDeleteCode] = useState("");
   const [resetting, setResetting] = useState(false);
   const [deletingOrganization, setDeletingOrganization] = useState(false);
+  const [savingOrganization, setSavingOrganization] = useState(false);
   const [adminReplacementPassword, setAdminReplacementPassword] = useState("");
   const [adminReplacementPasswordConfirmation, setAdminReplacementPasswordConfirmation] = useState("");
   const [adminPasswordError, setAdminPasswordError] = useState("");
@@ -1496,26 +1475,19 @@ function OrganizationLanding({
   };
   async function save(event: FormEvent) {
     event.preventDefault();
+    if (savingOrganization) return;
     if (!editing && form.organization_admin_password !== form.organization_admin_password_confirmation) {
       setError("Organization Admin passwords do not match");
       return;
     }
+    setSavingOrganization(true);
     try {
       if (!editing) {
-        const availability = await morax.emailAvailable(form.organization_admin_email);
+        const availability = await morax.emailAvailable(form.organization_admin_email, undefined, undefined, true);
         if (!availability.available) {
           setError("Email ID already exists.");
           return;
         }
-      }
-      const contactAvailability = await morax.emailAvailable(
-        form.primary_contact_email,
-        editing ? "ORGANIZATION" : undefined,
-        editing || undefined,
-      );
-      if (!contactAvailability.available) {
-        setError("Email ID already exists.");
-        return;
       }
       const request = payload(form);
       delete request.organization_admin_password_confirmation;
@@ -1524,9 +1496,11 @@ function OrganizationLanding({
       else await morax.createPlatformOrganization(request);
       setError("Success: Organization saved");
       closeForm();
-      load();
+      await load();
     } catch (err) {
       setError(message(err));
+    } finally {
+      setSavingOrganization(false);
     }
   }
 
@@ -1777,7 +1751,7 @@ function OrganizationLanding({
             <div>
               <h2>{editing ? "Edit organization" : "Create organization"}</h2>
             </div>
-            <button className="secondary" onClick={closeForm}>
+            <button className="secondary" type="button" disabled={savingOrganization} onClick={closeForm}>
               Cancel
             </button>
           </div>
@@ -2009,10 +1983,10 @@ function OrganizationLanding({
               />
             </label>
             <div className="action-row">
-              <button>
-                {editing ? "Save changes" : "Create organization"}
+              <button disabled={savingOrganization}>
+                {savingOrganization ? "Saving…" : editing ? "Save changes" : "Create organization"}
               </button>
-              <button type="button" className="secondary" onClick={closeForm}>
+              <button type="button" className="secondary" disabled={savingOrganization} onClick={closeForm}>
                 Cancel
               </button>
             </div>

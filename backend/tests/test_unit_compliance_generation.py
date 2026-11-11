@@ -15,17 +15,17 @@ from app.models import (
     State,
     Unit,
 )
-from app.services.compliance import calculate_due_date, compliance_display_status, evaluate, generate_for_subject, period_end, period_for, period_start
+from app.services.compliance import calculate_due_date, compliance_display_status, evaluate, generate_for_subject, generate_history_for_subject, period_end, period_for, period_start
 from scripts.replace_compliance_master import unit_compliance_types
 
 
-def test_master_classifier_does_not_treat_determine_as_mines():
+def test_master_classifier_expands_all_covered_establishments_without_mines_inference():
     assert unit_compliance_types(
         "Central",
         "ALL COVERED ESTABLISHMENTS",
         "Determine Professional Tax applicability",
         "Local-body provisions",
-    ) == []
+    ) == ["Shops & Establishments", "Mines", "BOCW", "ESI", "PF"]
     assert unit_compliance_types(
         "SHOPS",
         "SHOPS & ESTABLISHMENTS",
@@ -40,7 +40,7 @@ def test_master_classifier_does_not_treat_determine_as_mines():
     ) == ["Mines"]
 
 
-def test_unit_compliance_type_is_the_first_applicability_gate():
+def test_unit_compliance_type_is_ignored_for_main_unit_applicability():
     version = type("Version", (), {"id": "version-1"})()
     criteria = type(
         "Criteria",
@@ -67,14 +67,86 @@ def test_unit_compliance_type_is_the_first_applicability_gate():
         },
     )()
 
-    applicable, explanation = evaluate(version, criteria, unit)
-    assert applicable is False
-    assert explanation["matched"]["unit_compliance_type"] is False
-
-    unit.compliance_types_json = json.dumps(["PF", "ESI"])
-    applicable, explanation = evaluate(version, criteria, unit)
+    applicable, explanation = evaluate(
+        version,
+        criteria,
+        unit,
+        include_unit_compliance_type=False,
+    )
     assert applicable is True
     assert explanation["matched"]["unit_compliance_type"] is True
+    assert explanation["unit_compliance_type_mode"] == "IGNORED_FOR_MAIN"
+
+
+def test_unit_generation_retains_main_rules_and_merges_type_candidates_once():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        master = Organization(name="MORAX Platform", code="SYSTEM", status="CONFIGURED", is_system=True)
+        customer = Organization(name="Example Company", code="EXAMPLE", status="ACTIVE")
+        state = State(name="Tamil Nadu", code="TN")
+        industry = IndustryType(name="IT Services", code="IT")
+        db.add_all([master, customer, state, industry])
+        db.flush()
+
+        typed_unit = Unit(
+            organization_id=customer.id, name="Typed Unit", code="TYPED-001",
+            employer_name="Example Company", industry_type_id=industry.id, state_id=state.id,
+            compliance_types_json=json.dumps(["ESI", "PF"]),
+            compliance_start_date=date(2026, 1, 1), status="ACTIVE",
+        )
+        plain_unit = Unit(
+            organization_id=customer.id, name="Plain Unit", code="PLAIN-001",
+            employer_name="Example Company", industry_type_id=industry.id, state_id=state.id,
+            compliance_types_json="[]", compliance_start_date=date(2026, 1, 1), status="ACTIVE",
+        )
+        single_type_unit = Unit(
+            organization_id=customer.id, name="PF Unit", code="PF-001",
+            employer_name="Example Company", industry_type_id=industry.id, state_id=state.id,
+            compliance_types_json=json.dumps(["PF"]), compliance_start_date=date(2026, 1, 1), status="ACTIVE",
+        )
+        db.add_all([typed_unit, plain_unit, single_type_unit])
+        db.flush()
+
+        def add_rule(compliance_id: str, unit_types: list[str]):
+            rule = ComplianceRule(organization_id=master.id, compliance_id=compliance_id)
+            db.add(rule)
+            db.flush()
+            version = ComplianceRuleVersion(
+                rule_id=rule.id, version=1, name=compliance_id, frequency="ONE_TIME",
+                due_date_rule="DAYS_AFTER_PERIOD_END", due_date_offset=1,
+                effective_from=date(2026, 1, 1), active=True,
+            )
+            db.add(version)
+            db.flush()
+            db.add(RuleApplicabilityCriteria(
+                rule_version_id=version.id, entity_type="UNIT", state_id=state.id,
+                unit_compliance_types_json=json.dumps(unit_types),
+            ))
+            return version
+
+        universal = add_rule("UNIVERSAL", [])
+        pf = add_rule("PF-ADD-ON", ["PF"])
+        esi = add_rule("ESI-ADD-ON", ["ESI"])
+        mines = add_rule("MINES-UNMATCHED", ["Mines"])
+        db.commit()
+
+        typed_created = generate_for_subject(db, customer.id, "UNIT", typed_unit.id, date(2026, 11, 6))
+        db.commit()
+        # Main eligibility is never removed by PF/ESI classification, and
+        # matching add-ons are merged by rule/version ID without duplication.
+        assert {item.rule_version_id for item in typed_created} == {universal.id, pf.id, esi.id}
+        assert len(typed_created) == 3
+        assert generate_for_subject(db, customer.id, "UNIT", typed_unit.id, date(2026, 11, 6)) == []
+
+        plain_created = generate_for_subject(db, customer.id, "UNIT", plain_unit.id, date(2026, 11, 6))
+        db.commit()
+        # With no selected types only main (untyped) compliance is generated.
+        assert {item.rule_version_id for item in plain_created} == {universal.id}
+
+        single_type_created = generate_for_subject(db, customer.id, "UNIT", single_type_unit.id, date(2026, 11, 6))
+        db.commit()
+        assert {item.rule_version_id for item in single_type_created} == {universal.id, pf.id}
 
 
 def test_monthly_generation_creates_previous_month_due_on_day_15_once():
@@ -183,6 +255,30 @@ def test_monthly_generation_creates_previous_month_due_on_day_15_once():
             ("2026-11-02", date(2026, 11, 3)),
             ("2026-W45", date(2026, 11, 10)),
         }
+
+
+def test_history_generation_backfills_each_month_without_duplicates():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        master = Organization(name="MORAX Platform", code="SYSTEM", status="CONFIGURED", is_system=True)
+        customer = Organization(name="Example Company", code="EXAMPLE", status="ACTIVE")
+        state = State(name="Tamil Nadu", code="TN")
+        industry = IndustryType(name="IT Services", code="IT")
+        db.add_all([master, customer, state, industry]); db.flush()
+        unit = Unit(organization_id=customer.id, name="Historic Unit", code="HIST-001", employer_name="Example Company", industry_type_id=industry.id, state_id=state.id, compliance_start_date=date(2026, 7, 1), status="ACTIVE")
+        rule = ComplianceRule(organization_id=master.id, compliance_id="HIST-MONTHLY")
+        db.add_all([unit, rule]); db.flush()
+        version = ComplianceRuleVersion(rule_id=rule.id, version=1, name="Historic monthly return", frequency="MONTHLY", due_date_rule="FIXED_DAY_OF_MONTH", due_date_offset=15, effective_from=date(2026, 1, 1), active=True)
+        db.add(version); db.flush()
+        db.add(RuleApplicabilityCriteria(rule_version_id=version.id, entity_type="UNIT", state_id=state.id, industry_type_id=industry.id))
+        db.commit()
+
+        created = generate_history_for_subject(db, customer.id, "UNIT", unit.id, date(2026, 11, 10))
+        db.commit()
+        assert [item.period_key for item in created] == ["2026-07", "2026-08", "2026-09", "2026-10"]
+        assert [item.due_date for item in created] == [date(2026, 8, 15), date(2026, 9, 15), date(2026, 10, 15), date(2026, 11, 15)]
+        assert generate_history_for_subject(db, customer.id, "UNIT", unit.id, date(2026, 11, 10)) == []
 
 
 def test_date_aware_statuses_are_derived_consistently():

@@ -29,7 +29,7 @@ from app.models import (
     UserRoleScope,
 )
 from app.services.qa_dataset import seed_qa_demo_workspace
-from app.services.compliance import generate_for_subject
+from app.services.compliance import generate_for_subject, generate_history_for_subject
 from app.services.notifications import schedule_compliance_reminders, schedule_register_reminders, schedule_license_reminders
 
 
@@ -355,13 +355,14 @@ def seed_baseline() -> None:
         db.close()
 
 
-def generate_scheduled_unit_compliance(run_date: date | None = None) -> int:
+def generate_scheduled_unit_compliance(run_date: date | None = None, *, backfill_history: bool = False) -> int:
     """Idempotently create due obligations for every active compliance subject.
 
     The function name is retained for compatibility with existing scripts.  A
     contractor or contractor-site rule must receive the same recurring cycle
     as a unit rule; otherwise those users could receive reminders only for
-    manually generated records.
+    manually generated records.  The scheduler's first run after process
+    startup reconciles older periods; later runs remain current-cycle only.
     """
     db = SessionLocal()
     created = []
@@ -386,9 +387,8 @@ def generate_scheduled_unit_compliance(run_date: date | None = None) -> int:
                         model.status == "ACTIVE",
                     )
                 ):
-                    created.extend(
-                        generate_for_subject(db, organization.id, subject_type, subject.id, run_date)
-                    )
+                    generator = generate_history_for_subject if backfill_history else generate_for_subject
+                    created.extend(generator(db, organization.id, subject_type, subject.id, run_date))
         db.commit()
         return len(created)
     except Exception:
@@ -421,8 +421,13 @@ def generate_scheduled_compliance_notifications(run_date: date | None = None) ->
 
 async def compliance_scheduler() -> None:
     """Run on startup and periodically; database uniqueness keeps it idempotent."""
+    reconcile_history = True
     while True:
-        created = await asyncio.to_thread(generate_scheduled_unit_compliance)
+        created = await asyncio.to_thread(
+            generate_scheduled_unit_compliance,
+            backfill_history=reconcile_history,
+        )
+        reconcile_history = False
         notifications_created = await asyncio.to_thread(generate_scheduled_compliance_notifications)
         if created:
             logger.info("Scheduled compliance generation created %s obligations", created)

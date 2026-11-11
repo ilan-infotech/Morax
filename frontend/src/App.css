@@ -552,13 +552,13 @@
   color: #64748b;
 }
 
-.password-input { position: relative; display: block; }
-.password-input input { width: 100%; padding-right: 2.8rem; }
+.password-input { position: relative; isolation: isolate; display: block; width: 100%; }
+.password-input input { position: relative; z-index: 1; width: 100%; padding-right: 2.8rem; }
 .password-visibility-toggle {
   position: absolute; top: 50%; right: 0.65rem; display: inline-grid;
-  width: 2rem; height: 2rem; place-items: center; padding: 0;
+  z-index: 2; width: 2rem; min-height: 2rem; height: 2rem; place-items: center; padding: 0;
   color: #475569; background: transparent; border: 0; border-radius: 0.4rem;
-  cursor: pointer; transform: translateY(-50%);
+  cursor: pointer; pointer-events: auto; touch-action: manipulation; transform: translateY(-50%);
 }
 .password-visibility-toggle:hover, .password-visibility-toggle:focus-visible {
   color: #2a3620; background: #eef2e8; outline: none;
@@ -1178,6 +1178,7 @@ nav a.active {
 
 .filter-grid label,
 .form-grid label,
+.form-grid .field-control,
 .login-card label {
   display: grid;
   gap: 0.4rem;
@@ -3759,6 +3760,20 @@ textarea:focus-visible {
   line-height: 1.5;
 }
 
+.crud-page .entity-management-header {
+  width: 100%;
+  min-height: 112px;
+  padding: 1.1rem 1.25rem;
+  border: 1px solid #dce8d8;
+  border-radius: 0.9rem;
+  background: linear-gradient(120deg, #fbfdf9 0%, #f1f7ef 100%);
+  box-shadow: 0 1px 2px rgb(31 58 39 / 5%);
+}
+
+.crud-page .entity-management-header .action-row {
+  justify-content: flex-end;
+}
+
 .primary-action {
   color: #F5F5DC;
   background: #424B35;
@@ -4808,6 +4823,11 @@ textarea:focus-visible {
   box-shadow: 0 0 0 1px rgb(220 38 38 / 18%);
 }
 
+.form-grid .field-control.has-error :is(input, select, textarea) {
+  border-color: #dc2626;
+  box-shadow: 0 0 0 1px rgb(220 38 38 / 18%);
+}
+
 .capacity-helper {
   display: block;
   min-height: 1.25rem;
@@ -5686,3 +5706,53 @@ button:disabled {
 .license-dialog-body .license-form-grid :is(input, select, textarea):required {
   border-left: 3px solid #b45309;
 }
+
+/* Shared MORAX form-dialog treatment. Entity create/edit and Compliance Master
+   revisions use the same green header, spacing and scroll behaviour as License
+   Management without changing their form logic. */
+.workspace-form-backdrop{z-index:300!important;inset:0!important;display:grid;place-items:center;padding:1rem;overflow:hidden;background:rgb(15 23 42 / 42%)}
+.workspace-form{display:flex;flex-direction:column;width:min(1100px,100%)!important;height:auto;min-height:0!important;max-height:calc(100dvh - 2rem);overflow:hidden;border:0!important;border-radius:1rem!important;background:#fff!important;box-shadow:0 20px 60px rgb(15 23 42 / 35%)!important}
+.workspace-form .drawer-heading,.workspace-form.compliance-master-workspace-form .drawer-heading{flex:none;padding:1rem 1.15rem;background:linear-gradient(115deg,#234332,#5e8b5b)!important;color:#fff!important;border:0!important}
+.workspace-form .drawer-icon,.workspace-form.compliance-master-workspace-form .drawer-icon{display:grid!important;color:#fff;background:rgb(255 255 255 / 16%)}
+.workspace-form .drawer-heading p,.workspace-form.compliance-master-workspace-form .drawer-heading p{display:block!important;margin:.25rem 0 0!important;color:#e8f1e7!important;font-size:.76rem!important}
+.workspace-form .drawer-heading h2,.workspace-form.compliance-master-workspace-form .drawer-heading h2{color:#fff!important;font-size:1.1rem!important;font-weight:750!important}
+.workspace-form .drawer-heading .icon-action{color:#fff;border-color:rgb(255 255 255 / 35%);background:transparent}
+.workspace-form .entity-form{min-height:0;overflow:auto;padding:1rem 1.15rem 0!important}
+.workspace-form .form-section,.workspace-form.compliance-master-workspace-form .form-section{background:#fbfcf9;border-color:#e5eadd}
+.workspace-form .drawer-footer{flex:none;margin:0!important;padding:.75rem 1.15rem!important;background:#fff}
+.contractor-import-summary{display:flex;gap:.45rem;flex-wrap:wrap}.contractor-import-summary span{padding:.35rem .55rem;border:1px solid #dbe7d7;border-radius:999px;background:#f5faf3;color:#34503a;font-size:.76rem}.contractor-import-summary b{color:#234332}
+.import-mode-grid label.selected,.import-mode-grid label.selected.danger{background:#f0f6ee;border-color:#8daf86;box-shadow:0 0 0 2px rgb(141 175 134 / 16%);color:#234332}.import-mode-grid label.selected b{color:#234332}.import-mode-grid label.selected small{color:#45624a}
+.checker-entity-selector{gap:.28rem;min-width:190px;padding:.4rem .5rem .45rem;border:1px solid #d9e5d5;border-radius:.85rem;background:linear-gradient(145deg,#fff,#f8fbf7);box-shadow:0 1px 2px rgb(31 58 39 / 5%)}.checker-entity-selector>span{padding-left:.15rem;color:#5b7160;font-size:.64rem;letter-spacing:.045em;text-transform:uppercase}.checker-entity-selector select{min-height:30px;padding:.15rem 1.75rem .15rem .32rem;border:0!important;border-radius:.45rem;background-color:transparent;color:#234332;font-size:.8rem;font-weight:750;box-shadow:none!important;cursor:pointer}.checker-entity-selector select:focus-visible{outline:2px solid rgb(94 139 91 / 55%);outline-offset:2px}
+.checker-view-tabs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.28rem;min-width:325px;padding:.28rem;border:1px solid #d9e5d5;border-radius:.9rem;background:#f6f9f4;box-shadow:inset 0 1px 0 #fff,0 1px 2px rgb(31 58 39 / 5%)}.checker-view-tab{display:flex;align-items:center;gap:.5rem;min-width:0;min-height:45px;padding:.42rem .55rem;border:1px solid transparent;border-radius:.65rem;color:#4a6250;text-decoration:none;transition:background .16s ease,border-color .16s ease,box-shadow .16s ease,color .16s ease}.checker-view-tab:hover{background:#eef5ec;color:#234332}.checker-view-tab.active{border-color:#c8dbc3;background:#fff;color:#234332;box-shadow:0 1px 2px rgb(31 58 39 / 8%)}.checker-view-tab-icon{display:grid;flex:0 0 1.8rem;width:1.8rem;height:1.8rem;place-items:center;border-radius:.55rem;background:#e8f1e5;color:#477348}.checker-view-tab.active .checker-view-tab-icon{background:#dcecd8;color:#234332}.checker-view-tab-copy{display:grid;min-width:0;gap:.08rem;line-height:1.1}.checker-view-tab-copy strong{overflow:hidden;font-size:.74rem;font-weight:780;text-overflow:ellipsis;white-space:nowrap}.checker-view-tab-copy small{overflow:hidden;color:#718275;font-size:.64rem;font-weight:600;text-overflow:ellipsis;white-space:nowrap}.checker-view-tab:focus-visible{outline:3px solid rgb(94 139 91 / 45%);outline-offset:2px}
+@media(max-width:640px){.workspace-form-backdrop{padding:0}.workspace-form{width:100%!important;height:100%;max-height:100vh;border-radius:0!important}.workspace-form .entity-form{padding:.85rem}.checker-entity-selector,.checker-view-tabs{width:100%;min-width:0}.checker-view-tab{justify-content:center;padding:.42rem}.checker-view-tab-copy small{display:none}.contractor-import-summary span{flex:1;text-align:center}}
+
+/* Checkboxes and radio controls must not inherit the large text-input focus
+   halo. Keep their native compact control and a restrained, accessible ring. */
+input[type="checkbox"],input[type="radio"]{width:1rem!important;height:1rem!important;min-height:0!important;padding:0!important;flex:0 0 1rem;accent-color:#5e8b5b;cursor:pointer}
+input[type="checkbox"]:hover:not(:disabled),input[type="radio"]:hover:not(:disabled),input[type="checkbox"]:focus,input[type="radio"]:focus{border-color:initial;box-shadow:none!important}
+input[type="checkbox"]:focus-visible,input[type="radio"]:focus-visible{outline:2px solid rgb(94 139 91 / 55%)!important;outline-offset:2px;box-shadow:none!important}
+
+/* A Compliance Type option has a deliberately non-interactive container.
+   Only its checkbox and text label can change selection. */
+.compliance-type-option{display:inline-flex;align-items:center;gap:.35rem;padding:.45rem .65rem;border:1px solid #dbe5d5;border-radius:.45rem;background:#f8fbf6}
+.compliance-type-option label{display:inline;cursor:pointer}
+
+/* Composite checkbox fields are non-label containers. Only the native
+   checkbox and its own label are interactive, so blank field space cannot
+   accidentally toggle the first option. */
+.field-control .checkbox-group{cursor:default}
+.workspace-form .drawer-heading{align-items:center}
+.workspace-form .drawer-heading>div{min-width:0;align-items:center}
+.workspace-form .drawer-heading>div>div{min-width:0}
+.workspace-form .drawer-icon{flex:0 0 38px;align-self:center}
+.workspace-form .drawer-heading h2{line-height:1.2}
+.workspace-form .drawer-heading p{line-height:1.35}
+
+/* Unit and Contractor create/edit forms are workspace pages, not dialogs.
+   Keep the long assignment area in the normal document flow. */
+.entity-page-form-backdrop{position:static!important;z-index:auto!important;inset:auto!important;display:block!important;padding:0!important;overflow:visible!important;background:transparent!important}
+.entity-page-form{width:100%!important;height:auto!important;max-height:none!important;min-height:0!important;overflow:visible!important;border:1px solid #dfe8da!important;border-radius:.85rem!important;box-shadow:none!important}
+.entity-page-form .entity-form{overflow:visible!important;max-height:none!important;padding:1rem 1.15rem 0!important}
+
+.rule-detail-section{margin-bottom:1rem}.rule-detail-section:last-child{margin-bottom:0}.rule-detail-section .dialog-detail-grid dd{white-space:pre-wrap;overflow-wrap:anywhere}.rule-detail-section .dialog-detail-grid>div{background:#fbfcf9;border-color:#e1eadc}
+.compliance-master-detail-drawer{width:min(1180px,calc(100vw - 2rem));overflow:hidden}.compliance-master-detail-drawer>.drawer-heading{position:sticky;top:0;z-index:1;padding:1rem 1.15rem;background:linear-gradient(115deg,#234332,#5e8b5b);border:0;color:#fff}.compliance-master-detail-drawer>.drawer-heading h2{color:#fff}.compliance-master-detail-drawer>.drawer-heading p{color:#e8f1e7}.compliance-master-detail-drawer>.drawer-heading .icon-action{color:#fff;border-color:rgb(255 255 255 / 35%);background:transparent}.compliance-master-detail-drawer>.entity-form{max-height:calc(100dvh - 10rem);overflow:auto;padding:1rem 1.15rem 1.25rem}.compliance-master-detail-drawer .dialog-detail-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:.7rem}.compliance-master-detail-drawer .dialog-detail-grid .wide{grid-column:1/-1}@media(max-width:860px){.compliance-master-detail-drawer .dialog-detail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:560px){.compliance-master-detail-drawer{width:100%;max-height:100dvh;border-radius:0}.compliance-master-detail-drawer .dialog-detail-grid{grid-template-columns:1fr}.compliance-master-detail-drawer .dialog-detail-grid .wide{grid-column:auto}}

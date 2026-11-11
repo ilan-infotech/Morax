@@ -2,12 +2,18 @@ import csv
 import io
 import json
 import re
+from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
+from itertools import combinations
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from openpyxl import Workbook, load_workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.workbook.defined_name import DefinedName
+from openpyxl.worksheet.datavalidation import DataValidation
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -18,8 +24,11 @@ from app.db.session import get_db
 from app.models import (
     ApplicabilityEvaluation, AuditLog, AuthSession, City, ComplianceAssignment, ComplianceComment, ComplianceEvidence, ComplianceImport, ContractorDocument, InAppNotification,
     ComplianceImportError, ComplianceImportRow, ComplianceInstance, ComplianceRule, ComplianceRuleVersion, ComplianceSubmission,
-    ComplianceWorkflowHistory, Contractor, ContractorImport, ContractorImportRow, ContractorSite, IndustryType, Organization, RuleApplicabilityCriteria,
-    State, SupportTicket, SupportTicketActivity, SupportTicketAttachment, SupportTicketMessage, Unit, User, UserActivation, UserPermissionGrant, UserRoleScope,
+    ComplianceWorkflowHistory, Contractor, ContractorImport, ContractorImportRow, ContractorSite, GeneratedRegister, IndustryType, LicenseComplianceLink,
+    LicenseComplianceMapping, LicenseDocument, LicenseRecord, LicenseRenewal, LicenseType, Organization, RegisterAttendance, RegisterColumnMapping,
+    RegisterComplianceLink, RegisterEmployee, RegisterPayroll, RegisterTemplate, RegisterTemplateVersion, RegisterUploadBatch, RegisterWorkflowHistory,
+    RuleApplicabilityCriteria, State, SupportTicket, SupportTicketActivity, SupportTicketAttachment, SupportTicketMessage, Unit, User, UserActivation,
+    UserPermissionGrant, UserRoleScope,
 )
 from app.schemas import (
     AccountActivationInput, ActivityInput, AdministratorPasswordResetInput, AssignmentInput, CommentInput, ContractorContextInput, ContractorInput, ContractorSiteInput, EntityUserAssignmentInput, GenerationRequest,
@@ -29,7 +38,7 @@ from app.schemas import (
 from app.services.access import CHECKER_ROLES, MAKER_ROLES, MODULE_PERMISSION_CHOICES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, contractor_context_for_user, current_user, has_permission, is_org_admin, platform_master_organization_id, require_org_admin, roles_for, scopes_for, user_summary
 from app.services.audit import audit
 from app.services.activation import activate_account
-from app.services.compliance import SUBJECTS, assert_assignment_or_admin, compliance_display_status, generate_for_subject, submit, transition
+from app.services.compliance import SUBJECTS, assert_assignment_or_admin, compliance_display_status, generate_for_subject, generate_history_for_subject, submit, transition
 from app.services.location_master import ensure_cities_for_state, ensure_states
 from app.services.notifications import assignment_recipients, emit_notification, notify_compliance_event
 from app.services.serialization import entity_dict, instance_dict, model_dict
@@ -80,6 +89,17 @@ def email_is_in_use(
         if db.scalar(query.limit(1)):
             return True
     return False
+
+
+def login_email_is_in_use(db: Session, email: str, exclude_user_id: str | None = None) -> bool:
+    """Check the unique namespace used by sign-in accounts only."""
+    normalized = email.strip().lower()
+    if not normalized:
+        return False
+    query = select(User.id).where(func.lower(User.email) == normalized)
+    if exclude_user_id:
+        query = query.where(User.id != exclude_user_id)
+    return db.scalar(query.limit(1)) is not None
 
 
 def organization_dict(organization: Organization) -> dict:
@@ -637,6 +657,21 @@ def entity_page(
         "states": {s.id: s for s in db.scalars(select(State))},
         "industries": {i.id: i for i in db.scalars(select(IndustryType))},
     }
+    if entity_type == "CONTRACTOR" and rows:
+        makers_by_contractor: dict[str, list[User]] = defaultdict(list)
+        maker_rows = db.execute(
+            select(UserRoleScope.scope_id, User)
+            .join(User, User.id == UserRoleScope.user_id)
+            .where(
+                UserRoleScope.role == "CONTRACTOR_MAKER",
+                UserRoleScope.scope_type == "CONTRACTOR",
+                UserRoleScope.scope_id.in_([row.id for row in rows]),
+            )
+            .order_by(UserRoleScope.scope_id, User.name, User.id)
+        ).all()
+        for contractor_id, maker in maker_rows:
+            makers_by_contractor[contractor_id].append(maker)
+        cache["contractor_makers"] = makers_by_contractor
     return {
         "items": [entity_dict(db, row, entity_type, cache=cache) for row in rows],
         "total": total,
@@ -653,6 +688,8 @@ def parse_bool(value, default=True):
 
 def parse_applicable_months(value) -> list[int]:
     if value in (None, ""):
+        return []
+    if str(value).strip().upper() in {"ALL", "ALL MONTHS", "*"}:
         return []
     if isinstance(value, (list, tuple)):
         values = value
@@ -674,12 +711,38 @@ def parse_unit_compliance_types(value) -> list[str]:
         text = str(item).strip()
         if not text:
             continue
+        # Excel imports can use this business shorthand instead of listing all
+        # five controlled values. Persist the real values so the Master form
+        # reopens with every Unit Compliance Type checkbox selected.
+        if text.casefold() == "all covered establishments":
+            for canonical in sorted(UNIT_COMPLIANCE_TYPES):
+                if canonical not in normalized:
+                    normalized.append(canonical)
+            continue
         canonical = aliases.get(text.lower())
         if not canonical:
             raise HTTPException(422, f"Unsupported Unit Compliance Type: {text}")
         if canonical not in normalized:
             normalized.append(canonical)
     return normalized
+
+
+def master_lookup_key(value: object) -> str:
+    """Normalize harmless master-data formatting differences, not meaning.
+
+    Excel often represents ``Tamil Nadu`` as ``Tamilnadu``. Removing spacing
+    and punctuation makes those two canonical forms equivalent while
+    continuing to reject unrelated State names.
+    """
+    return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
+
+
+def state_import_lookup(db: Session) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for state in db.scalars(select(State)):
+        lookup[master_lookup_key(state.name)] = state.id
+        lookup[master_lookup_key(state.code)] = state.id
+    return lookup
 
 
 def stage_construction_checklist(workbook, organization_id: str, user: User, db: Session) -> dict:
@@ -925,10 +988,13 @@ def email_availability(
     email: str,
     exclude_type: str | None = None,
     exclude_id: str | None = None,
+    login_only: bool = False,
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ):
     del user  # Authentication is required even though the lookup is global.
+    if login_only:
+        return {"available": not login_email_is_in_use(db, email, exclude_id if exclude_type == "USER" else None)}
     return {"available": not email_is_in_use(db, email, exclude_type, exclude_id)}
 
 
@@ -964,11 +1030,11 @@ def create_platform_organization(payload: PlatformOrganizationInput, user: User 
     if db.scalar(select(Organization).where(Organization.code == code)):
         raise HTTPException(409, "Organization code already exists")
     admin_email = str(payload.organization_admin_email).lower()
-    if email_is_in_use(db, admin_email):
+    if login_email_is_in_use(db, admin_email):
         raise HTTPException(409, "Email ID already exists.")
-    contact_email = str(payload.primary_contact_email).lower() if payload.primary_contact_email else None
-    if contact_email and (contact_email == admin_email or email_is_in_use(db, contact_email)):
-        raise HTTPException(409, "Email ID already exists.")
+    # A primary contact is not a login identity.  Organizations may share a
+    # receptionist, consultant, or group mailbox, so only the Organization
+    # Admin/login email is globally unique.
     if payload.state_id and not db.get(State, payload.state_id):
         raise HTTPException(422, "State must be a configured master value")
     validate_organization_city(db, payload.state_id, payload.city)
@@ -1177,16 +1243,62 @@ def delete_platform_organization(
     rule_version_ids = list(db.scalars(select(ComplianceRuleVersion.id).where(ComplianceRuleVersion.rule_id.in_(rule_ids)))) if rule_ids else []
     import_ids = list(db.scalars(select(ComplianceImport.id).where(ComplianceImport.organization_id == organization.id)))
     import_row_ids = list(db.scalars(select(ComplianceImportRow.id).where(ComplianceImportRow.import_id.in_(import_ids)))) if import_ids else []
+    contractor_import_ids = list(db.scalars(select(ContractorImport.id).where(ContractorImport.organization_id == organization.id)))
+    register_template_ids = list(db.scalars(select(RegisterTemplate.id).where(RegisterTemplate.organization_id == organization.id)))
+    register_template_version_ids = list(db.scalars(select(RegisterTemplateVersion.id).where(RegisterTemplateVersion.template_id.in_(register_template_ids)))) if register_template_ids else []
+    generated_register_ids = list(db.scalars(select(GeneratedRegister.id).where(GeneratedRegister.organization_id == organization.id)))
+    register_upload_ids = list(db.scalars(select(RegisterUploadBatch.id).where(RegisterUploadBatch.organization_id == organization.id)))
+    register_upload_files = list(db.scalars(select(RegisterUploadBatch.stored_filename).where(RegisterUploadBatch.id.in_(register_upload_ids)))) if register_upload_ids else []
+    license_ids = list(db.scalars(select(LicenseRecord.id).where(LicenseRecord.organization_id == organization.id)))
+    license_type_ids = list(db.scalars(select(LicenseType.id).where(LicenseType.organization_id == organization.id)))
+    license_document_files = list(db.scalars(select(LicenseDocument.stored_filename).where(LicenseDocument.license_id.in_(license_ids)))) if license_ids else []
+    support_ticket_ids = list(db.scalars(select(SupportTicket.id).where(SupportTicket.organization_id == organization.id)))
+    support_attachment_files = list(db.scalars(select(SupportTicketAttachment.stored_filename).where(SupportTicketAttachment.ticket_id.in_(support_ticket_ids)))) if support_ticket_ids else []
     tenant_user_ids = list(db.scalars(select(User.id).where(User.organization_id == organization.id)))
     tenant_session_ids = list(db.scalars(select(AuthSession.id).where(AuthSession.user_id.in_(tenant_user_ids)))) if tenant_user_ids else []
     evidence_files = list(db.scalars(select(ComplianceEvidence.stored_filename).join(ComplianceInstance, ComplianceEvidence.instance_id == ComplianceInstance.id).where(ComplianceInstance.organization_id == organization.id)))
     contractor_document_files = list(db.scalars(select(ContractorDocument.stored_filename).join(Contractor, ContractorDocument.contractor_id == Contractor.id).where(Contractor.organization_id == organization.id)))
+    organization_logo_files = [organization.logo_filename] if organization.logo_filename else []
 
     def remove(statement) -> int:
         return max(db.execute(statement).rowcount or 0, 0)
 
     deleted: dict[str, int] = {}
     try:
+        # Registers and licenses can reference compliance instances, units,
+        # users, templates, and uploads. Remove their dependent rows before
+        # deleting the shared tenant entities below.
+        if generated_register_ids:
+            deleted["register_compliance_links"] = remove(delete(RegisterComplianceLink).where(RegisterComplianceLink.register_id.in_(generated_register_ids)))
+            deleted["register_workflow_history"] = remove(delete(RegisterWorkflowHistory).where(RegisterWorkflowHistory.register_id.in_(generated_register_ids)))
+            db.execute(update(GeneratedRegister).where(GeneratedRegister.supersedes_id.in_(generated_register_ids)).values(supersedes_id=None))
+            deleted["generated_registers"] = remove(delete(GeneratedRegister).where(GeneratedRegister.id.in_(generated_register_ids)))
+        deleted["register_employees"] = remove(delete(RegisterEmployee).where(RegisterEmployee.organization_id == organization.id))
+        deleted["register_attendance"] = remove(delete(RegisterAttendance).where(RegisterAttendance.organization_id == organization.id))
+        deleted["register_payroll"] = remove(delete(RegisterPayroll).where(RegisterPayroll.organization_id == organization.id))
+        if register_upload_ids:
+            deleted["register_uploads"] = remove(delete(RegisterUploadBatch).where(RegisterUploadBatch.id.in_(register_upload_ids)))
+        deleted["register_mappings"] = remove(delete(RegisterColumnMapping).where(RegisterColumnMapping.organization_id == organization.id))
+        if register_template_version_ids:
+            deleted["register_template_versions"] = remove(delete(RegisterTemplateVersion).where(RegisterTemplateVersion.id.in_(register_template_version_ids)))
+        if register_template_ids:
+            deleted["register_templates"] = remove(delete(RegisterTemplate).where(RegisterTemplate.id.in_(register_template_ids)))
+
+        if license_ids:
+            deleted["license_compliance_links"] = remove(delete(LicenseComplianceLink).where(LicenseComplianceLink.license_id.in_(license_ids)))
+            deleted["license_documents"] = remove(delete(LicenseDocument).where(LicenseDocument.license_id.in_(license_ids)))
+            deleted["license_renewals"] = remove(delete(LicenseRenewal).where(LicenseRenewal.license_id.in_(license_ids)))
+            deleted["license_records"] = remove(delete(LicenseRecord).where(LicenseRecord.id.in_(license_ids)))
+        deleted["license_compliance_mappings"] = remove(delete(LicenseComplianceMapping).where(LicenseComplianceMapping.organization_id == organization.id))
+        if license_type_ids:
+            deleted["license_types"] = remove(delete(LicenseType).where(LicenseType.id.in_(license_type_ids)))
+
+        if support_ticket_ids:
+            deleted["support_ticket_attachments"] = remove(delete(SupportTicketAttachment).where(SupportTicketAttachment.ticket_id.in_(support_ticket_ids)))
+            deleted["support_ticket_messages"] = remove(delete(SupportTicketMessage).where(SupportTicketMessage.ticket_id.in_(support_ticket_ids)))
+            deleted["support_ticket_activity"] = remove(delete(SupportTicketActivity).where(SupportTicketActivity.ticket_id.in_(support_ticket_ids)))
+            deleted["support_tickets"] = remove(delete(SupportTicket).where(SupportTicket.id.in_(support_ticket_ids)))
+
         if instance_ids:
             deleted["evidence"] = remove(delete(ComplianceEvidence).where(ComplianceEvidence.instance_id.in_(instance_ids)))
             deleted["comments"] = remove(delete(ComplianceComment).where(ComplianceComment.instance_id.in_(instance_ids)))
@@ -1203,6 +1315,9 @@ def delete_platform_organization(
         if import_ids:
             deleted["import_rows"] = remove(delete(ComplianceImportRow).where(ComplianceImportRow.import_id.in_(import_ids)))
             deleted["imports"] = remove(delete(ComplianceImport).where(ComplianceImport.id.in_(import_ids)))
+        if contractor_import_ids:
+            deleted["contractor_import_rows"] = remove(delete(ContractorImportRow).where(ContractorImportRow.import_id.in_(contractor_import_ids)))
+            deleted["contractor_imports"] = remove(delete(ContractorImport).where(ContractorImport.id.in_(contractor_import_ids)))
         if rule_version_ids:
             deleted["rule_criteria"] = remove(delete(RuleApplicabilityCriteria).where(RuleApplicabilityCriteria.rule_version_id.in_(rule_version_ids)))
             deleted["rule_versions"] = remove(delete(ComplianceRuleVersion).where(ComplianceRuleVersion.id.in_(rule_version_ids)))
@@ -1254,9 +1369,24 @@ def delete_platform_organization(
         db.rollback()
         raise
 
-    for stored_filename in {*evidence_files, *contractor_document_files}:
+    for stored_filename in {
+        *evidence_files,
+        *contractor_document_files,
+        *license_document_files,
+        *support_attachment_files,
+        *register_upload_files,
+        *organization_logo_files,
+    }:
         delete_stored_file(stored_filename)
-    return {"ok": True, "message": "Organization and all related data were permanently deleted.", "deleted": deleted, "files_deleted": len(set(evidence_files) | set(contractor_document_files))}
+    deleted_files = {
+        *evidence_files,
+        *contractor_document_files,
+        *license_document_files,
+        *support_attachment_files,
+        *register_upload_files,
+        *organization_logo_files,
+    }
+    return {"ok": True, "message": "Organization and all related data were permanently deleted.", "deleted": deleted, "files_deleted": len(deleted_files)}
 
 
 @router.post("/platform/organizations/{organization_id}/development-reset")
@@ -1623,8 +1753,6 @@ def update_organization(payload: OrganizationInput, user: User = Depends(current
     organization_id = org_for(user)
     require_org_admin(db, user, organization_id)
     organization = db.get(Organization, organization_id)
-    if payload.contact_email and email_is_in_use(db, str(payload.contact_email), "ORGANIZATION", organization.id):
-        raise HTTPException(409, "Email ID already exists.")
     if payload.state_id and not db.get(State, payload.state_id):
         raise HTTPException(422, "State must be a configured master value")
     validate_organization_city(db, payload.state_id, payload.city)
@@ -1664,8 +1792,6 @@ def create_unit(payload: UnitInput, user: User = Depends(current_user), db: Sess
     payload.code = (payload.code or "").strip().upper() or generated_code(db, Unit, payload.name, "UNIT", organization_id)
     if db.scalar(select(Unit).where(Unit.organization_id == organization_id, Unit.code == payload.code)):
         raise HTTPException(409, "A unit with this code already exists in the organization")
-    if payload.contact_email and email_is_in_use(db, str(payload.contact_email)):
-        raise HTTPException(409, "Email ID already exists.")
     if not db.get(State, payload.state_id) or not db.get(IndustryType, payload.industry_type_id):
         raise HTTPException(422, "State and industry type must be configured master values")
     payload.city_id, payload.city = resolve_city(db, payload.state_id, payload.city_id, payload.city)
@@ -1674,7 +1800,7 @@ def create_unit(payload: UnitInput, user: User = Depends(current_user), db: Sess
     unit = Unit(organization_id=organization_id, compliance_types_json=json.dumps(payload.compliance_types), **values)
     db.add(unit)
     db.flush()
-    generate_for_subject(db, organization_id, "UNIT", unit.id, date.today(), user.id)
+    generate_history_for_subject(db, organization_id, "UNIT", unit.id, date.today(), user.id)
     audit(db, organization_id=organization_id, actor_id=user.id, action="CREATE_UNIT", module="ENTITIES", entity_type="Unit", entity_id=unit.id, new={"name": unit.name, "code": unit.code})
     commit_or_conflict(db, "A unit with this code already exists in the organization")
     return entity_dict(db, unit, "UNIT")
@@ -1687,8 +1813,6 @@ def update_unit(unit_id: str, payload: UnitInput, user: User = Depends(current_u
         raise HTTPException(404, "Unit not found")
     require_permission(db, user, "entities.manage")
     payload.effective_date = payload.effective_date or unit.effective_date or payload.compliance_start_date
-    if payload.contact_email and email_is_in_use(db, str(payload.contact_email), "UNIT", unit.id):
-        raise HTTPException(409, "Email ID already exists.")
     payload.code = (payload.code or unit.code).strip().upper()
     if db.scalar(select(Unit).where(Unit.organization_id == unit.organization_id, Unit.code == payload.code, Unit.id != unit.id)):
         raise HTTPException(409, "A unit with this code already exists in the organization")
@@ -1700,7 +1824,7 @@ def update_unit(unit_id: str, payload: UnitInput, user: User = Depends(current_u
     values = payload.model_dump(exclude={"compliance_types"})
     for key, value in values.items(): setattr(unit, key, value)
     unit.compliance_types_json = json.dumps(payload.compliance_types)
-    generate_for_subject(db, unit.organization_id, "UNIT", unit.id, date.today(), user.id)
+    generate_history_for_subject(db, unit.organization_id, "UNIT", unit.id, date.today(), user.id)
     audit(db, organization_id=unit.organization_id, actor_id=user.id, action="UPDATE_UNIT", module="ENTITIES", entity_type="Unit", entity_id=unit.id, old=old, new={"industry_type_id": unit.industry_type_id, "other_industry_name": unit.other_industry_name, "state_id": unit.state_id, "status": unit.status})
     commit_or_conflict(db, "A unit with this code already exists in the organization")
     return entity_dict(db, unit, "UNIT")
@@ -1756,7 +1880,22 @@ def list_contractors(paginated: bool = False, page: int = 1, page_size: int = 50
         "states": {s.id: s for s in db.scalars(select(State))},
         "industries": {i.id: i for i in db.scalars(select(IndustryType))},
     }
-    return [entity_dict(db, row, "CONTRACTOR", cache=cache) for row in db.scalars(select(Contractor).where(Contractor.organization_id == org).order_by(Contractor.name)) if can_access_subject(db, user, org, "CONTRACTOR", row.id)]
+    rows = [row for row in db.scalars(select(Contractor).where(Contractor.organization_id == org).order_by(Contractor.name)) if can_access_subject(db, user, org, "CONTRACTOR", row.id)]
+    if rows:
+        makers_by_contractor: dict[str, list[User]] = defaultdict(list)
+        for contractor_id, maker in db.execute(
+            select(UserRoleScope.scope_id, User)
+            .join(User, User.id == UserRoleScope.user_id)
+            .where(
+                UserRoleScope.role == "CONTRACTOR_MAKER",
+                UserRoleScope.scope_type == "CONTRACTOR",
+                UserRoleScope.scope_id.in_([row.id for row in rows]),
+            )
+            .order_by(UserRoleScope.scope_id, User.name, User.id)
+        ).all():
+            makers_by_contractor[contractor_id].append(maker)
+        cache["contractor_makers"] = makers_by_contractor
+    return [entity_dict(db, row, "CONTRACTOR", cache=cache) for row in rows]
 
 
 @router.get("/contractors/{contractor_id}")
@@ -1844,7 +1983,7 @@ def create_contractor_record(payload: ContractorInput, user: User, db: Session, 
         db.add(UserRoleScope(user_id=contractor_maker.id, role="CONTRACTOR_MAKER", scope_type="CONTRACTOR", scope_id=contractor.id))
         if reusing_contractor_maker:
             audit(db, organization_id=org, actor_id=user.id, action="REUSE_CONTRACTOR_MAKER", module="USERS", entity_type="User", entity_id=contractor_maker.id, new={"email": maker_email, "contractor_id": contractor.id, "role": "CONTRACTOR_MAKER"})
-    generate_for_subject(db, org, "CONTRACTOR", contractor.id, date.today(), user.id)
+    generate_history_for_subject(db, org, "CONTRACTOR", contractor.id, date.today(), user.id)
     configure_contractor_assignments(db, contractor, contractor_maker.id if contractor_maker else None, payload.checker_user_id, user.id)
     audit(db, organization_id=org, actor_id=user.id, action="CREATE_CONTRACTOR", module="ENTITIES", entity_type="Contractor", entity_id=contractor.id, new={"name": contractor.name})
     if commit:
@@ -1867,6 +2006,24 @@ CONTRACTOR_IMPORT_HEADERS = [
     "Work Order Expiry Date", "Status",
 ]
 CONTRACTOR_IMPORT_REQUIRED_HEADERS = {"Contractor Name", "Contractor Code", "Principal Employer Code", "Maker Email"}
+
+
+def contractor_import_summary(rows: list[ContractorImportRow]) -> dict[str, int]:
+    """Return UI-facing import counts without trusting client supplied IDs."""
+    summary = {"new_contractors": 0, "existing_contractors": 0, "records_to_update": 0, "unchanged_records": 0}
+    for staged in rows:
+        if not staged.valid:
+            continue
+        payload = json.loads(staged.payload_json)
+        if payload.get("_existing_contractor_id"):
+            summary["existing_contractors"] += 1
+            if payload.get("_changed"):
+                summary["records_to_update"] += 1
+            else:
+                summary["unchanged_records"] += 1
+        else:
+            summary["new_contractors"] += 1
+    return summary
 
 
 def contractor_import_for(db: Session, user: User, import_id: str) -> ContractorImport:
@@ -1922,12 +2079,15 @@ def contractor_import_payload(
     for field, item in (("Contractor Name", name), ("Contractor Code", code), ("Principal Employer Code", unit_code), ("Maker Email", maker_email)):
         if not item:
             errors.append({"field": field, "message": "Value is required"})
+    existing = None
     if code:
         if code in seen_codes:
             errors.append({"field": "Contractor Code", "message": "Duplicate Contractor Code in this workbook"})
         seen_codes.add(code)
-        if db.scalar(select(Contractor.id).where(Contractor.organization_id == organization_id, Contractor.code == code)):
-            errors.append({"field": "Contractor Code", "message": "A contractor with this code already exists in this organization"})
+        # Contractor code is the stable, tenant-owned matching identifier. An
+        # existing code is therefore an update candidate, never a cross-tenant
+        # reference and never an automatic duplicate error.
+        existing = db.scalar(select(Contractor).where(Contractor.organization_id == organization_id, Contractor.code == code))
     unit = db.scalar(select(Unit).where(Unit.organization_id == organization_id, func.upper(Unit.code) == unit_code, Unit.status == "ACTIVE")) if unit_code else None
     if unit_code and not unit:
         errors.append({"field": "Principal Employer Code", "message": "No active Unit with this code exists in the organization"})
@@ -1952,7 +2112,7 @@ def contractor_import_payload(
     if industry and industry.code.upper() == "OTHER":
         errors.append({"field": "Industry Code", "message": "Other industry requires manual configuration and cannot be bulk imported"})
     contact_email = value("Contact Email").lower() or None
-    if contact_email and email_is_in_use(db, contact_email):
+    if contact_email and email_is_in_use(db, contact_email, "CONTRACTOR", existing.id if existing else None):
         errors.append({"field": "Contact Email", "message": "Email ID already exists"})
     male_workers = import_nonnegative_int(source.get("Male Workers"), "Male Workers", errors)
     female_workers = import_nonnegative_int(source.get("Female Workers"), "Female Workers", errors)
@@ -1972,7 +2132,7 @@ def contractor_import_payload(
         "work_order_expiry_date": import_date(source.get("Work Order Expiry Date"), "Work Order Expiry Date", errors), "status": status,
     }
     if unit and not errors and status == "ACTIVE" and unit.worker_limit is not None:
-        allocated = sum(item.total_workers for item in db.scalars(select(Contractor).where(Contractor.organization_id == organization_id, Contractor.unit_id == unit.id, Contractor.status == "ACTIVE")))
+        allocated = sum(item.total_workers for item in db.scalars(select(Contractor).where(Contractor.organization_id == organization_id, Contractor.unit_id == unit.id, Contractor.status == "ACTIVE")) if not existing or item.id != existing.id)
         proposed = male_workers + female_workers
         if allocated + pending_workers.get(unit.id, 0) + proposed > unit.worker_limit:
             errors.append({"field": "Male Workers/Female Workers", "message": f"Worker limit exceeded for {unit.code}"})
@@ -1985,6 +2145,21 @@ def contractor_import_payload(
             # serialization, but the staged import needs the trusted Maker ID
             # resolved during validation in order to use the normal create flow.
             row["maker_user_id"] = maker.id if maker else None
+            row["_existing_contractor_id"] = existing.id if existing else None
+            row["_provided_fields"] = [
+                field for field, header in {
+                    "name": "Contractor Name", "unit_id": "Principal Employer Code", "maker_user_id": "Maker Email",
+                    "state_id": "State Code", "city": "City / District", "contractor_type": "Contractor Type",
+                    "industry_type_id": "Industry Code", "contact_email": "Contact Email", "contact_phone": "Contact Phone",
+                    "address": "Address", "pincode": "Pincode", "gstin": "GSTIN", "pan": "PAN", "lin": "LIN",
+                    "male_workers": "Male Workers", "female_workers": "Female Workers", "contract_start_date": "Contract Start Date",
+                    "contract_end_date": "Contract End Date", "compliance_start_date": "Compliance Start Date",
+                    "work_order_expiry_date": "Work Order Expiry Date", "status": "Status",
+                }.items() if import_text(source.get(header))
+            ]
+            if existing:
+                compare_fields = [field for field in row["_provided_fields"] if field != "maker_user_id"]
+                row["_changed"] = any(str(getattr(existing, field, "") or "") != str(row.get(field, "") or "") for field in compare_fields)
     except Exception as exc:
         errors.append({"field": "Contractor details", "message": str(exc).split("\n")[-1]})
     return row, errors
@@ -2007,6 +2182,48 @@ def contractor_import_template(user: User = Depends(current_user), db: Session =
     instructions.column_dimensions["A"].width = 130
     output = io.BytesIO(); workbook.save(output); output.seek(0)
     return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=morax-contractor-import-template.xlsx"})
+
+
+@router.get("/contractor-imports/export.xlsx")
+def export_contractors(q: str | None = None, status: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Export only the current tenant's authorized contractors in import format."""
+    organization_id = org_for(user)
+    require_permission(db, user, "entities.read")
+    query = select(Contractor).where(Contractor.organization_id == organization_id)
+    if status:
+        query = query.where(Contractor.status == status)
+    if q:
+        needle = f"%{q.strip()}%"
+        query = query.where(or_(Contractor.name.ilike(needle), Contractor.code.ilike(needle)))
+    contractors = [item for item in db.scalars(query.order_by(Contractor.name)) if can_access_subject(db, user, organization_id, "CONTRACTOR", item.id)]
+    units = {item.id: item for item in db.scalars(select(Unit).where(Unit.organization_id == organization_id))}
+    states = {item.id: item for item in db.scalars(select(State))}
+    industries = {item.id: item for item in db.scalars(select(IndustryType))}
+    makers = {
+        scope.scope_id: account.email
+        for scope, account in db.execute(
+            select(UserRoleScope, User).join(User, User.id == UserRoleScope.user_id).where(
+                UserRoleScope.role == "CONTRACTOR_MAKER", UserRoleScope.scope_type == "CONTRACTOR", User.organization_id == organization_id,
+            )
+        )
+    }
+    workbook = Workbook(); sheet = workbook.active; sheet.title = "Contractors"; sheet.append(CONTRACTOR_IMPORT_HEADERS)
+    for contractor in contractors:
+        unit, state, industry = units.get(contractor.unit_id), states.get(contractor.state_id), industries.get(contractor.industry_type_id)
+        sheet.append([safe_excel_cell(value) for value in [
+            contractor.name, contractor.code, unit.code if unit else "", makers.get(contractor.id, ""),
+            state.code if state else "", contractor.city, contractor.contractor_type, industry.code if industry else "",
+            contractor.contact_email, contractor.contact_phone, contractor.address, contractor.pincode, contractor.gstin,
+            contractor.pan, contractor.lin, contractor.male_workers, contractor.female_workers, contractor.contract_start_date,
+            contractor.contract_end_date, contractor.compliance_start_date, contractor.work_order_expiry_date, contractor.status,
+        ]])
+    for cell in sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF"); cell.fill = PatternFill("solid", fgColor="234332"); cell.alignment = Alignment(horizontal="center")
+    sheet.freeze_panes = "A2"
+    for column in sheet.columns:
+        sheet.column_dimensions[column[0].column_letter].width = min(32, max(14, max(len(import_text(cell.value)) for cell in column) + 2))
+    output = io.BytesIO(); workbook.save(output); output.seek(0)
+    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=morax-contractors-export.xlsx"})
 
 
 @router.post("/contractor-imports/validate")
@@ -2038,7 +2255,8 @@ async def validate_contractor_import(file: UploadFile = File(...), user: User = 
     record.total_rows, record.valid_rows, record.error_rows = total, valid, errors
     audit(db, organization_id=organization_id, actor_id=user.id, action="VALIDATE_CONTRACTOR_IMPORT", module="ENTITIES", entity_type="ContractorImport", entity_id=record.id, new={"total": total, "valid": valid, "errors": errors})
     db.commit()
-    return {"id": record.id, "total_rows": total, "valid_rows": valid, "error_rows": errors}
+    rows = list(db.scalars(select(ContractorImportRow).where(ContractorImportRow.import_id == record.id)))
+    return {"id": record.id, "total_rows": total, "valid_rows": valid, "error_rows": errors, **contractor_import_summary(rows)}
 
 
 @router.get("/contractor-imports/{import_id}/preview")
@@ -2048,7 +2266,7 @@ def contractor_import_preview(import_id: str, user: User = Depends(current_user)
         {"row_number": row.row_number, "valid": row.valid, "data": json.loads(row.payload_json), "errors": json.loads(row.errors_json)}
         for row in db.scalars(select(ContractorImportRow).where(ContractorImportRow.import_id == record.id).order_by(ContractorImportRow.row_number))
     ]
-    return {"import": model_dict(record, [field.name for field in record.__table__.columns]), "rows": rows}
+    return {"import": model_dict(record, [field.name for field in record.__table__.columns]), "rows": rows, **contractor_import_summary(list(db.scalars(select(ContractorImportRow).where(ContractorImportRow.import_id == record.id))))}
 
 
 def safe_excel_cell(value: object) -> object:
@@ -2076,18 +2294,48 @@ def contractor_import_validation_report(import_id: str, user: User = Depends(cur
 
 
 @router.post("/contractor-imports/{import_id}/confirm")
-def confirm_contractor_import(import_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def confirm_contractor_import(import_id: str, user: User = Depends(current_user), db: Session = Depends(get_db), mode: str = "MERGE"):
     record = contractor_import_for(db, user, import_id)
+    mode = mode.upper()
+    if mode not in {"MERGE", "REPLACE"}:
+        raise HTTPException(422, "Import mode must be MERGE or REPLACE")
     if record.status != "VALIDATED":
         raise HTTPException(409, "This contractor import has already been applied")
+    if record.error_rows:
+        raise HTTPException(422, "Correct all invalid contractor rows and validate the workbook again before importing")
     rows = list(db.scalars(select(ContractorImportRow).where(ContractorImportRow.import_id == record.id, ContractorImportRow.valid.is_(True)).order_by(ContractorImportRow.row_number)))
     if not rows:
         raise HTTPException(422, "No valid contractor rows are available to import")
     try:
+        created = updated = unchanged = 0
         for row in rows:
-            create_contractor_record(ContractorInput(**json.loads(row.payload_json)), user, db, commit=False)
+            payload = json.loads(row.payload_json)
+            existing_id = payload.pop("_existing_contractor_id", None)
+            provided_fields = set(payload.pop("_provided_fields", []))
+            changed = bool(payload.pop("_changed", False))
+            if not existing_id:
+                create_contractor_record(ContractorInput(**payload), user, db, commit=False)
+                created += 1
+                continue
+            contractor = db.get(Contractor, existing_id)
+            if not contractor or contractor.organization_id != record.organization_id:
+                raise HTTPException(409, "A matched contractor is no longer available in this organization")
+            if not changed:
+                unchanged += 1
+                continue
+            # MERGE preserves empty spreadsheet cells. REPLACE intentionally
+            # applies them to editable fields, while both modes preserve IDs,
+            # assignments, compliance history and audit records.
+            current = {field: getattr(contractor, field) for field in ContractorInput.model_fields if hasattr(contractor, field)}
+            editable = set(ContractorInput.model_fields) - {"code", "maker_new_user", "contractor_maker_email", "contractor_maker_password", "checker_user_id"}
+            for field in editable:
+                if field in payload and (mode == "REPLACE" or field in provided_fields):
+                    current[field] = payload[field]
+            current["code"] = contractor.code
+            _update_contractor_record(contractor.id, ContractorInput(**current), user, db, commit=False)
+            updated += 1
         record.status, record.imported_rows, record.confirmed_at = "CONFIRMED", len(rows), datetime.now(UTC)
-        audit(db, organization_id=record.organization_id, actor_id=user.id, action="CONFIRM_CONTRACTOR_IMPORT", module="ENTITIES", entity_type="ContractorImport", entity_id=record.id, new={"imported": len(rows), "invalid": record.error_rows})
+        audit(db, organization_id=record.organization_id, actor_id=user.id, action="CONFIRM_CONTRACTOR_IMPORT", module="ENTITIES", entity_type="ContractorImport", entity_id=record.id, new={"mode": mode, "created": created, "updated": updated, "unchanged": unchanged, "invalid": record.error_rows})
         db.commit()
     except HTTPException as exc:
         db.rollback()
@@ -2095,11 +2343,10 @@ def confirm_contractor_import(import_id: str, user: User = Depends(current_user)
     except Exception:
         db.rollback()
         raise
-    return {"id": record.id, "imported": len(rows), "invalid": record.error_rows}
+    return {"id": record.id, "imported": len(rows), "created": created, "updated": updated, "unchanged": unchanged, "invalid": record.error_rows}
 
 
-@router.patch("/contractors/{contractor_id}")
-def update_contractor(contractor_id: str, payload: ContractorInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def _update_contractor_record(contractor_id: str, payload: ContractorInput, user: User, db: Session, *, commit: bool = True):
     contractor = db.get(Contractor, contractor_id)
     if not contractor or contractor.organization_id != org_for(user):
         raise HTTPException(404, "Contractor not found")
@@ -2120,10 +2367,19 @@ def update_contractor(contractor_id: str, payload: ContractorInput, user: User =
     validate_worker_capacity(db, principal_employer, payload.male_workers + payload.female_workers, contractor.id)
     payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
     for key, value in payload.model_dump(exclude={"contractor_maker_email", "contractor_maker_password"}).items(): setattr(contractor, key, value)
-    generate_for_subject(db, contractor.organization_id, "CONTRACTOR", contractor.id, date.today(), user.id)
+    generate_history_for_subject(db, contractor.organization_id, "CONTRACTOR", contractor.id, date.today(), user.id)
     configure_contractor_assignments(db, contractor, payload.maker_user_id, payload.checker_user_id, user.id)
     audit(db, organization_id=contractor.organization_id, actor_id=user.id, action="UPDATE_CONTRACTOR", module="ENTITIES", entity_type="Contractor", entity_id=contractor.id, new={"name": contractor.name, "status": contractor.status})
-    commit_or_conflict(db, "A contractor with this code already exists in the organization"); return entity_dict(db, contractor, "CONTRACTOR")
+    if commit:
+        commit_or_conflict(db, "A contractor with this code already exists in the organization")
+    else:
+        db.flush()
+    return entity_dict(db, contractor, "CONTRACTOR")
+
+
+@router.patch("/contractors/{contractor_id}")
+def update_contractor(contractor_id: str, payload: ContractorInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    return _update_contractor_record(contractor_id, payload, user, db)
 
 
 @router.delete("/contractors/{contractor_id}")
@@ -2443,6 +2699,28 @@ COMPLIANCE_MASTER_HEADERS = [
     "Effective From", "Effective To", "Active",
 ]
 
+COMPLIANCE_TEMPLATE_MAX_ROWS = 1000
+COMPLIANCE_TYPE_CHOICES = ("RETURN", "REGISTER", "PAYMENT", "LICENSE", "CERTIFICATE", "NOTICE", "DISPLAY", "OTHER")
+FREQUENCY_CHOICES = ("ONE_TIME", "DAILY", "WEEKLY", "MONTHLY", "QUARTERLY", "HALF_YEARLY", "ANNUAL", "EVENT_BASED")
+DUE_DATE_RULE_CHOICES = ("FIXED_DAY_OF_MONTH", "DAYS_AFTER_PERIOD_END", "FIXED_ANNUAL_DATE", "ONE_TIME_CONFIGURED_DATE", "MANUAL")
+RISK_LEVEL_CHOICES = ("LOW", "MEDIUM", "HIGH", "CRITICAL")
+MONTH_CHOICES = ("ALL MONTHS", *(str(month) for month in range(1, 13)), "3,6,9,12", "6,12")
+UNIT_COMPLIANCE_TYPE_CHOICES = (
+    "ALL COVERED ESTABLISHMENTS",
+    *(",".join(items)
+      for size in range(1, len(UNIT_COMPLIANCE_TYPES) + 1)
+      for items in combinations(("Shops & Establishments", "Mines", "BOCW", "ESI", "PF"), size)),
+)
+
+
+def parse_import_date(value: object) -> date:
+    """Accept native Excel dates as well as ISO dates in controlled imports."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value).strip())
+
 
 def style_compliance_workbook(worksheet) -> None:
     header_fill = PatternFill("solid", fgColor="34452A")
@@ -2457,6 +2735,137 @@ def style_compliance_workbook(worksheet) -> None:
         letter = column[0].column_letter
         longest = max(len(str(cell.value or "")) for cell in column)
         worksheet.column_dimensions[letter].width = min(max(longest + 2, 12), 42)
+
+
+def _add_compliance_reference_list(workbook: Workbook, sheet, column: int, name: str, values: list[str] | tuple[str, ...]) -> str | None:
+    cleaned = list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+    if not cleaned:
+        return None
+    sheet.cell(row=1, column=column, value=name.replace("_", " ").title())
+    for row, value in enumerate(cleaned, start=2):
+        sheet.cell(row=row, column=column, value=value)
+    letter = get_column_letter(column)
+    workbook.defined_names.add(DefinedName(name, attr_text=f"'{sheet.title}'!${letter}$2:${letter}${len(cleaned) + 1}"))
+    return name
+
+
+def _add_list_validation(worksheet, cell_range: str, defined_name: str | None, *, allow_blank: bool = True) -> None:
+    if not defined_name:
+        return
+    validation = DataValidation(type="list", formula1=f"={defined_name}", allow_blank=allow_blank)
+    validation.errorTitle = "Use a configured value"
+    validation.error = "Choose a value from the template dropdown. The import will reject altered values."
+    validation.errorStyle = "stop"
+    validation.showErrorMessage = True
+    validation.showInputMessage = True
+    worksheet.add_data_validation(validation)
+    validation.add(cell_range)
+
+
+def _add_number_validation(worksheet, cell_range: str, *, minimum: int, allow_blank: bool = True) -> None:
+    validation = DataValidation(type="whole", operator="greaterThanOrEqual", formula1=str(minimum), allow_blank=allow_blank)
+    validation.errorTitle = "Invalid number"
+    validation.error = f"Enter a whole number of {minimum} or greater."
+    validation.errorStyle = "stop"
+    validation.showErrorMessage = True
+    worksheet.add_data_validation(validation)
+    validation.add(cell_range)
+
+
+def _add_date_validation(worksheet, cell_range: str, *, allow_blank: bool) -> None:
+    validation = DataValidation(type="date", operator="between", formula1="DATE(1900,1,1)", formula2="DATE(2100,12,31)", allow_blank=allow_blank)
+    validation.errorTitle = "Invalid date"
+    validation.error = "Enter a valid date between 1900 and 2100."
+    validation.errorStyle = "stop"
+    validation.showErrorMessage = True
+    worksheet.add_data_validation(validation)
+    validation.add(cell_range)
+
+
+def configure_compliance_workbook(workbook: Workbook, worksheet, db: Session) -> None:
+    """Add controlled dropdowns and guidance to Compliance Master workbooks."""
+    master_org = platform_master_organization_id(db)
+    acts = sorted({item.strip() for item in db.scalars(
+        select(ComplianceRuleVersion.act)
+        .join(ComplianceRule, ComplianceRuleVersion.rule_id == ComplianceRule.id)
+        .where(ComplianceRule.organization_id == master_org, ComplianceRuleVersion.act.is_not(None))
+    ) if item and item.strip()})
+    existing_compliance_types = sorted({item.strip().upper() for item in db.scalars(
+        select(ComplianceRuleVersion.compliance_type)
+        .join(ComplianceRule, ComplianceRuleVersion.rule_id == ComplianceRule.id)
+        .where(ComplianceRule.organization_id == master_org, ComplianceRuleVersion.compliance_type.is_not(None))
+    ) if item and item.strip()})
+    existing_risk_levels = sorted({item.strip().upper() for item in db.scalars(
+        select(ComplianceRuleVersion.risk_level)
+        .join(ComplianceRule, ComplianceRuleVersion.rule_id == ComplianceRule.id)
+        .where(ComplianceRule.organization_id == master_org, ComplianceRuleVersion.risk_level.is_not(None))
+    ) if item and item.strip()})
+    states = sorted({item.name for item in db.scalars(select(State)) if item.name})
+    industries = sorted({item.name for item in db.scalars(select(IndustryType)) if item.name})
+    reference = workbook.create_sheet("Reference Data")
+    reference.sheet_state = "veryHidden"
+    lists = {
+        "Acts": acts,
+        "Compliance_Types": (*COMPLIANCE_TYPE_CHOICES, *existing_compliance_types),
+        "Document_Types": DOCUMENT_TYPES,
+        "Entity_Types": ("UNIT", "CONTRACTOR", "CONTRACTOR_SITE"),
+        "States": states,
+        "Industry_Types": industries,
+        "Unit_Compliance_Types": UNIT_COMPLIANCE_TYPE_CHOICES,
+        "Frequencies": FREQUENCY_CHOICES,
+        "Applicable_Months": MONTH_CHOICES,
+        "Due_Date_Rules": DUE_DATE_RULE_CHOICES,
+        "Risk_Levels": (*RISK_LEVEL_CHOICES, *existing_risk_levels),
+        "Active_Values": ("TRUE", "FALSE"),
+    }
+    defined_names = {
+        name: _add_compliance_reference_list(workbook, reference, index, name, values)
+        for index, (name, values) in enumerate(lists.items(), start=1)
+    }
+    range_end = COMPLIANCE_TEMPLATE_MAX_ROWS + 1
+    column_ranges = {
+        "Acts": f"D2:D{range_end}", "Compliance_Types": f"G2:G{range_end}", "Document_Types": f"H2:H{range_end}",
+        "Entity_Types": f"M2:M{range_end}", "States": f"N2:N{range_end}", "Industry_Types": f"O2:O{range_end}",
+        "Unit_Compliance_Types": f"Q2:Q{range_end}", "Frequencies": f"R2:R{range_end}", "Applicable_Months": f"S2:S{range_end}",
+        "Due_Date_Rules": f"T2:T{range_end}", "Risk_Levels": f"X2:X{range_end}", "Active_Values": f"AA2:AA{range_end}",
+    }
+    for name, cell_range in column_ranges.items():
+        _add_list_validation(worksheet, cell_range, defined_names[name])
+    worksheet.auto_filter.ref = f"A1:AA{range_end}"
+    _add_number_validation(worksheet, f"L2:L{range_end}", minimum=1, allow_blank=False)
+    _add_number_validation(worksheet, f"P2:P{range_end}", minimum=0)
+    _add_number_validation(worksheet, f"U2:U{range_end}", minimum=0)
+    _add_date_validation(worksheet, f"Y2:Y{range_end}", allow_blank=False)
+    _add_date_validation(worksheet, f"Z2:Z{range_end}", allow_blank=True)
+    guidance = {
+        "Compliance ID": "Required unique business identifier. Use the same ID for later versions.",
+        "Compliance Type": "Controlled classification. It describes the rule; it does not filter Units.",
+        "Entity Type": "Controls whether the rule applies to a Unit, Contractor, or Contractor Site.",
+        "State": "Choose a configured State. Leave blank only when the rule is not State-specific.",
+        "Industry Type": "Choose a configured Industry. Leave blank only when the rule is not Industry-specific.",
+        "Unit Compliance Types": "For UNIT rules only. Leave blank for a universal Unit rule. ALL COVERED ESTABLISHMENTS selects all five controlled types.",
+        "Applicable Months": "Leave blank or choose ALL MONTHS for every period. Select a listed schedule for common annual/quarterly cycles.",
+        "Due Date Rule": "MANUAL keeps the rule in Master but does not generate an automatic due date.",
+        "Effective From": "Required. This controls the first period that may be generated.",
+    }
+    for index, header in enumerate(COMPLIANCE_MASTER_HEADERS, start=1):
+        if header in guidance:
+            worksheet.cell(row=1, column=index).comment = Comment(guidance[header], "MORAX")
+    guide = workbook.create_sheet("Read Me")
+    guide.append(["MORAX Compliance Master — Controlled Import Template"])
+    guide.append(["Use dropdown cells wherever available. Narrative and legal-text fields remain free text by design."])
+    guide.append(["Required columns", "Compliance ID, Compliance Name, Act, Version, Entity Type, Frequency, Due Date Rule, Effective From"])
+    guide.append(["Unit Compliance Types", "Leave blank for a universal Unit rule; ALL COVERED ESTABLISHMENTS expands to all five controlled Unit types."])
+    guide.append(["Applicable Months", "Leave blank or use ALL MONTHS for every period. Values are month numbers (1-12), separated by commas for specialised schedules."])
+    guide.append(["Safety", "Paste can bypass Excel dropdowns, so MORAX Validate still rejects invalid controlled values before Merge or Replace."])
+    guide.column_dimensions["A"].width = 30
+    guide.column_dimensions["B"].width = 110
+    guide["A1"].font = Font(bold=True, color="FFFFFF")
+    guide["A1"].fill = PatternFill("solid", fgColor="34452A")
+    guide.merge_cells("A1:B1")
+    for row in guide.iter_rows(min_row=2, max_col=2):
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
 
 
 def compliance_export_row(
@@ -2523,8 +2932,8 @@ def require_compliance_hard_delete_enabled() -> None:
 def compliance_template(user: User = Depends(current_user), db: Session = Depends(get_db)):
     require_platform_admin(user)
     workbook = Workbook(); worksheet = workbook.active; worksheet.title = "Compliance Master"; worksheet.append(COMPLIANCE_MASTER_HEADERS)
-    worksheet.append(["DEMO-HALF-YEARLY-001", "Half-yearly demonstration filing", "Example compliance description", "Example Act", "Rule 1", "Section 1", "STATUTORY_RETURN", "RETURN", "Form A", "Example legal description", "", 1, "UNIT", "Tamil Nadu", "Factory", 10, "PF,ESI", "HALF_YEARLY", "6,12", "FIXED_DAY_OF_MONTH", 15, "", "PT Return", "MEDIUM", "2026-01-01", "", "TRUE"])
     style_compliance_workbook(worksheet)
+    configure_compliance_workbook(workbook, worksheet, db)
     stream = io.BytesIO(); workbook.save(stream); stream.seek(0)
     return StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=compliance-master-template.xlsx"})
 
@@ -2546,6 +2955,7 @@ def export_compliance_master(user: User = Depends(current_user), db: Session = D
     for version, rule, criteria in rows:
         worksheet.append(compliance_export_row(version, rule, criteria, state_names, industry_names))
     style_compliance_workbook(worksheet)
+    configure_compliance_workbook(workbook, worksheet, db)
     notes = workbook.create_sheet("Export Summary")
     notes.append(["Exported at", datetime.now(UTC).isoformat()])
     notes.append(["Rule versions", len(rows)])
@@ -2782,7 +3192,17 @@ async def validate_import(file: UploadFile = File(...), user: User = Depends(cur
     if not required.issubset(set(headers)): raise HTTPException(422, f"Missing required headers: {', '.join(sorted(required - set(headers)))}")
     import_record = ComplianceImport(organization_id=master_org, uploaded_by_id=user.id, original_filename=file.filename or "compliance-master.xlsx")
     db.add(import_record); db.flush(); seen = set(); valid = errors = total = 0
-    states_by_name = {state.name.lower(): state.id for state in db.scalars(select(State))}; industries_by_name = {industry.name.lower(): industry.id for industry in db.scalars(select(IndustryType))}
+    states_by_name = state_import_lookup(db); industries_by_name = {industry.name.lower(): industry.id for industry in db.scalars(select(IndustryType))}
+    existing_compliance_types = {item.strip().upper() for item in db.scalars(
+        select(ComplianceRuleVersion.compliance_type)
+        .join(ComplianceRule, ComplianceRuleVersion.rule_id == ComplianceRule.id)
+        .where(ComplianceRule.organization_id == master_org, ComplianceRuleVersion.compliance_type.is_not(None))
+    ) if item and item.strip()}
+    existing_risk_levels = {item.strip().upper() for item in db.scalars(
+        select(ComplianceRuleVersion.risk_level)
+        .join(ComplianceRule, ComplianceRuleVersion.rule_id == ComplianceRule.id)
+        .where(ComplianceRule.organization_id == master_org, ComplianceRuleVersion.risk_level.is_not(None))
+    ) if item and item.strip()}
     for number, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
         if not any(value is not None and str(value).strip() for value in values): continue
         total += 1; row = {headers[index]: values[index] for index in range(len(headers))}; messages = []
@@ -2791,8 +3211,20 @@ async def validate_import(file: UploadFile = File(...), user: User = Depends(cur
         identity = (str(row.get("Compliance ID", "")).strip(), str(row.get("Version", "")).strip())
         if identity in seen: messages.append(("Compliance ID", "Duplicate Compliance ID and Version in uploaded file"))
         seen.add(identity)
-        if str(row.get("Entity Type", "")).upper() not in SUBJECTS: messages.append(("Entity Type", "Must be UNIT, CONTRACTOR, or CONTRACTOR_SITE"))
-        if str(row.get("Frequency", "")).upper() not in {"ONE_TIME", "DAILY", "WEEKLY", "MONTHLY", "QUARTERLY", "HALF_YEARLY", "HALF-YEARLY", "ANNUAL", "YEARLY", "EVENT_BASED"}: messages.append(("Frequency", "Unsupported frequency"))
+        entity_type = str(row.get("Entity Type", "")).strip().upper()
+        compliance_type = str(row.get("Compliance Type") or "").strip().upper()
+        document_type = str(row.get("Document Type") or "").strip().upper()
+        frequency = str(row.get("Frequency", "")).strip().upper()
+        due_date_rule = str(row.get("Due Date Rule", "")).strip().upper()
+        risk_level = str(row.get("Risk Level") or "MEDIUM").strip().upper()
+        active_value = str(row.get("Active") or "TRUE").strip().upper()
+        if entity_type not in SUBJECTS: messages.append(("Entity Type", "Must be UNIT, CONTRACTOR, or CONTRACTOR_SITE"))
+        if compliance_type and compliance_type not in {*COMPLIANCE_TYPE_CHOICES, *existing_compliance_types}: messages.append(("Compliance Type", "Choose a configured Compliance Type from the template"))
+        if document_type and document_type not in DOCUMENT_TYPES: messages.append(("Document Type", "Choose a configured Document Type from the template"))
+        if frequency not in FREQUENCY_CHOICES and frequency not in {"HALF-YEARLY", "YEARLY"}: messages.append(("Frequency", "Choose a configured Frequency from the template"))
+        if due_date_rule not in DUE_DATE_RULE_CHOICES: messages.append(("Due Date Rule", "Choose a configured Due Date Rule from the template"))
+        if risk_level not in {*RISK_LEVEL_CHOICES, *existing_risk_levels}: messages.append(("Risk Level", "Choose a configured Risk Level from the template"))
+        if active_value not in {"TRUE", "FALSE", "1", "0", "YES", "NO", "Y", "N", "ACTIVE"}: messages.append(("Active", "Use TRUE or FALSE"))
         try:
             if any(month < 1 or month > 12 for month in parse_applicable_months(row.get("Applicable Months"))):
                 messages.append(("Applicable Months", "Months must be between 1 and 12"))
@@ -2801,15 +3233,21 @@ async def validate_import(file: UploadFile = File(...), user: User = Depends(cur
         try:
             parse_unit_compliance_types(row.get("Unit Compliance Types"))
         except HTTPException:
-            messages.append(("Unit Compliance Types", "Use only Shops & Establishments, Mines, BOCW, ESI, or PF"))
-        if row.get("State") and str(row["State"]).strip().lower() not in states_by_name: messages.append(("State", "State is not configured"))
+            messages.append(("Unit Compliance Types", "Use Shops & Establishments, Mines, BOCW, ESI, PF, or ALL COVERED ESTABLISHMENTS"))
+        if entity_type != "UNIT" and row.get("Unit Compliance Types") not in (None, ""):
+            messages.append(("Unit Compliance Types", "This field is only available for UNIT rules"))
+        if row.get("State") and master_lookup_key(row["State"]) not in states_by_name: messages.append(("State", "State is not configured"))
         if row.get("Industry Type") and str(row["Industry Type"]).strip().lower() not in industries_by_name: messages.append(("Industry Type", "Industry Type is not configured"))
         if row.get("Employee Threshold") not in (None, ""):
             try:
                 if int(row["Employee Threshold"]) < 0: messages.append(("Employee Threshold", "Must be zero or a positive integer"))
             except (TypeError, ValueError): messages.append(("Employee Threshold", "Must be zero or a positive integer"))
-        try: int(row.get("Version")); date.fromisoformat(str(row.get("Effective From")))
-        except (TypeError, ValueError): messages.append(("Version/Effective From", "Version must be an integer and Effective From must be ISO date"))
+        try:
+            int(row.get("Version")); effective_from = parse_import_date(row.get("Effective From"))
+            effective_to = parse_import_date(row.get("Effective To")) if row.get("Effective To") not in (None, "") else None
+            if effective_to and effective_to < effective_from:
+                messages.append(("Effective To", "Effective To cannot be earlier than Effective From"))
+        except (TypeError, ValueError): messages.append(("Version/Effective From", "Version must be an integer and Effective From must be a valid date"))
         import_row = ComplianceImportRow(import_id=import_record.id, row_number=number, payload_json=json.dumps(row, default=str), valid=not messages); db.add(import_row); db.flush()
         for field, message in messages: db.add(ComplianceImportError(import_row_id=import_row.id, field=field, message=message))
         if messages: errors += 1
@@ -2846,7 +3284,7 @@ def confirm_import(import_id: str, mode: str = "MERGE", confirmation: str | None
         raise HTTPException(422, "Correct every invalid workbook row before confirming the import")
     if not record.valid_rows:
         raise HTTPException(422, "The workbook does not contain any valid compliance rules")
-    state_names = {state.name.lower(): state.id for state in db.scalars(select(State))}; industry_names = {industry.name.lower(): industry.id for industry in db.scalars(select(IndustryType))}
+    state_names = state_import_lookup(db); industry_names = {industry.name.lower(): industry.id for industry in db.scalars(select(IndustryType))}
     imported = skipped = 0; deleted = {}; stored_files: list[str] = []
     if normalized_mode == "REPLACE":
         require_compliance_hard_delete_enabled()
@@ -2871,7 +3309,7 @@ def confirm_import(import_id: str, mode: str = "MERGE", confirmation: str | None
     }
     for item in import_rows:
         row = json.loads(item.payload_json)
-        payload = RuleInput(compliance_id=str(row["Compliance ID"]).strip(), name=str(row["Compliance Name"]).strip(), description=str(row["Description"]) if row.get("Description") else None, act=str(row["Act"]).strip() if row.get("Act") else None, rule_reference=str(row["Rule"]).strip() if row.get("Rule") else None, section=str(row["Section"]).strip() if row.get("Section") else None, compliance_type=str(row["Compliance Type"]).strip() if row.get("Compliance Type") else None, document_type=str(row["Document Type"]).strip() if row.get("Document Type") else None, form_number=str(row["Form Number"]).strip() if row.get("Form Number") else None, legal_description=str(row["Legal Description"]) if row.get("Legal Description") else None, consequence_or_penalty=str(row["Consequence / Penalty"]) if row.get("Consequence / Penalty") else None, version=int(row["Version"]), entity_type=str(row["Entity Type"]).strip().upper(), state_id=state_names.get(str(row.get("State") or "").strip().lower()), industry_type_id=industry_names.get(str(row.get("Industry Type") or "").strip().lower()), employee_threshold=int(row["Employee Threshold"]) if row.get("Employee Threshold") not in (None, "") else None, unit_compliance_types=parse_unit_compliance_types(row.get("Unit Compliance Types")), frequency=str(row["Frequency"]).strip().upper(), applicable_months=parse_applicable_months(row.get("Applicable Months")), due_date_rule=str(row["Due Date Rule"]).strip().upper(), due_date_offset=int(row["Due Date Offset"]) if row.get("Due Date Offset") not in (None, "") else None, due_date_anchor=str(row["Due Date Anchor"]).strip() if row.get("Due Date Anchor") else None, required_document=str(row["Required Document"]) if row.get("Required Document") else None, risk_level=str(row.get("Risk Level") or "MEDIUM").strip().upper(), effective_from=date.fromisoformat(str(row["Effective From"])), effective_to=date.fromisoformat(str(row["Effective To"])) if row.get("Effective To") else None, active=parse_bool(row.get("Active")))
+        payload = RuleInput(compliance_id=str(row["Compliance ID"]).strip(), name=str(row["Compliance Name"]).strip(), description=str(row["Description"]) if row.get("Description") else None, act=str(row["Act"]).strip() if row.get("Act") else None, rule_reference=str(row["Rule"]).strip() if row.get("Rule") else None, section=str(row["Section"]).strip() if row.get("Section") else None, compliance_type=str(row["Compliance Type"]).strip() if row.get("Compliance Type") else None, document_type=str(row["Document Type"]).strip() if row.get("Document Type") else None, form_number=str(row["Form Number"]).strip() if row.get("Form Number") else None, legal_description=str(row["Legal Description"]) if row.get("Legal Description") else None, consequence_or_penalty=str(row["Consequence / Penalty"]) if row.get("Consequence / Penalty") else None, version=int(row["Version"]), entity_type=str(row["Entity Type"]).strip().upper(), state_id=state_names.get(master_lookup_key(row.get("State"))), industry_type_id=industry_names.get(str(row.get("Industry Type") or "").strip().lower()), employee_threshold=int(row["Employee Threshold"]) if row.get("Employee Threshold") not in (None, "") else None, unit_compliance_types=parse_unit_compliance_types(row.get("Unit Compliance Types")), frequency=str(row["Frequency"]).strip().upper(), applicable_months=parse_applicable_months(row.get("Applicable Months")), due_date_rule=str(row["Due Date Rule"]).strip().upper(), due_date_offset=int(row["Due Date Offset"]) if row.get("Due Date Offset") not in (None, "") else None, due_date_anchor=str(row["Due Date Anchor"]).strip() if row.get("Due Date Anchor") else None, required_document=str(row["Required Document"]) if row.get("Required Document") else None, risk_level=str(row.get("Risk Level") or "MEDIUM").strip().upper(), effective_from=parse_import_date(row["Effective From"]), effective_to=parse_import_date(row["Effective To"]) if row.get("Effective To") else None, active=parse_bool(row.get("Active")))
         existing_rule = existing_rules_by_compliance_id.get(payload.compliance_id)
         if existing_rule and (existing_rule.id, payload.version) in existing_versions:
             skipped += 1
@@ -3456,7 +3894,7 @@ def list_grouped_instances(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ):
-    """Return recurring obligations grouped by their configured rule/Act.
+    """Return recurring obligations grouped by their configured Act.
 
     Counts are calculated after every non-document filter and before the active
     document-type tab is applied.  This makes every tab a live count while
@@ -3483,11 +3921,10 @@ def list_grouped_instances(
     rows = [row for row in base_rows if not document_type or row["document_type"] == document_type]
     grouped: dict[str, dict] = {}
     for row in rows:
-        # The Compliance Master rule is the stable grouping identity.  Its
-        # configured name is displayed; an Act may be shared by several rules
-        # and therefore must not merge distinct operational obligations.
-        group_key = row["rule_id"]
-        group_name = row["rule_name"] or row["compliance_name"]
+        # Act is the legal top-level grouping. Individual rules and periods
+        # remain separate records beneath it, preserving their actions/status.
+        group_name = (row.get("act") or "Act not specified").strip() or "Act not specified"
+        group_key = f"act:{group_name.casefold()}"
         group = grouped.setdefault(group_key, {"id": group_key, "name": group_name, "records": []})
         group["records"].append(row)
 
@@ -3513,6 +3950,8 @@ def list_grouped_instances(
     return {
         "groups": groups[start : start + safe_page_size],
         "total_compliances": len(rows),
+        "total_acts": len(groups),
+        # Kept for older clients; this now counts Act groups.
         "total_rules": len(groups),
         "document_type_counts": type_counts,
         "status_counts": {

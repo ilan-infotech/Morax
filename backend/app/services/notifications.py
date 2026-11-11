@@ -8,6 +8,7 @@ event may be retried or scheduled repeatedly.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import UTC, date, datetime
 
 from sqlalchemy import select

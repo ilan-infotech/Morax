@@ -117,7 +117,7 @@ def register_dict(db: Session, item: GeneratedRegister, detail: bool = False, ca
     versions_cache = cache.get("versions", {})
     templates_cache = cache.get("templates", {})
     result = model_dict(item, [field.name for field in item.__table__.columns])
-    result["entity_name"] = entity_name(db, item.entity_type, item.entity_id)
+    result["entity_name"] = cache.get("entity_names", {}).get((item.entity_type, item.entity_id)) or entity_name(db, item.entity_type, item.entity_id)
     result["validation_summary"] = json.loads(item.validation_summary_json or "{}")
     version = versions_cache.get(item.template_version_id) or db.get(RegisterTemplateVersion, item.template_version_id)
     template = templates_cache.get(version.template_id) if version else None
@@ -137,6 +137,29 @@ def register_dict(db: Session, item: GeneratedRegister, detail: bool = False, ca
         ]
         result["compliance_links"] = [model_dict(link, [field.name for field in link.__table__.columns]) for link in db.scalars(select(RegisterComplianceLink).where(RegisterComplianceLink.register_id == item.id))]
     return result
+
+
+def register_list_cache(db: Session, items: list[GeneratedRegister]) -> dict:
+    """Batch the presentation lookups needed for register collection views."""
+    version_ids = {item.template_version_id for item in items if item.template_version_id}
+    versions = {
+        item.id: item
+        for item in db.scalars(select(RegisterTemplateVersion).where(RegisterTemplateVersion.id.in_(version_ids)))
+    } if version_ids else {}
+    template_ids = {item.template_id for item in versions.values() if item.template_id}
+    templates = {
+        item.id: item
+        for item in db.scalars(select(RegisterTemplate).where(RegisterTemplate.id.in_(template_ids)))
+    } if template_ids else {}
+    entity_names: dict[tuple[str, str], str] = {}
+    for entity_type, model in {"UNIT": Unit, "CONTRACTOR": Contractor, "CONTRACTOR_SITE": ContractorSite}.items():
+        entity_ids = {item.entity_id for item in items if item.entity_type == entity_type}
+        if entity_ids:
+            entity_names.update({
+                (entity_type, item.id): item.name
+                for item in db.scalars(select(model).where(model.id.in_(entity_ids)))
+            })
+    return {"versions": versions, "templates": templates, "entity_names": entity_names}
 
 
 def get_register_or_404(db: Session, user: User, register_id: str) -> GeneratedRegister:
@@ -490,11 +513,7 @@ def list_registers(entity_type: str | None = None, entity_id: str | None = None,
     permitted = [item for item in db.scalars(query.order_by(GeneratedRegister.updated_at.desc())) if can_access_subject(db, user, org, item.entity_type, item.entity_id)]
     size = min(max(page_size, 1), 100); start = (max(page, 1)-1)*size
     page_items = permitted[start:start+size]
-    version_ids = {item.template_version_id for item in page_items if item.template_version_id}
-    versions = {v.id: v for v in db.scalars(select(RegisterTemplateVersion).where(RegisterTemplateVersion.id.in_(version_ids)))} if version_ids else {}
-    template_ids = {v.template_id for v in versions.values() if v.template_id}
-    templates = {t.id: t for t in db.scalars(select(RegisterTemplate).where(RegisterTemplate.id.in_(template_ids)))} if template_ids else {}
-    reg_cache = {"versions": versions, "templates": templates}
+    reg_cache = register_list_cache(db, page_items)
     return {"items": [register_dict(db, item, cache=reg_cache) for item in page_items], "total": len(permitted), "page": page, "page_size": size}
 
 
@@ -506,6 +525,7 @@ def registers_dashboard(entity_type: str | None = None, entity_id: str | None = 
     rows = [item for item in db.scalars(select(GeneratedRegister).where(GeneratedRegister.organization_id == org)) if can_access_subject(db, user, org, item.entity_type, item.entity_id)]
     if entity_type and entity_id: rows = [item for item in rows if item.entity_type == entity_type and item.entity_id == entity_id]
     if period_key: rows = [item for item in rows if item.period_key == period_key]
+    presentation_cache = register_list_cache(db, rows)
     status = Counter(item.status for item in rows); overdue = sum(1 for item in rows if item.due_date and item.due_date < date.today() and item.status != "APPROVED")
     monthly: dict[str, dict[str, int]] = {}
     for item in rows:
@@ -517,7 +537,7 @@ def registers_dashboard(entity_type: str | None = None, entity_id: str | None = 
             bucket["approved"] += 1
     entities: dict[tuple[str, str], list[GeneratedRegister]] = defaultdict(list)
     for row in rows: entities[(row.entity_type, row.entity_id)].append(row)
-    performance = [{"id": entity_id, "entity_type": entity_type, "name": entity_name(db, entity_type, entity_id), "applicable": len(items), "generated": sum(item.status != "SUPERSEDED" for item in items), "approved": sum(item.status == "APPROVED" for item in items), "overdue": sum(bool(item.due_date and item.due_date < date.today() and item.status != "APPROVED") for item in items), "rate": round(100 * sum(item.status == "APPROVED" for item in items) / len(items), 1) if items else 0} for (entity_type, entity_id), items in entities.items()]
+    performance = [{"id": entity_id, "entity_type": entity_type, "name": presentation_cache["entity_names"].get((entity_type, entity_id), "Unknown entity"), "applicable": len(items), "generated": sum(item.status != "SUPERSEDED" for item in items), "approved": sum(item.status == "APPROVED" for item in items), "overdue": sum(bool(item.due_date and item.due_date < date.today() and item.status != "APPROVED") for item in items), "rate": round(100 * sum(item.status == "APPROVED" for item in items) / len(items), 1) if items else 0} for (entity_type, entity_id), items in entities.items()]
     return {"summary": {"total_applicable": len(ready) if ready else len(rows), "generated": sum(item.status not in {"SUPERSEDED"} for item in rows), "pending_generation": sum(item["status"] == "READY_TO_GENERATE" for item in ready), "validation_failed": db.scalar(select(func.count()).select_from(RegisterUploadBatch).where(RegisterUploadBatch.organization_id == org, RegisterUploadBatch.status == "VALIDATION_FAILED")) or 0, "pending_approval": status["SUBMITTED"], "approved": status["APPROVED"], "rejected": status["REJECTED"], "overdue": overdue}, "status_distribution": [{"name": key, "value": value} for key, value in sorted(status.items())], "generation_trend": [monthly[key] for key in sorted(monthly)[-12:]], "entity_performance": performance, "readiness": ready}
 
 
@@ -549,7 +569,8 @@ def submit_register(register_id: str, payload: RegisterDecisionInput, user: User
 @router.get("/reviews/pending")
 def pending_register_reviews(user: User = Depends(current_user), db: Session = Depends(get_db)):
     require_register_permission(db, user, "registers.review"); org = org_for(user); rows = [item for item in db.scalars(select(GeneratedRegister).where(GeneratedRegister.organization_id == org, GeneratedRegister.status == "SUBMITTED").order_by(GeneratedRegister.submitted_at)) if can_access_subject(db, user, org, item.entity_type, item.entity_id)]
-    return {"items": [register_dict(db, item) for item in rows], "total": len(rows)}
+    cache = register_list_cache(db, rows)
+    return {"items": [register_dict(db, item, cache=cache) for item in rows], "total": len(rows)}
 
 
 def review_register(register_id: str, payload: RegisterDecisionInput, decision: str, user: User, db: Session) -> dict:

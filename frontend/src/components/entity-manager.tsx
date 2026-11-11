@@ -43,7 +43,7 @@ import { PasswordInput } from "./password-input";
 type Row = Record<string, unknown>;
 type EntityKind = "units" | "contractors" | "sites";
 type ContractorMakerLogin = { id: string; name: string; email: string; active: boolean };
-type ContractorImportPreview = { id: string; total_rows: number; valid_rows: number; error_rows: number; rows: { row_number: number; valid: boolean; data: Record<string, unknown>; errors: { field: string; message: string }[] }[] };
+type ContractorImportPreview = { id: string; total_rows: number; valid_rows: number; error_rows: number; new_contractors: number; existing_contractors: number; records_to_update: number; unchanged_records: number; rows: { row_number: number; valid: boolean; data: Record<string, unknown>; errors: { field: string; message: string }[] }[] };
 
 type EntityForm = {
   name: string;
@@ -91,7 +91,7 @@ type FormAssignment = {
   role: AssignmentRole;
   pending_user?: PendingEntityUser;
 };
-type SavedContractorFollowUpError = Error & { contractorSaved?: boolean };
+type SavedEntityFollowUpError = Error & { entitySaved?: boolean };
 
 const assignmentKey = () =>
   `assignment-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -102,6 +102,35 @@ const scopeRoleFor = (kind: "units" | "contractors", role: AssignmentRole) =>
 
 const entityTableFeatures = tableFeatures({ rowSortingFeature });
 const EMPTY_ROWS: Row[] = [];
+const UNIT_COMPLIANCE_TYPES = ["Shops & Establishments", "Mines", "BOCW", "ESI", "PF"] as const;
+
+/**
+ * Unit records returned by older API responses may contain the persisted JSON
+ * column instead of the presentation array.  Normalise both formats here so
+ * the edit form is always driven by the saved, known checkbox values.
+ */
+function unitComplianceTypes(value: unknown): string[] {
+  let values: unknown[] = [];
+  if (Array.isArray(value)) {
+    values = value;
+  } else if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      values = Array.isArray(parsed) ? parsed : value.split(",");
+    } catch {
+      values = value.split(",");
+    }
+  }
+
+  return [...new Set(
+    values
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter((item): item is (typeof UNIT_COMPLIANCE_TYPES)[number] =>
+        UNIT_COMPLIANCE_TYPES.includes(item as (typeof UNIT_COMPLIANCE_TYPES)[number]),
+      ),
+  )];
+}
 
 const blankEntity = (): EntityForm => ({
   name: "",
@@ -223,7 +252,7 @@ function asForm(row: Row): EntityForm {
     Object.entries(defaults).map(([key, fallback]) => [
       key,
       key === "compliance_types"
-        ? (Array.isArray(row[key]) ? row[key].map(String) : fallback)
+        ? unitComplianceTypes(row.compliance_types ?? row.compliance_types_json)
         : key === "effective_date"
           ? String(row.effective_date ?? row.compliance_start_date ?? fallback)
         : row[key] == null ? fallback : String(row[key]),
@@ -277,6 +306,8 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
   const [contractorImportPreview, setContractorImportPreview] = useState<ContractorImportPreview | null>(null);
   const [contractorImportBusy, setContractorImportBusy] = useState(false);
   const [contractorImportError, setContractorImportError] = useState("");
+  const [contractorImportMode, setContractorImportMode] = useState<"MERGE" | "REPLACE">("MERGE");
+  const [contractorReplaceConfirmation, setContractorReplaceConfirmation] = useState("");
   const [entityAssignments, setEntityAssignments] = useState<FormAssignment[]>([]);
   const [newUserOpen, setNewUserOpen] = useState(false);
   const [newEntityUser, setNewEntityUser] = useState<{
@@ -421,33 +452,48 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
 
   const saveMutation = useMutation({
     mutationFn: async (values: EntityForm) => {
-      if (kind === "units" && values.compliance_types.length === 0) {
-        form.setError("compliance_types", { type: "required", message: "Select at least one Unit Compliance Type" });
-        throw new Error("Select at least one Unit Compliance Type before saving.");
+      if (kind === "units") {
+        const requiredUnitFields: Array<[keyof EntityForm, string, (value: string) => boolean]> = [
+          ["unit_type", "Unit type is required", (value) => Boolean(value.trim())],
+          ["compliance_start_date", "Compliance start date is required", (value) => Boolean(value)],
+          ["effective_date", "Effective date is required", (value) => Boolean(value)],
+          ["pincode", "Enter a valid 6-digit PIN code", (value) => /^\d{6}$/.test(value.trim())],
+          ["address", "Address is required", (value) => Boolean(value.trim())],
+        ];
+        const invalid = requiredUnitFields.filter(([field, , valid]) => !valid(values[field] as string));
+        if (invalid.length) {
+          invalid.forEach(([field, message]) => form.setError(field, { type: "required", message }));
+          throw new Error("Complete the highlighted required fields before saving.");
+        }
       }
       if (kind === "units" && !values.employer_name.trim()) {
         form.setError("employer_name", { type: "required", message: "Employer Name is required" });
         throw new Error("Employer Name is required.");
       }
       if (!values.state_id) {
+        form.setError("state_id", { type: "required", message: "Select a State before saving" });
         throw new Error("Select a State before saving");
       }
       if ((kind === "units" || kind === "sites") && !values.industry_type_id) {
+        form.setError("industry_type_id", { type: "required", message: "Select an industry type before saving" });
         throw new Error("Select an industry type before saving");
       }
       if ((kind === "units" || kind === "contractors" || kind === "sites") && !values.city_id) {
+        form.setError("city_id", { type: "required", message: "Select a City / District before saving" });
         throw new Error("Select a City / District before saving");
       }
       if (kind === "contractors" && !values.unit_id) {
+        form.setError("unit_id", { type: "required", message: "Select the Principal Employer before saving" });
         throw new Error("Select the Principal Employer before saving");
       }
       if (kind === "sites" && !values.contractor_id) {
+        form.setError("contractor_id", { type: "required", message: "Select a contractor before saving" });
         throw new Error("Select a contractor before saving");
       }
-      if ((kind === "units" || kind === "contractors") && values.contact_email) {
+      if (kind === "contractors" && values.contact_email) {
         const availability = await morax.emailAvailable(
           values.contact_email,
-          kind === "units" ? "UNIT" : "CONTRACTOR",
+          "CONTRACTOR",
           editing ? String(editing.id) : undefined,
         );
         if (!availability.available) throw new Error("Email ID already exists.");
@@ -560,13 +606,12 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
           await Promise.all(uploads);
         }
       } catch (error) {
-        if (kind === "contractors" && !id) {
-          const detail = error instanceof Error ? error.message : "Unable to complete the follow-up step.";
-          const followUpError = new Error(`Contractor was created, but a follow-up step needs attention: ${detail}`) as SavedContractorFollowUpError;
-          followUpError.contractorSaved = true;
-          throw followUpError;
-        }
-        throw error;
+        // The entity endpoint has already committed at this point. Keep the
+        // list consistent even if a later assignment or document call fails.
+        const detail = error instanceof Error ? error.message : "Unable to complete the follow-up step.";
+        const followUpError = new Error(`${meta.singular[0].toUpperCase()}${meta.singular.slice(1)} was saved, but user assignments or documents need attention: ${detail}`) as SavedEntityFollowUpError;
+        followUpError.entitySaved = true;
+        throw followUpError;
       }
       return saved;
     },
@@ -578,8 +623,8 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
       await invalidateEntities();
     },
     onError: async (error) => {
-      if ((error as SavedContractorFollowUpError).contractorSaved) {
-        setNotice("Contractor created successfully. Review its user assignments or documents before continuing.");
+      if ((error as SavedEntityFollowUpError).entitySaved) {
+        setNotice(`${meta.singular[0].toUpperCase()}${meta.singular.slice(1)} saved successfully. Review its user assignments or documents before continuing.`);
         closeForm();
         await invalidateEntities();
         return;
@@ -627,6 +672,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
     setNotice("");
     setEditing(null);
     form.reset(blankEntity());
+    form.clearErrors();
     setEntityAssignments([]);
     setNewUserOpen(false);
     setNewEntityUserError("");
@@ -640,6 +686,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
       setNotice("");
       setEditing(row);
       form.reset(asForm(row));
+      form.clearErrors();
       setEntityAssignments([]);
       setNewUserOpen(false);
       setNewEntityUserError("");
@@ -804,24 +851,28 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
 
   return (
     <section className="crud-page">
-      <header className="page-header">
+      <header className="page-header entity-management-header">
         <div>
           <p className="eyebrow" style={{ fontWeight: 'bold' }}>
             <GradientText colors={['#2A3620', '#B6D7A8', '#2A3620']} showBorder={false}>ENTITY MANAGEMENT</GradientText>
           </p>
           <h1 style={{ fontWeight: 'bold' }}>
-            <GradientText colors={['#2A3620', '#B6D7A8', '#2A3620']} showBorder={false}>{meta.title}</GradientText>
+            <GradientText colors={['#2A3620', '#B6D7A8', '#2A3620']} showBorder={false}>Organization entities</GradientText>
           </h1>
           <p className="muted">
-            Manage the organization records used throughout compliance
-            operations.
+            Manage the entity records, assignments, and operational details used throughout compliance.
           </p>
         </div>
         {canManage && (
           <div className="action-row">
-            {kind === "contractors" && <button type="button" className="secondary" onClick={() => { setContractorImportOpen(true); setContractorImportError(""); }}>
-              <Upload size={17} /> Import Contractors
-            </button>}
+            {kind === "contractors" && <>
+              <button type="button" className="secondary" onClick={() => void morax.downloadContractorExport({ q: deferredSearch.trim() || undefined, status: status || undefined })}>
+                <Download size={17} /> Export Contractors
+              </button>
+              <button type="button" className="secondary" onClick={() => { setContractorImportOpen(true); setContractorImportError(""); setContractorImportMode("MERGE"); setContractorReplaceConfirmation(""); }}>
+                <Upload size={17} /> Import Contractors
+              </button>
+            </>}
             <button type="button" className="primary-action" onClick={openCreate}>
               <Plus size={17} /> Add {meta.singular}
             </button>
@@ -841,7 +892,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
         <InlineError message="Organization administrator permission is required to manage these entities." />
       )}
 
-      <section className="panel entity-list-panel">
+      {(!formOpen || kind === "sites") && <section className="panel entity-list-panel">
         <div className="crud-toolbar">
           <label className="table-search">
             <Search size={17} aria-hidden="true" />
@@ -975,16 +1026,16 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
             </button>
           </div>
         </footer>
-      </section>
+      </section>}
 
       {canManage && formOpen && (
         <div
-          className="workspace-form-backdrop"
+          className={`workspace-form-backdrop ${kind === "units" || kind === "contractors" ? "entity-page-form-backdrop" : ""}`}
           role="presentation"
-          onMouseDown={closeForm}
+          onMouseDown={() => (kind === "sites" && !saveMutation.isPending ? closeForm() : undefined)}
         >
           <section
-            className="workspace-form"
+            className={`workspace-form ${kind === "units" || kind === "contractors" ? "entity-page-form" : ""}`}
             role="region"
             aria-labelledby="entity-form-title"
             onMouseDown={(event) => event.stopPropagation()}
@@ -1004,6 +1055,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
               <button
                 type="button"
                 className="icon-action"
+                disabled={saveMutation.isPending}
                 onClick={closeForm}
                 aria-label="Close form"
               >
@@ -1012,10 +1064,14 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
             </div>
             <form
               className="entity-form"
+              noValidate={kind === "units"}
               onSubmit={form.handleSubmit((values) =>
                 saveMutation.mutate(values),
               )}
             >
+              {notice && !/^(Created|Updated|Imported)/.test(notice) && (
+                <InlineError message={notice} />
+              )}
               <div className="form-section">
                 <h3>Identity</h3>
                 <div className="form-grid">
@@ -1027,7 +1083,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                     <input {...form.register("name")} autoFocus required maxLength={200} />
                   </Field>
                   {kind === "units" ? (
-                    <Field label="Unit type" required>
+                    <Field label="Unit type" required error={form.formState.errors.unit_type?.message}>
                       <input
                         {...form.register("unit_type")}
                         placeholder="Factory, branch, office…"
@@ -1133,7 +1189,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                       />
                     </Field>
                   )}
-                  <Field label="Compliance start" required>
+                  <Field label="Compliance start" required error={form.formState.errors.compliance_start_date?.message}>
                     <input
                       type="date"
                       {...form.register("compliance_start_date")}
@@ -1141,22 +1197,25 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                     />
                   </Field>
                   {kind === "units" && (
-                    <Field label="Unit Compliance Type" wide required error={form.formState.errors.compliance_types?.message}>
+                    <Field label="Unit Compliance Type" wide group error={form.formState.errors.compliance_types?.message}>
                       <div className="checkbox-group" role="group" aria-label="Unit Compliance Type">
-                        {["Shops & Establishments", "Mines", "BOCW", "ESI", "PF"].map((type) => (
-                          <label className="inline" key={type}>
+                        {UNIT_COMPLIANCE_TYPES.map((type) => {
+                          const inputId = `unit-compliance-type-${type.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+                          return <div className="compliance-type-option" key={type}>
                             <input
+                              id={inputId}
                               type="checkbox"
-                              checked={form.watch("compliance_types").includes(type)}
+                              checked={unitComplianceTypes(form.watch("compliance_types")).includes(type)}
                               onChange={(event) => {
-                                const selected = form.getValues("compliance_types");
+                                const selected = unitComplianceTypes(form.getValues("compliance_types"));
                                 form.setValue("compliance_types", event.target.checked ? [...selected, type] : selected.filter((value) => value !== type), { shouldDirty: true, shouldValidate: true });
                               }}
                             />
-                            {type}
-                          </label>
-                        ))}
+                            <label htmlFor={inputId}>{type}</label>
+                          </div>;
+                        })}
                       </div>
+                      <small className="muted">Optional. Select applicable types only when they apply to this unit.</small>
                     </Field>
                   )}
                   {kind === "sites" && (
@@ -1245,7 +1304,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                     </select>
                     {citiesQuery.isError && <small className="field-error">Could not load districts for this State. Please retry.</small>}
                   </Field>
-                  <Field label="Pincode" required>
+                  <Field label="Pincode" required error={form.formState.errors.pincode?.message}>
                     <input {...form.register("pincode")} inputMode="numeric" maxLength={6} pattern="[0-9]{6}" title="Enter a valid 6-digit PIN code" required />
                   </Field>
                   <Field label="Contact email" required error={form.formState.errors.contact_email?.message}>
@@ -1266,7 +1325,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                   <Field label="Employer Name" required={kind === "units"} error={form.formState.errors.employer_name?.message}>
                     <input {...form.register("employer_name")} maxLength={250} required={kind === "units"} />
                   </Field>
-                  <Field label="Effective date" required>
+                  <Field label="Effective date" required error={form.formState.errors.effective_date?.message}>
                     <input type="date" {...form.register("effective_date")} required />
                   </Field>
                   {kind === "contractors" && (
@@ -1276,7 +1335,7 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                       <Field label="Work order expiry" required><input type="date" {...form.register("work_order_expiry_date")} required /></Field>
                     </>
                   )}
-                  <Field label="Address" wide required>
+                  <Field label="Address" wide required error={form.formState.errors.address?.message}>
                     <textarea rows={3} {...form.register("address")} required />
                   </Field>
                   {kind === "sites" && (
@@ -1383,6 +1442,9 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
               {kind !== "sites" && (
                 <div className="form-section">
                   <h3>Assign users</h3>
+                  {editing && entityAssignmentsQuery.isError && (
+                    <InlineError message="Could not load the current user assignments. Retry the edit form before saving." />
+                  )}
                   <div className="assignment-role-grid">
                     {(["MAKER", "CHECKER", "ADMIN"] as AssignmentRole[]).map((role) => {
                       const assignment = entityAssignments.find((item) => item.role === role);
@@ -1501,16 +1563,18 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                 </div>
               )}
               <footer className="drawer-footer">
-                <button type="button" className="secondary" onClick={closeForm}>
+                <button type="button" className="secondary" disabled={saveMutation.isPending} onClick={closeForm}>
                   Cancel
                 </button>
                 <button
                   type="submit"
                   className="primary-action"
-                  disabled={saveMutation.isPending}
+                  disabled={saveMutation.isPending || (Boolean(editing) && kind !== "sites" && entityAssignmentsQuery.isLoading)}
                 >
                   {saveMutation.isPending
                     ? "Saving…"
+                    : editing && kind !== "sites" && entityAssignmentsQuery.isLoading
+                      ? "Loading assignments…"
                     : editing
                       ? "Save changes"
                       : `Create ${meta.singular}`}
@@ -1695,7 +1759,10 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
               {contractorImportError && <InlineError message={contractorImportError} />}
               <div className="import-template-note">
                 <p><b>Required:</b> Contractor Name, Contractor Code, Principal Employer Code, and Maker Email.</p>
-                <button type="button" className="text-action" onClick={() => morax.downloadContractorImportTemplate()}><Download size={15} /> Download Excel template</button>
+                <div className="action-row">
+                  <button type="button" className="text-action" disabled={contractorImportBusy} onClick={() => morax.downloadContractorImportTemplate()}><Download size={15} /> Download blank template</button>
+                  <button type="button" className="text-action" disabled={contractorImportBusy} onClick={() => morax.downloadContractorExport({ q: deferredSearch.trim() || undefined, status: status || undefined })}><Download size={15} /> Export current results</button>
+                </div>
               </div>
               <Field label="Contractor workbook" required>
                 <input type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => { setContractorImportFile(event.target.files?.[0] ?? null); setContractorImportPreview(null); setContractorImportError(""); }} />
@@ -1711,17 +1778,25 @@ function EntityManager({ user, kind, onImpersonate }: { user: User; kind: Entity
                   } catch (error) { setContractorImportError(error instanceof Error ? error.message : "Could not validate the contractor workbook."); }
                   finally { setContractorImportBusy(false); }
                 }}>{contractorImportBusy ? "Validating…" : "Validate workbook"}</button>
-                {contractorImportPreview && <button type="button" className="primary-action" disabled={!contractorImportPreview.valid_rows || contractorImportBusy} onClick={async () => {
+                {contractorImportPreview && <button type="button" className="primary-action" disabled={!contractorImportPreview.valid_rows || contractorImportBusy || contractorImportPreview.error_rows > 0 || (contractorImportMode === "REPLACE" && contractorReplaceConfirmation !== "REPLACE")} onClick={async () => {
                   setContractorImportBusy(true); setContractorImportError("");
                   try {
-                    const result = await morax.confirmContractorImport(contractorImportPreview.id);
-                    await invalidateEntities(); setPage(1); setNotice(`Imported ${result.imported} contractor(s); ${result.invalid} invalid row(s) were not imported.`); setContractorImportOpen(false);
+                    const result = await morax.confirmContractorImport(contractorImportPreview.id, contractorImportMode);
+                    await invalidateEntities(); setPage(1); setNotice(`${contractorImportMode === "MERGE" ? "Merged" : "Replaced"} ${result.created} new and ${result.updated} updated contractor(s); ${result.unchanged} unchanged.`); setContractorImportOpen(false);
                   } catch (error) { setContractorImportError(error instanceof Error ? error.message : "Could not import contractors."); }
                   finally { setContractorImportBusy(false); }
-                }}>{contractorImportBusy ? "Importing…" : `Import ${contractorImportPreview.valid_rows} ready row(s)`}</button>}
+                }}>{contractorImportBusy ? "Importing…" : `${contractorImportMode === "MERGE" ? "Merge" : "Replace"} ${contractorImportPreview.valid_rows} ready row(s)`}</button>}
               </div>
               {contractorImportPreview && <>
                 <div className={`import-validation-summary ${contractorImportPreview.error_rows ? "has-errors" : "valid"}`}><b>{contractorImportPreview.valid_rows} ready · {contractorImportPreview.error_rows} need correction</b><span>{contractorImportPreview.total_rows} total rows</span></div>
+                <div className="contractor-import-summary" aria-label="Contractor import validation summary">
+                  <span><b>{contractorImportPreview.new_contractors}</b> new</span><span><b>{contractorImportPreview.existing_contractors}</b> existing</span><span><b>{contractorImportPreview.records_to_update}</b> to update</span><span><b>{contractorImportPreview.unchanged_records}</b> unchanged</span>
+                </div>
+                <div className="import-mode-grid" role="radiogroup" aria-label="Contractor import mode">
+                  <label className={contractorImportMode === "MERGE" ? "selected" : ""}><input type="radio" name="contractor-import-mode" checked={contractorImportMode === "MERGE"} disabled={contractorImportBusy} onChange={() => { setContractorImportMode("MERGE"); setContractorReplaceConfirmation(""); }} /><span><b>Merge</b><small>Add new records and update only fields supplied in the workbook. Blank editable cells keep their current value.</small></span></label>
+                  <label className={contractorImportMode === "REPLACE" ? "selected" : ""}><input type="radio" name="contractor-import-mode" checked={contractorImportMode === "REPLACE"} disabled={contractorImportBusy} onChange={() => setContractorImportMode("REPLACE")} /><span><b>Replace editable details</b><small>Apply workbook values to matched records. Blank editable cells clear those values; records not in the file are retained.</small></span></label>
+                </div>
+                {contractorImportMode === "REPLACE" && contractorImportPreview.error_rows === 0 && <label className="replace-confirmation"><span>Type <b>REPLACE</b> to confirm updating editable contractor details</span><input value={contractorReplaceConfirmation} disabled={contractorImportBusy} onChange={(event) => setContractorReplaceConfirmation(event.target.value.toUpperCase())} placeholder="REPLACE" autoComplete="off" /></label>}
                 {contractorImportPreview.error_rows > 0 && <button type="button" className="text-action" onClick={() => morax.downloadContractorImportReport(contractorImportPreview.id)}><Download size={15} /> Download validation report</button>}
                 <div className="contractor-import-preview" aria-live="polite">
                   {contractorImportPreview.rows.slice(0, 8).map((row) => <div className={row.valid ? "valid" : "invalid"} key={row.row_number}><b>Row {row.row_number}</b><span>{row.valid ? `${String(row.data.name ?? "Contractor")} is ready` : row.errors.map((error) => `${error.field}: ${error.message}`).join(" · ")}</span></div>)}
@@ -1742,19 +1817,27 @@ function Field({
   error,
   wide = false,
   required = false,
+  group = false,
   children,
 }: {
   label: string;
   error?: string;
   wide?: boolean;
   required?: boolean;
+  /** A composite control cannot be nested inside a label. */
+  group?: boolean;
   children: ReactNode;
 }) {
+  const className = `${group ? "field-control " : ""}${wide ? "wide " : ""}${error ? "has-error" : ""}`.trim() || undefined;
+  const content = <>
+    <span>{label}{required && <b className="required-indicator" aria-label="required"> *</b>}</span>
+    {children}
+    {error && <small className="field-error">{error}</small>}
+  </>;
+  if (group) {
+    return <div className={className}>{content}</div>;
+  }
   return (
-    <label className={`${wide ? "wide " : ""}${error ? "has-error" : ""}`.trim() || undefined}>
-      <span>{label}{required && <b className="required-indicator" aria-label="required"> *</b>}</span>
-      {children}
-      {error && <small className="field-error">{error}</small>}
-    </label>
+    <label className={className}>{content}</label>
   );
 }

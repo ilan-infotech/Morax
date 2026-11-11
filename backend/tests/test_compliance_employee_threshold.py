@@ -122,7 +122,9 @@ def test_compliance_master_export_replace_and_confirmed_deletion():
             "Compliance ID": "NEW-001", "Compliance Name": "New rule", "Description": "Evidence guidance",
             "Act": "New Act", "Rule": "Rule 1", "Section": "", "Compliance Type": "STATUTORY",
             "Document Type": "RECORDS", "Form Number": "", "Legal Description": "Manual trigger",
-            "Consequence / Penalty": "", "Version": 1, "Entity Type": "UNIT", "State": "Tamil Nadu",
+            # Workbook users commonly omit the space; the import must resolve
+            # this to the configured Tamil Nadu State without a fuzzy match.
+            "Consequence / Penalty": "", "Version": 1, "Entity Type": "UNIT", "State": "Tamilnadu",
             "Industry Type": "Factory", "Employee Threshold": 10, "Frequency": "EVENT_BASED",
             "Applicable Months": "", "Due Date Rule": "MANUAL", "Due Date Offset": "",
             "Due Date Anchor": "", "Required Document": "Evidence", "Risk Level": "HIGH",

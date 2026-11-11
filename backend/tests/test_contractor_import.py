@@ -66,14 +66,40 @@ def test_contractor_import_validates_previews_reports_imports_and_isolates_tenan
         assert report.headers["content-disposition"].endswith(".xlsx")
         assert any(str(row[4].value).startswith("'+") for row in report_book["Validation report"].iter_rows(min_row=2))
 
-        result = api.confirm_contractor_import(staged["id"], admin, db)
-        assert result["imported"] == 1 and result["invalid"] == 2
+        with pytest.raises(HTTPException) as blocked_invalid_import:
+            api.confirm_contractor_import(staged["id"], admin, db)
+        assert blocked_invalid_import.value.status_code == 422
+
+        clean_upload = UploadFile(filename="contractors-clean.xlsx", file=io.BytesIO(workbook_bytes([valid])))
+        clean_stage = asyncio.run(api.validate_contractor_import(clean_upload, admin, db))
+        result = api.confirm_contractor_import(clean_stage["id"], admin, db)
+        assert result["imported"] == 1 and result["invalid"] == 0
         created = db.scalar(select(Contractor).where(Contractor.organization_id == org_a.id, Contractor.code == "ACME-001"))
         assert created and created.unit_id == unit.id and created.total_workers == 15
         assert db.scalar(select(Contractor).where(Contractor.code == "BAD-001")) is None
         with pytest.raises(HTTPException) as repeat:
-            api.confirm_contractor_import(staged["id"], admin, db)
+            api.confirm_contractor_import(clean_stage["id"], admin, db)
         assert repeat.value.status_code == 409
+
+        # The exported stable Contractor Code is also the tenant-scoped update
+        # key: an edited workbook must update this record rather than create a
+        # duplicate. Empty optional cells remain unchanged in Merge mode.
+        edited = valid.copy(); edited[0] = "Acme Workforce Updated"; edited[15] = 11
+        update_upload = UploadFile(filename="contractors-update.xlsx", file=io.BytesIO(workbook_bytes([edited])))
+        update_stage = asyncio.run(api.validate_contractor_import(update_upload, admin, db))
+        assert update_stage["new_contractors"] == 0
+        assert update_stage["existing_contractors"] == 1
+        assert update_stage["records_to_update"] == 1
+        merged = api.confirm_contractor_import(update_stage["id"], admin, db, mode="MERGE")
+        assert merged["created"] == 0 and merged["updated"] == 1
+        db.refresh(created)
+        assert created.name == "Acme Workforce Updated" and created.male_workers == 11
+
+        exported = api.export_contractors(q="Updated", status="ACTIVE", user=admin, db=db)
+        export_book = load_workbook(io.BytesIO(asyncio.run(_stream_bytes(exported))), data_only=False)
+        export_sheet = export_book["Contractors"]
+        assert [cell.value for cell in export_sheet[1]] == api.CONTRACTOR_IMPORT_HEADERS
+        assert export_sheet["B2"].value == "ACME-001"
 
         template = api.contractor_import_template(admin, db)
         template_book = load_workbook(io.BytesIO(asyncio.run(_stream_bytes(template))))

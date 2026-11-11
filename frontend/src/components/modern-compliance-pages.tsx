@@ -608,16 +608,14 @@ function RecurringRuleGroup({
   canSubmit: boolean;
   canReview: boolean;
 }) {
-  const reference = group.records[0];
-  const ruleReference = [reference?.act, reference?.rule_reference].filter(Boolean).join(" / ");
   return (
     <article className={`rule-group recurring-rule-group ${expanded ? "expanded" : ""}`}>
       <button className="rule-group-header recurring-rule-header" type="button" onClick={onToggle} aria-expanded={expanded}>
         <span className="rule-group-title recurring-rule-title">
           <span className="rule-group-icon"><FileText size={18} /></span>
           <span>
-            <b>{ruleReference || group.name}</b>
-            {ruleReference && <small>{group.name}</small>}
+            <b>{group.name}</b>
+            <small>Act-wise compliance requirements</small>
           </span>
         </span>
         <span className="rule-group-meta recurring-rule-meta">
@@ -1470,7 +1468,9 @@ function GroupedRecurringWorklist() {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [page, setPage] = useState(1);
   const [filters, setFilters] = useState<WorklistFilters & { document_type: string; subject_id: string }>({
-    q: "", status: "", risk_level: "", entity_type: "", subject_id: "", frequency: "", due_window: "THIS_MONTH", document_type: "",
+    // Do not default this worklist to the current month: an overdue
+    // obligation remains actionable regardless of when its due date passed.
+    q: "", status: "", risk_level: "", entity_type: "", subject_id: "", frequency: "", due_window: "", document_type: "",
   });
   const debouncedSearch = useDebouncedValue(filters.q.trim());
   const entityQueries = useQuery({
@@ -1583,8 +1583,8 @@ function GroupedRecurringWorklist() {
   return (
     <div className="modern-page grouped-compliance-page">
       <WorkspacePageHeader
-        title="Compliances — Grouped by Rule"
-        description="Recurring obligations grouped by their configured Act, regulation, or rule."
+        title="Compliances — Grouped by Act"
+        description="Recurring obligations grouped by their configured legal Act."
         actions={<button className="button-secondary" type="button" onClick={() => grouped.refetch()} disabled={grouped.isFetching}><RefreshCw size={16} className={grouped.isFetching ? "spin" : ""} />Refresh</button>}
       />
       <InlineError message={grouped.error instanceof Error ? grouped.error.message : ""} />
@@ -1601,7 +1601,7 @@ function GroupedRecurringWorklist() {
         {activeFilters.length > 0 && <div className="active-filters" aria-label="Active filters">{activeFilters.map(([label, value]) => <FilterChip key={label} label={`${label}: ${value}`} onRemove={() => removeFilter(label)} />)}</div>}
       </DashboardSection>
 
-      <DashboardSection title="Compliances — Grouped by Rule" description={data ? `${data.total_compliances} compliance${data.total_compliances === 1 ? "" : "s"} across ${data.total_rules} applicable rule${data.total_rules === 1 ? "" : "s"}` : "Loading applicable rules"} className="grouped-compliance-section" action={<div className="group-actions"><button className="button-secondary compact-action" type="button" onClick={expandAll} disabled={!data?.groups.length}><ChevronDown size={15} />Expand all</button><button className="button-secondary compact-action" type="button" onClick={() => setExpanded(new Set())} disabled={!expanded.size}><ChevronDown size={15} className="collapse-icon" />Collapse all</button></div>}>
+      <DashboardSection title="Compliances — Grouped by Act" description={data ? `${data.total_compliances} compliance${data.total_compliances === 1 ? "" : "s"} across ${data.total_acts ?? data.total_rules} applicable Act${(data.total_acts ?? data.total_rules) === 1 ? "" : "s"}` : "Loading applicable Acts"} className="grouped-compliance-section" action={<div className="group-actions"><button className="button-secondary compact-action" type="button" onClick={expandAll} disabled={!data?.groups.length}><ChevronDown size={15} />Expand all</button><button className="button-secondary compact-action" type="button" onClick={() => setExpanded(new Set())} disabled={!expanded.size}><ChevronDown size={15} className="collapse-icon" />Collapse all</button></div>}>
         <div className="document-type-tabs" aria-label="Filter by document type">
           <button className={`document-type-tab ${!filters.document_type ? "active" : ""}`} type="button" onClick={() => updateFilter("document_type", "")}>All <span>{data?.document_type_counts.reduce((total, item) => total + item.count, 0) ?? 0}</span></button>
           {documentTypeOrder.map((type) => {
@@ -1795,7 +1795,7 @@ function EnterpriseRecurringWorklist({ complianceArea }: { complianceArea?: "COM
         {activeFilters.length > 0 && <div className="active-filters" aria-label="Active filters">{activeFilters.map(([label, value]) => <FilterChip key={label} label={`${label}: ${value}`} onRemove={() => removeFilter(label)} />)}</div>}
       </DashboardSection>
 
-      <DashboardSection title="Compliances - Grouped by Rule" description={data ? `${data.total_compliances} compliance${data.total_compliances === 1 ? "" : "s"} across ${data.total_rules} rule${data.total_rules === 1 ? "" : "s"}` : "Loading applicable rules"} className="grouped-compliance-section recurring-grouped-section" action={<div className="group-actions"><button className="button-secondary compact-action" type="button" onClick={expandAll} disabled={!data?.groups.length}><ChevronDown size={15} />Expand all</button><button className="button-secondary compact-action" type="button" onClick={() => setExpanded(new Set())} disabled={!expanded.size}><ChevronDown size={15} className="collapse-icon" />Collapse all</button></div>}>
+      <DashboardSection title="Compliances - Grouped by Act" description={data ? `${data.total_compliances} compliance${data.total_compliances === 1 ? "" : "s"} across ${data.total_acts ?? data.total_rules} Act${(data.total_acts ?? data.total_rules) === 1 ? "" : "s"}` : "Loading applicable Acts"} className="grouped-compliance-section recurring-grouped-section" action={<div className="group-actions"><button className="button-secondary compact-action" type="button" onClick={expandAll} disabled={!data?.groups.length}><ChevronDown size={15} />Expand all</button><button className="button-secondary compact-action" type="button" onClick={() => setExpanded(new Set())} disabled={!expanded.size}><ChevronDown size={15} className="collapse-icon" />Collapse all</button></div>}>
         <div className="document-type-tabs" aria-label="Filter by document type">
           <button className={`document-type-tab ${!filters.document_type ? "active" : ""}`} type="button" onClick={() => updateFilter("document_type", "")}>All <span>({data?.document_type_counts.reduce((total, item) => total + item.count, 0) ?? 0})</span></button>
           {documentTypeOrder.map((type) => {
@@ -1999,6 +1999,28 @@ function useCheckerEntityOptions() {
   return { options, isLoading: currentUser.isLoading || entities.isLoading };
 }
 
+function CheckerViewTabs({ base, active }: { base: string; active?: "pending" | "history" }) {
+  return <nav className="checker-view-tabs" aria-label="Checker views" role="tablist">
+    <Link role="tab" aria-selected={active === "pending"} aria-current={active === "pending" ? "page" : undefined} className={`checker-view-tab${active === "pending" ? " active" : ""}`} to={`${base}/pending-reviews`}>
+      <span className="checker-view-tab-icon"><ClipboardCheck size={16} /></span>
+      <span className="checker-view-tab-copy"><strong>Pending reviews</strong><small>Assigned to you</small></span>
+    </Link>
+    <Link role="tab" aria-selected={active === "history"} aria-current={active === "history" ? "page" : undefined} className={`checker-view-tab${active === "history" ? " active" : ""}`} to={`${base}/review-history`}>
+      <span className="checker-view-tab-icon"><History size={16} /></span>
+      <span className="checker-view-tab-copy"><strong>My review history</strong><small>Past decisions</small></span>
+    </Link>
+  </nav>;
+}
+
+function CheckerEntitySelector({ entities, value, onChange }: { entities: { id: string; type: string; name: string }[]; value: string; onChange: (value: string) => void }) {
+  return <label className="compact-entity-selector checker-entity-selector">
+    <span>Entity</span>
+    <select value={value} onChange={(event) => onChange(event.target.value)} aria-label="Checker entity">
+      {entities.map((entity) => <option key={`${entity.type}-${entity.id}`} value={entity.id}>{entity.name}</option>)}
+    </select>
+  </label>;
+}
+
 function CheckerDashboard() {
   const { organizationId } = useParams();
   const base = organizationId ? `/app/organizations/${organizationId}` : "/app";
@@ -2026,7 +2048,7 @@ function CheckerDashboard() {
   const refresh = () => Promise.all([pending.refetch(), history.refetch(), overview.refetch()]);
 
   return <div className="modern-page checker-dashboard-page">
-    <WorkspacePageHeader eyebrow="CHECKER WORKSPACE" title="Compliance review dashboard" description="Review only Maker submissions assigned to your authorized entity. Decisions and documents remain linked to the correct compliance period." actions={<div className="page-actions">{checkerEntities.length > 1 && <label className="compact-entity-selector">Entity<select value={subjectId} onChange={(event) => setSubjectId(event.target.value)}>{checkerEntities.map((entity) => <option key={`${entity.type}-${entity.id}`} value={entity.id}>{entity.name}</option>)}</select></label>}<Link className="button-primary" to={`${base}/pending-reviews`}><ClipboardCheck size={16} />Pending reviews</Link><Link className="button-secondary" to={`${base}/review-history`}><History size={16} />My review history</Link></div>} />
+    <WorkspacePageHeader eyebrow="CHECKER WORKSPACE" title="Compliance review dashboard" description="Review only Maker submissions assigned to your authorized entity. Decisions and documents remain linked to the correct compliance period." actions={<div className="page-actions">{checkerEntities.length > 1 && <CheckerEntitySelector entities={checkerEntities} value={subjectId} onChange={setSubjectId} />}<CheckerViewTabs base={base} /></div>} />
     <InlineError message={pending.error instanceof Error ? "Unable to load your review queue. Please try again." : downloadError} />
     <section className="dashboard-metric-grid checker-summary-grid" aria-label="Checker review summary">
       <DashboardMetricCard label="Awaiting my review" value={pending.data?.summary.pending_review ?? 0} helper="Assigned Maker submissions" tone="warning" />
@@ -2088,7 +2110,7 @@ export function PendingReviews() {
   const currentPage = Number(filters.page);
   const toggleGroup = (id: string) => setExpanded((current) => { const next = new Set(current); next.has(id) ? next.delete(id) : next.add(id); return next; });
   return <div className="modern-page pending-reviews-page">
-    <WorkspacePageHeader eyebrow="COMPLIANCE / CHECKER" title="Pending reviews" description="Review compliance documents submitted by Makers assigned to you." actions={<div className="page-actions">{checkerEntities.length > 1 && <label className="compact-entity-selector">Entity<select value={subjectId} onChange={(event) => setSubjectId(event.target.value)}>{checkerEntities.map((entity) => <option key={`${entity.type}-${entity.id}`} value={entity.id}>{entity.name}</option>)}</select></label>}<Link className="button-secondary" to={`${base}/review-history`}><History size={16} />My review history</Link></div>} />
+    <WorkspacePageHeader eyebrow="COMPLIANCE / CHECKER" title="Pending reviews" description="Review compliance documents submitted by Makers assigned to you." actions={<div className="page-actions">{checkerEntities.length > 1 && <CheckerEntitySelector entities={checkerEntities} value={subjectId} onChange={setSubjectId} />}<CheckerViewTabs base={base} active="pending" /></div>} />
     <section className="dashboard-metric-grid checker-summary-grid"><DashboardMetricCard label="Total submitted" value={pending.data?.total ?? 0} helper="Your active review queue" onClick={() => toggleQueueMetric()} active={!filters.status && !filters.waiting_over_days} /><DashboardMetricCard label="Pending review" value={pending.data?.summary.pending_review ?? 0} helper="Awaiting your decision" tone="warning" onClick={() => toggleQueueMetric()} active={!filters.status && !filters.waiting_over_days} /><DashboardMetricCard label="Over 3 days" value={pending.data?.summary.pending_more_than_3_days ?? 0} helper="Needs priority" tone="critical" onClick={() => toggleQueueMetric("", "3")} active={filters.waiting_over_days === "3"} /><DashboardMetricCard label="Overdue" value={pending.data?.summary.overdue ?? 0} helper="In your review queue" tone="critical" onClick={() => toggleQueueMetric("OVERDUE")} active={filters.status === "OVERDUE"} /></section>
     <DashboardSection title="Filters" description="Search and filters apply together." className="filter-section" action={<button className="button-secondary compact-action" type="button" onClick={clearFilters}><RefreshCw size={15} />Clear filters</button>}>
       <div className="filter-grid grouped-filter-grid"><label className="search-control"><span>Search</span><Search size={16} /><input value={filters.q} onChange={(event) => updateFilter("q", event.target.value)} placeholder="Compliance, Act, Rule, or Maker" /></label><label>Status<select value={filters.status} onChange={(event) => updateFilter("status", event.target.value)}><option value="">All pending statuses</option><option value="SUBMITTED">Submitted</option><option value="UNDER_REVIEW">Under review</option><option value="OVERDUE">Overdue</option></select></label><label>Risk level<select value={filters.risk_level} onChange={(event) => updateFilter("risk_level", event.target.value)}><option value="">All risk levels</option>{["LOW", "MEDIUM", "HIGH", "CRITICAL"].map((item) => <option key={item} value={item}>{humanize(item)}</option>)}</select></label><label>Frequency<select value={filters.frequency} onChange={(event) => updateFilter("frequency", event.target.value)}><option value="">All frequencies</option>{recurringFrequencies.map((item) => <option key={item} value={item}>{humanize(item)}</option>)}</select></label><label>Due from<input type="date" value={filters.date_from} onChange={(event) => updateFilter("date_from", event.target.value)} /></label><label>Due to<input type="date" value={filters.date_to} onChange={(event) => updateFilter("date_to", event.target.value)} /></label></div>
@@ -2116,7 +2138,7 @@ export function MyReviewHistory() {
   const toggleDecisionMetric = (decision = "") => updateFilter("decision", filters.decision === decision ? "" : decision);
   const currentPage = Number(filters.page);
   const totalPages = Math.max(1, Math.ceil((history.data?.total ?? 0) / Number(filters.page_size)));
-  return <div className="modern-page review-history-page"><WorkspacePageHeader eyebrow="COMPLIANCE / CHECKER" title="My review history" description="Every approval, rejection, and correction decision made by you is retained here." actions={<Link className="button-secondary" to={`${base}/pending-reviews`}><ClipboardCheck size={16} />Pending reviews</Link>} />
+  return <div className="modern-page review-history-page"><WorkspacePageHeader eyebrow="COMPLIANCE / CHECKER" title="My review history" description="Every approval, rejection, and correction decision made by you is retained here." actions={<CheckerViewTabs base={base} active="history" />} />
     <section className="dashboard-metric-grid checker-summary-grid"><DashboardMetricCard label="Total reviewed" value={summary.total_reviewed} helper="Your final decisions" onClick={() => toggleDecisionMetric()} active={!filters.decision} /><DashboardMetricCard label="Approved by me" value={summary.approved} helper="Completed submissions" tone="success" onClick={() => toggleDecisionMetric("APPROVED")} active={filters.decision === "APPROVED"} /><DashboardMetricCard label="Rejected by me" value={summary.rejected} helper="Corrections required" tone="critical" onClick={() => toggleDecisionMetric("REJECTED")} active={filters.decision === "REJECTED"} /><DashboardMetricCard label="Average review time" value={`${summary.average_review_hours}h`} helper="Submission to final decision" tone="attention" /></section>
     <DashboardSection title="Review history" description={`${history.data?.total ?? 0} decision${(history.data?.total ?? 0) === 1 ? "" : "s"}`} className="filter-section"><div className="filter-grid grouped-filter-grid"><label className="search-control"><span>Search</span><Search size={16} /><input value={filters.q} onChange={(event) => updateFilter("q", event.target.value)} placeholder="Compliance, Act, Rule, or entity" /></label><label>Decision<select value={filters.decision} onChange={(event) => updateFilter("decision", event.target.value)}><option value="">All decisions</option><option value="APPROVED">Approved</option><option value="REJECTED">Rejected / correction</option></select></label><label>Sort by<select value={filters.sort_by} onChange={(event) => updateFilter("sort_by", event.target.value)}><option value="reviewed_at">Reviewed date</option><option value="submitted_at">Submitted date</option><option value="compliance_name">Compliance name</option><option value="decision">Decision</option><option value="review_duration">Review duration</option></select></label><label>Direction<select value={filters.sort_dir} onChange={(event) => updateFilter("sort_dir", event.target.value)}><option value="desc">Newest first</option><option value="asc">Oldest first</option></select></label><label>Reviewed from<input type="date" value={filters.date_from} onChange={(event) => updateFilter("date_from", event.target.value)} /></label><label>Reviewed to<input type="date" value={filters.date_to} onChange={(event) => updateFilter("date_to", event.target.value)} /></label><button className="button-secondary compact-action" type="button" onClick={() => setFilters({ q: "", decision: "", date_from: "", date_to: "", sort_by: "reviewed_at", sort_dir: "desc", page: "1", page_size: "25" })}>Clear filters</button></div></DashboardSection>
     <InlineError message={history.error instanceof Error ? "Unable to load review history. Please try again." : downloadError} />

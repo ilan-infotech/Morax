@@ -43,7 +43,35 @@ const documentTypes = [
   ["DISPLAY", "Display"],
   ["NOTICE", "Notice"],
 ] as const;
+const complianceTypes = [
+  ["RETURN", "Return"],
+  ["REGISTER", "Register"],
+  ["PAYMENT", "Payment"],
+  ["LICENSE", "License"],
+  ["CERTIFICATE", "Certificate"],
+  ["NOTICE", "Notice"],
+  ["DISPLAY", "Display"],
+  ["OTHER", "Other"],
+] as const;
 const unitComplianceTypes = ["Shops & Establishments", "Mines", "BOCW", "ESI", "PF"] as const;
+
+/**
+ * API records created through the form store an array, while older and Excel
+ * imports can return the exact same field as a comma-separated string.  Keep
+ * this conversion deliberately strict: imported values must equal a current
+ * option after whitespace is removed; no fuzzy matching can create a new type.
+ */
+const selectedUnitComplianceTypes = (value: unknown): string[] => {
+  const values = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(",")
+      : [];
+  return [...new Set(values
+    .map((item) => String(item).trim())
+    .filter((item): item is (typeof unitComplianceTypes)[number] =>
+      unitComplianceTypes.includes(item as (typeof unitComplianceTypes)[number])))]
+};
 
 const ruleSchema = z.object({
   compliance_id: z.string().trim().min(1, "Compliance ID is required"),
@@ -287,7 +315,9 @@ export function ComplianceMasterManager() {
         ]),
       ),
       applicable_months: Array.isArray(row.applicable_months) ? row.applicable_months.join(",") : String(row.applicable_months ?? ""),
-      unit_compliance_types: Array.isArray(row.unit_compliance_types) ? row.unit_compliance_types : [],
+      unit_compliance_types: selectedUnitComplianceTypes(
+        row.unit_compliance_types ?? row.compliance_type ?? row["Compliance Type"],
+      ),
       version: Number(row.version || 0) + 1,
       active: true,
     } as RuleForm);
@@ -343,6 +373,15 @@ export function ComplianceMasterManager() {
   const total = rules.data?.total ?? 0;
   const size = rules.data?.page_size ?? 10;
   const last = Math.max(1, Math.ceil(total / size));
+  const stateName = (id: unknown) =>
+    options.data?.states.find((item) => item.id === String(id))?.name || "All states";
+  const industryName = (id: unknown) =>
+    options.data?.industries.find((item) => item.id === String(id))?.name || "All industries";
+  const commaList = (value: unknown, fallback = "Not specified") => {
+    const values = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
+    const result = values.map((item) => String(item).trim()).filter(Boolean).join(", ");
+    return result || fallback;
+  };
   return (
     <section className="crud-page compliance-master-page">
       <header className="page-header">
@@ -480,7 +519,7 @@ export function ComplianceMasterManager() {
               <input type="radio" name="import-mode" checked={importMode === "MERGE"} onChange={() => { setImportMode("MERGE"); setReplaceConfirmation(""); }} />
               <span><b>Merge</b><small>Add new IDs and versions. Existing identical versions are skipped.</small></span>
             </label>
-            <label className={importMode === "REPLACE" ? "selected danger" : ""}>
+            <label className={importMode === "REPLACE" ? "selected" : ""}>
               <input type="radio" name="import-mode" checked={importMode === "REPLACE"} onChange={() => setImportMode("REPLACE")} />
               <span><b>Replace master</b><small>Make this workbook the complete master and remove rules not present.</small></span>
             </label>
@@ -875,7 +914,7 @@ export function ComplianceMasterManager() {
                   <input type="number" min="0" {...form.register("employee_threshold")} />
                 </RuleField>
                 {form.watch("entity_type") === "UNIT" && (
-                  <RuleField label="Unit Compliance Types" wide>
+                  <RuleField label="Unit Compliance Types" wide group>
                     <div className="checkbox-group" role="group" aria-label="Unit Compliance Types">
                       {unitComplianceTypes.map((type) => (
                         <label className="inline" key={type}>
@@ -958,16 +997,30 @@ export function ComplianceMasterManager() {
               <h3>Legal references</h3>
               <div className="form-grid">
                 <RuleField label="Act" required error={form.formState.errors.act?.message}>
-                  <input {...form.register("act")} required />
+                  <select {...form.register("act")} required>
+                    <option value="">Select Act</option>
+                    {form.watch("act") && !(acts.data ?? []).includes(form.watch("act")) && (
+                      <option value={form.watch("act")}>{form.watch("act")} (existing)</option>
+                    )}
+                    {(acts.data ?? []).map((act) => <option key={act} value={act}>{act}</option>)}
+                  </select>
                 </RuleField>
                 <RuleField label="Rule reference">
-                  <input {...form.register("rule_reference")} />
+                  <input {...form.register("rule_reference")} placeholder="e.g. Rule 25(2)(a)" />
                 </RuleField>
                 <RuleField label="Section">
-                  <input {...form.register("section")} />
+                  <input {...form.register("section")} placeholder="e.g. Section 7A" />
                 </RuleField>
                 <RuleField label="Compliance type">
-                  <input {...form.register("compliance_type")} />
+                  <select {...form.register("compliance_type")}>
+                    <option value="">Select compliance type</option>
+                    {form.watch("compliance_type") && !complianceTypes.some(([value]) => value === form.watch("compliance_type")) && (
+                      <option value={form.watch("compliance_type")}>{form.watch("compliance_type")} (existing)</option>
+                    )}
+                    {complianceTypes.map(([value, label]) => (
+                      <option key={value} value={value}>{label}</option>
+                    ))}
+                  </select>
                 </RuleField>
                 <RuleField label="Document type">
                   <select {...form.register("document_type")}>
@@ -978,16 +1031,16 @@ export function ComplianceMasterManager() {
                   </select>
                 </RuleField>
                 <RuleField label="Form number">
-                  <input {...form.register("form_number")} />
+                  <input {...form.register("form_number")} placeholder="e.g. Form A or 3A" />
                 </RuleField>
                 <RuleField label="Description" wide>
-                  <textarea {...form.register("description")} />
+                  <textarea {...form.register("description")} placeholder="Short operational summary" />
                 </RuleField>
                 <RuleField label="Legal description" wide>
-                  <textarea {...form.register("legal_description")} />
+                  <textarea {...form.register("legal_description")} placeholder="Full legal requirement or instruction" />
                 </RuleField>
                 <RuleField label="Consequence / penalty" wide>
-                  <textarea {...form.register("consequence_or_penalty")} />
+                  <textarea {...form.register("consequence_or_penalty")} placeholder="Applicable consequence, penalty, or prosecution details" />
                 </RuleField>
               </div>
             </div>
@@ -1012,40 +1065,52 @@ export function ComplianceMasterManager() {
           onClose={() => setDetail(null)}
         >
           <div className="entity-form">
-            <dl className="dialog-detail-grid">
-              <div>
-                <dt>Name</dt>
-                <dd>{text(detail, "name")}</dd>
-              </div>
-              <div>
-                <dt>Act</dt>
-                <dd>{text(detail, "act") || "Not specified"}</dd>
-              </div>
-              <div>
-                <dt>Rule / reference</dt>
-                <dd>{text(detail, "rule_reference") || "Not specified"}</dd>
-              </div>
-              <div>
-                <dt>Frequency</dt>
-                <dd>{text(detail, "frequency")}</dd>
-              </div>
-              <div>
-                <dt>Effective from</dt>
-                <dd>{text(detail, "effective_from")}</dd>
-              </div>
-              <div>
-                <dt>Due date rule</dt>
-                <dd>{text(detail, "due_date_rule")}</dd>
-              </div>
-              <div>
-                <dt>Employee threshold</dt>
-                <dd>{text(detail, "employee_threshold") || "No threshold"}</dd>
-              </div>
-              <div className="wide">
-                <dt>Description</dt>
-                <dd>{text(detail, "description") || "Not provided"}</dd>
-              </div>
-            </dl>
+            <section className="form-section rule-detail-section">
+              <h3>Rule identity</h3>
+              <dl className="dialog-detail-grid">
+                <div><dt>Rule name</dt><dd>{text(detail, "name")}</dd></div>
+                <div><dt>Status</dt><dd>{detail.active ? "Active" : "Inactive"}</dd></div>
+                <div><dt>Act</dt><dd>{text(detail, "act") || "Not specified"}</dd></div>
+                <div><dt>Rule reference</dt><dd>{text(detail, "rule_reference") || "Not specified"}</dd></div>
+                <div><dt>Section</dt><dd>{text(detail, "section") || "Not specified"}</dd></div>
+                <div><dt>Compliance type</dt><dd>{text(detail, "compliance_type") || "Not specified"}</dd></div>
+                <div><dt>Document type</dt><dd>{text(detail, "document_type") || "Not specified"}</dd></div>
+                <div><dt>Form number</dt><dd>{text(detail, "form_number") || "Not specified"}</dd></div>
+              </dl>
+            </section>
+            <section className="form-section rule-detail-section">
+              <h3>Applicability</h3>
+              <dl className="dialog-detail-grid">
+                <div><dt>Entity type</dt><dd>{text(detail, "entity_type")}</dd></div>
+                <div><dt>State</dt><dd>{stateName(detail.state_id)}</dd></div>
+                <div><dt>Industry</dt><dd>{industryName(detail.industry_type_id)}</dd></div>
+                <div><dt>Employee threshold</dt><dd>{text(detail, "employee_threshold") || "No threshold"}</dd></div>
+                <div className="wide"><dt>Unit compliance types</dt><dd>{commaList(detail.unit_compliance_types, "Universal Unit rule")}</dd></div>
+              </dl>
+            </section>
+            <section className="form-section rule-detail-section">
+              <h3>Schedule and evidence</h3>
+              <dl className="dialog-detail-grid">
+                <div><dt>Frequency</dt><dd>{text(detail, "frequency")}</dd></div>
+                <div><dt>Applicable months</dt><dd>{commaList(detail.applicable_months, "All applicable months")}</dd></div>
+                <div><dt>Due date method</dt><dd>{text(detail, "due_date_rule")}</dd></div>
+                <div><dt>Due day / offset</dt><dd>{text(detail, "due_date_offset") || "Not specified"}</dd></div>
+                <div><dt>Due date anchor</dt><dd>{text(detail, "due_date_anchor") || "Not specified"}</dd></div>
+                <div><dt>Grace days</dt><dd>{text(detail, "grace_days") || "0"}</dd></div>
+                <div><dt>Risk level</dt><dd>{text(detail, "risk_level")}</dd></div>
+                <div><dt>Required evidence</dt><dd>{text(detail, "required_document") || "Not specified"}</dd></div>
+                <div><dt>Effective from</dt><dd>{text(detail, "effective_from")}</dd></div>
+                <div><dt>Effective to</dt><dd>{text(detail, "effective_to") || "Open-ended"}</dd></div>
+              </dl>
+            </section>
+            <section className="form-section rule-detail-section">
+              <h3>Legal information</h3>
+              <dl className="dialog-detail-grid">
+                <div className="wide"><dt>Description</dt><dd>{text(detail, "description") || "Not provided"}</dd></div>
+                <div className="wide"><dt>Legal description</dt><dd>{text(detail, "legal_description") || "Not provided"}</dd></div>
+                <div className="wide"><dt>Consequence / penalty</dt><dd>{text(detail, "consequence_or_penalty") || "Not provided"}</dd></div>
+              </dl>
+            </section>
           </div>
         </MasterSheet>
       )}
@@ -1105,7 +1170,7 @@ function MasterSheet({
         className={
           isWorkspace
             ? "workspace-form compliance-master-workspace-form"
-            : "crud-drawer"
+            : "crud-drawer compliance-master-detail-drawer"
         }
         role="dialog"
         aria-modal="true"
@@ -1145,19 +1210,27 @@ function RuleField({
   error,
   wide = false,
   required = false,
+  group = false,
   children,
 }: {
   label: string;
   error?: string;
   wide?: boolean;
   required?: boolean;
+  /** Checkbox groups must not be wrapped in a label. */
+  group?: boolean;
   children: React.ReactNode;
 }) {
+  const className = [group && "field-control", wide && "wide", error && "has-error"].filter(Boolean).join(" ") || undefined;
+  const content = <>
+    <span>{label}{required && <b className="required-indicator" aria-label="required"> *</b>}</span>
+    {children}
+    {error && <small className="field-error">{error}</small>}
+  </>;
+  if (group) {
+    return <div className={className}>{content}</div>;
+  }
   return (
-    <label className={[wide && "wide", error && "has-error"].filter(Boolean).join(" ") || undefined}>
-      <span>{label}{required && <b className="required-indicator" aria-label="required"> *</b>}</span>
-      {children}
-      {error && <small className="field-error">{error}</small>}
-    </label>
+    <label className={className}>{content}</label>
   );
 }

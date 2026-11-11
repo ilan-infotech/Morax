@@ -6,11 +6,12 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 import app.api.v1.router as api
+import app.api.v1.licenses as licenses_api
 import app.services.access as access
 from app.core.security import hash_password, verify_password
 from app.db.base import Base
-from app.models import AuditLog, AuthSession, Contractor, IndustryType, Organization, State, Unit, User, UserActivation, UserRoleScope
-from app.schemas import AdministratorPasswordResetInput, ContractorContextInput, ContractorInput, EntityUserAssignmentInput, LoginRequest, OrganizationDeleteInput, PendingEntityUserInput, PlatformOrganizationInput, RoleScopeInput, UnitInput, UserCreateInput
+from app.models import AuditLog, AuthSession, Contractor, IndustryType, LicenseRecord, LicenseType, Organization, RegisterTemplate, RegisterTemplateVersion, State, Unit, User, UserActivation, UserRoleScope
+from app.schemas import AdministratorPasswordResetInput, ContractorContextInput, ContractorInput, EntityUserAssignmentInput, LicenseInput, LoginRequest, OrganizationDeleteInput, PendingEntityUserInput, PlatformOrganizationInput, RoleScopeInput, UnitInput, UserCreateInput
 
 
 @pytest.fixture()
@@ -77,6 +78,22 @@ def test_platform_organization_provisions_admin_password(db):
     with pytest.raises(HTTPException, match="Invalid email or password"):
         api.login(LoginRequest(email=admin.email, password="Acme-Admin-Password-1"), db)
     assert api.login(LoginRequest(email=admin.email, password="Acme-Admin-Replacement-1"), db)["user"]["id"] == admin.id
+
+    # Contact addresses are business contact details, not login identities.
+    # A shared group mailbox is valid for more than one organization.
+    second = api.create_platform_organization(
+        PlatformOrganizationInput(
+            organization_name="Acme Compliance South",
+            organization_code="ACME-SOUTH",
+            organization_admin_name="Acme South Admin",
+            organization_admin_email="admin.south@acme.example.com",
+            organization_admin_password="Acme-South-Admin-Password-1",
+            primary_contact_email="contact@acme.example.com",
+        ),
+        platform_admin,
+        db,
+    )
+    assert second["primary_contact_email"] == "contact@acme.example.com"
 
     # The centralized User Access endpoint provisions the same immediately
     # usable, password-based user records used by the Unit/Contractor popup.
@@ -418,6 +435,64 @@ def test_generated_codes_unit_types_and_contractor_maker_scope(db):
     assert "CONTRACTOR_CONTEXT_SELECTED" in set(db.scalars(select(AuditLog.action)))
 
 
+def test_unit_contact_email_is_not_unique(db):
+    organization = Organization(name="Shared Contact Org", code="SHARED", status="ACTIVE")
+    state = State(name="Tamil Nadu", code="TN")
+    industry = IndustryType(name="Engineering", code="ENG")
+    db.add_all([organization, state, industry])
+    db.flush()
+    admin = User(
+        organization_id=organization.id,
+        name="Organization Admin",
+        email="shared-contact-admin@example.test",
+        password_hash=hash_password("Admin-Password-1"),
+        active=True,
+        platform_role="MORAX_ADMIN",
+    )
+    db.add(admin)
+    db.flush()
+    db.add(UserRoleScope(
+        user_id=admin.id,
+        role="ORGANIZATION_ADMIN",
+        scope_type="ORGANIZATION",
+        scope_id=organization.id,
+    ))
+    db.commit()
+
+    shared_email = "operations@shared-contact.example.com"
+    first = api.create_unit(UnitInput(
+        name="North Plant",
+        code="NORTH-PLANT",
+        employer_name="Shared Contact Org",
+        industry_type_id=industry.id,
+        state_id=state.id,
+        compliance_start_date=date(2026, 11, 6),
+        contact_email=shared_email,
+    ), admin, db)
+    second = api.create_unit(UnitInput(
+        name="South Plant",
+        code="SOUTH-PLANT",
+        employer_name="Shared Contact Org",
+        industry_type_id=industry.id,
+        state_id=state.id,
+        compliance_start_date=date(2026, 11, 6),
+        contact_email=shared_email,
+    ), admin, db)
+    updated = api.update_unit(second["id"], UnitInput(
+        name="South Plant Updated",
+        code="SOUTH-PLANT",
+        employer_name="Shared Contact Org",
+        industry_type_id=industry.id,
+        state_id=state.id,
+        compliance_start_date=date(2026, 11, 6),
+        contact_email=shared_email,
+    ), admin, db)
+
+    assert first["contact_email"] == shared_email
+    assert second["contact_email"] == shared_email
+    assert updated["contact_email"] == shared_email
+
+
 def test_entity_assignments_are_centralized_multi_role_and_tenant_scoped(db):
     org_a = Organization(name="Org A", code="ORGA", status="ACTIVE")
     org_b = Organization(name="Org B", code="ORGB", status="ACTIVE")
@@ -557,6 +632,86 @@ def test_entity_assignments_are_centralized_multi_role_and_tenant_scoped(db):
     )) is not None
 
 
+def test_license_patch_preserves_optional_values_omitted_by_the_editor(db):
+    organization = Organization(name="License Update Org", code="LICENSE-UPDATE", status="ACTIVE")
+    state = State(name="Goa", code="GA")
+    industry = IndustryType(name="Services", code="SERVICES")
+    db.add_all([organization, state, industry])
+    db.flush()
+    admin = User(
+        organization_id=organization.id,
+        name="License Admin",
+        email="license-admin@example.test",
+        password_hash=hash_password("License-Admin-Password-1"),
+        active=True,
+        platform_role="MORAX_ADMIN",
+    )
+    unit = Unit(
+        organization_id=organization.id,
+        name="License Unit",
+        code="LICENSE-UNIT",
+        industry_type_id=industry.id,
+        state_id=state.id,
+        compliance_start_date=date(2026, 1, 1),
+    )
+    db.add_all([admin, unit])
+    db.flush()
+    license_type = LicenseType(
+        organization_id=organization.id,
+        name="License Update Type",
+        category="STATUTORY_LICENSE",
+        applicable_entity_type="UNIT",
+        created_by_id=admin.id,
+    )
+    db.add(license_type)
+    db.flush()
+    record = LicenseRecord(
+        organization_id=organization.id,
+        entity_type="UNIT",
+        entity_id=unit.id,
+        license_type_id=license_type.id,
+        license_name="Original license",
+        issuing_authority="Authority retained on update",
+        applicable_state="Goa",
+        registration_number="REG-100",
+        application_number="APP-200",
+        issue_date=date(2025, 12, 1),
+        valid_from=date(2026, 1, 1),
+        valid_until=date(2026, 12, 31),
+        renewal_frequency="BIENNIAL",
+        reminder_days=45,
+        created_by_id=admin.id,
+        updated_by_id=admin.id,
+    )
+    db.add(record)
+    db.commit()
+
+    updated = licenses_api.update_license(
+        record.id,
+        LicenseInput(
+            entity_type="UNIT",
+            entity_id=unit.id,
+            license_type_id=license_type.id,
+            license_name="Renamed license",
+            valid_from=date(2026, 1, 1),
+            valid_until=date(2026, 12, 31),
+        ),
+        record.row_version,
+        admin,
+        db,
+    )
+
+    assert updated["license_name"] == "Renamed license"
+    persisted = db.get(LicenseRecord, record.id)
+    assert persisted.issuing_authority == "Authority retained on update"
+    assert persisted.applicable_state == "Goa"
+    assert persisted.registration_number == "REG-100"
+    assert persisted.application_number == "APP-200"
+    assert persisted.issue_date == date(2025, 12, 1)
+    assert persisted.renewal_frequency == "BIENNIAL"
+    assert persisted.reminder_days == 45
+
+
 def test_product_admin_can_permanently_delete_only_a_tenant_and_its_data(db):
     master = Organization(name="MORAX Platform System", code="MORAX-MASTER", status="ACTIVE", is_system=True)
     tenant = Organization(name="Delete Me", code="DELETE-ME", status="ACTIVE")
@@ -570,10 +725,16 @@ def test_product_admin_can_permanently_delete_only_a_tenant_and_its_data(db):
     db.add_all([product_admin, tenant_user, unit])
     db.flush()
     contractor = Contractor(organization_id=tenant.id, unit_id=unit.id, name="Delete Contractor", code="DEL-CONTRACTOR")
-    db.add(contractor)
+    tenant_license_type = LicenseType(organization_id=tenant.id, name="Tenant License", category="STATUTORY_LICENSE", created_by_id=product_admin.id)
+    tenant_template = RegisterTemplate(organization_id=tenant.id, code="E2E-REGISTER", name="E2E Register", created_by_id=product_admin.id)
+    db.add_all([contractor, tenant_license_type, tenant_template])
+    db.flush()
+    tenant_template_version = RegisterTemplateVersion(template_id=tenant_template.id, version=1, status="DRAFT")
+    db.add(tenant_template_version)
     db.add(UserRoleScope(user_id=tenant_user.id, role="UNIT_MAKER", scope_type="UNIT", scope_id=unit.id))
     db.commit()
     tenant_id, tenant_user_id, unit_id, contractor_id, master_id = tenant.id, tenant_user.id, unit.id, contractor.id, master.id
+    tenant_license_type_id, tenant_template_id, tenant_template_version_id = tenant_license_type.id, tenant_template.id, tenant_template_version.id
 
     listed = api.list_platform_organizations(user=product_admin, db=db)
     assert [item["id"] for item in listed] == [tenant_id]
@@ -587,6 +748,9 @@ def test_product_admin_can_permanently_delete_only_a_tenant_and_its_data(db):
     assert db.get(User, tenant_user_id) is None
     assert db.get(Unit, unit_id) is None
     assert db.get(Contractor, contractor_id) is None
+    assert db.get(LicenseType, tenant_license_type_id) is None
+    assert db.get(RegisterTemplate, tenant_template_id) is None
+    assert db.get(RegisterTemplateVersion, tenant_template_version_id) is None
     assert db.get(Organization, master_id) is not None
     with pytest.raises(HTTPException, match="cannot be deleted"):
         api.delete_platform_organization(master_id, OrganizationDeleteInput(confirmation_code="MORAX-MASTER"), product_admin, db)

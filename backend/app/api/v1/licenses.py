@@ -84,14 +84,48 @@ def validity_status(item: LicenseRecord, today: date | None = None) -> str:
     return "ACTIVE"
 
 
-def license_dict(db: Session, item: LicenseRecord, detail: bool = False) -> dict:
+def license_list_cache(db: Session, items: list[LicenseRecord]) -> dict:
+    """Batch lookup data used by a license collection response.
+
+    License rows may refer to different entity tables. Loading their type,
+    subject name, and document count one row at a time turned a 25-row page
+    into dozens of database round trips on Turso.
+    """
+    if not items:
+        return {"types": {}, "entity_names": {}, "document_counts": {}}
+    type_ids = {item.license_type_id for item in items}
+    types = {
+        item.id: item
+        for item in db.scalars(select(LicenseType).where(LicenseType.id.in_(type_ids)))
+    }
+    entity_names: dict[tuple[str, str], str] = {}
+    for entity_type, model in ENTITY_MODELS.items():
+        entity_ids = {item.entity_id for item in items if item.entity_type == entity_type}
+        if entity_ids:
+            entity_names.update({
+                (entity_type, item.id): item.name
+                for item in db.scalars(select(model).where(model.id.in_(entity_ids)))
+            })
+    item_ids = [item.id for item in items]
+    document_counts = dict(db.execute(
+        select(LicenseDocument.license_id, func.count(LicenseDocument.id))
+        .where(LicenseDocument.license_id.in_(item_ids))
+        .group_by(LicenseDocument.license_id)
+    ).all())
+    return {"types": types, "entity_names": entity_names, "document_counts": document_counts}
+
+
+def license_dict(db: Session, item: LicenseRecord, detail: bool = False, cache: dict | None = None) -> dict:
+    cache = cache or {}
     result = model_dict(item, [column.name for column in item.__table__.columns])
-    kind = db.get(LicenseType, item.license_type_id)
+    kind = cache.get("types", {}).get(item.license_type_id) or db.get(LicenseType, item.license_type_id)
+    entity_label = cache.get("entity_names", {}).get((item.entity_type, item.entity_id)) or entity_name(db, item.entity_type, item.entity_id)
+    document_count = cache.get("document_counts", {}).get(item.id)
     result.update({
-        "status": validity_status(item), "entity_name": entity_name(db, item.entity_type, item.entity_id),
+        "status": validity_status(item), "entity_name": entity_label,
         "license_type": model_dict(kind, [column.name for column in kind.__table__.columns]) if kind else None,
         "days_remaining": None if item.never_expires or not item.valid_until else (item.valid_until - datetime.now(UTC).date()).days,
-        "document_count": int(db.scalar(select(func.count()).select_from(LicenseDocument).where(LicenseDocument.license_id == item.id)) or 0),
+        "document_count": int(document_count if document_count is not None else (db.scalar(select(func.count()).select_from(LicenseDocument).where(LicenseDocument.license_id == item.id)) or 0)),
     })
     if detail:
         documents = db.scalars(select(LicenseDocument).where(LicenseDocument.license_id == item.id).order_by(LicenseDocument.version.desc())).all()
@@ -199,6 +233,7 @@ def dashboard(entity_type: str | None = None, entity_id: str | None = None, user
         if can_access_subject(db, user, organization_id, item.entity_type, item.entity_id)
     ]
     if entity_type: records = [item for item in records if item.entity_type == entity_type and item.entity_id == entity_id]
+    cache = license_list_cache(db, records)
     counts = {"all": len(records), "active": 0, "expiring_30": 0, "expired": 0, "archived": 0, "renewal_in_progress": 0}
     entities: dict[str, dict] = {}
     today = datetime.now(UTC).date()
@@ -209,7 +244,7 @@ def dashboard(entity_type: str | None = None, entity_id: str | None = None, user
         if status == "ARCHIVED": counts["archived"] += 1
         if not item.archived and not item.never_expires and item.valid_until and 0 <= (item.valid_until - today).days <= 30: counts["expiring_30"] += 1
         if item.renewal_status == "IN_PROGRESS": counts["renewal_in_progress"] += 1
-        key = f"{item.entity_type}:{item.entity_id}"; summary = entities.setdefault(key, {"entity_type": item.entity_type, "entity_id": item.entity_id, "entity_name": entity_name(db, item.entity_type, item.entity_id), "total": 0, "active": 0, "expired": 0, "expiring": 0})
+        key = f"{item.entity_type}:{item.entity_id}"; summary = entities.setdefault(key, {"entity_type": item.entity_type, "entity_id": item.entity_id, "entity_name": cache["entity_names"].get((item.entity_type, item.entity_id), "Unknown entity"), "total": 0, "active": 0, "expired": 0, "expiring": 0})
         summary["total"] += 1; summary["active"] += int(status == "ACTIVE"); summary["expired"] += int(status == "EXPIRED"); summary["expiring"] += int(status == "EXPIRING_SOON")
     return {"summary": counts, "entity_summary": list(entities.values())}
 
@@ -228,7 +263,9 @@ def list_licenses(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, l
     if status:
         wanted = status.upper(); scoped = [item for item in scoped if validity_status(item) == wanted or (wanted == "EXPIRING_30" and not item.archived and not item.never_expires and item.valid_until and 0 <= (item.valid_until - datetime.now(UTC).date()).days <= 30)]
     total = len(scoped); start = (page - 1) * page_size
-    return {"items": [license_dict(db, item) for item in scoped[start:start + page_size]], "total": total, "page": page, "page_size": page_size}
+    page_items = scoped[start:start + page_size]
+    cache = license_list_cache(db, page_items)
+    return {"items": [license_dict(db, item, cache=cache) for item in page_items], "total": total, "page": page, "page_size": page_size}
 
 
 @router.post("", status_code=201)
@@ -253,7 +290,10 @@ def update_license(license_id: str, payload: LicenseInput, row_version: int = Qu
     if item.row_version != row_version: raise HTTPException(409, "This license was updated by another user. Refresh and try again.")
     require_subject(db, user, payload.entity_type, payload.entity_id); assert_type(db, organization_id, payload.entity_type, payload.license_type_id)
     old = {"valid_from": item.valid_from, "valid_until": item.valid_until, "license_number": item.license_number}
-    for field, value in payload.model_dump().items(): setattr(item, field, value)
+    # PATCH requests can come from focused editors that intentionally omit
+    # optional fields. Preserve those stored values instead of resetting them
+    # to schema defaults during an unrelated edit.
+    for field, value in payload.model_dump(exclude_unset=True).items(): setattr(item, field, value)
     item.updated_by_id = user.id; item.row_version += 1; auto_link(db, item, user.id)
     audit(db, organization_id=organization_id, actor_id=user.id, action="UPDATE", module="LICENSE", entity_type="LicenseRecord", entity_id=item.id, old=old, new={"valid_from": item.valid_from, "valid_until": item.valid_until, "license_number": item.license_number}); db.commit()
     return license_dict(db, item, True)

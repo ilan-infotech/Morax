@@ -32,17 +32,19 @@ def entity_dict(db: Session, entity: Any, kind: str, cache: dict | None = None) 
     if kind in {"CONTRACTOR", "CONTRACTOR_SITE"}:
         result["total_workers"] = entity.total_workers
     if kind == "CONTRACTOR":
-        contractor_makers = (
-            db.query(User)
-            .join(UserRoleScope, UserRoleScope.user_id == User.id)
-            .filter(
-                UserRoleScope.role == "CONTRACTOR_MAKER",
-                UserRoleScope.scope_type == "CONTRACTOR",
-                UserRoleScope.scope_id == entity.id,
+        contractor_makers = cache.get("contractor_makers", {}).get(entity.id)
+        if contractor_makers is None:
+            contractor_makers = (
+                db.query(User)
+                .join(UserRoleScope, UserRoleScope.user_id == User.id)
+                .filter(
+                    UserRoleScope.role == "CONTRACTOR_MAKER",
+                    UserRoleScope.scope_type == "CONTRACTOR",
+                    UserRoleScope.scope_id == entity.id,
+                )
+                .order_by(User.name, User.id)
+                .all()
             )
-            .order_by(User.name, User.id)
-            .all()
-        )
         result["contractor_makers"] = [
             {"id": maker.id, "name": maker.name, "email": maker.email, "active": maker.active}
             for maker in contractor_makers

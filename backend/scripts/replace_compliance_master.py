@@ -108,6 +108,8 @@ DOCUMENT_TYPES = {
     "display": "DISPLAY",
 }
 
+ALL_UNIT_COMPLIANCE_TYPES = ["Shops & Establishments", "Mines", "BOCW", "ESI", "PF"]
+
 
 def clean(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
@@ -128,6 +130,11 @@ def normalized_frequency(value: Any) -> str:
 
 def unit_compliance_types(sheet_name: str, applicability: Any, name: str, rule_reference: str) -> list[str]:
     """Translate the SME wording into the Unit's controlled applicability tags."""
+    value = clean(applicability).upper()
+    # This explicit source value means the rule must be marked for every
+    # controlled Unit Compliance Type, not treated as a blank universal rule.
+    if value == "ALL COVERED ESTABLISHMENTS":
+        return ALL_UNIT_COMPLIANCE_TYPES.copy()
     text = f"{name} {rule_reference}".upper()
     specialized: list[str] = []
     if "EPF" in text or "PROVIDENT FUND" in text:
@@ -142,13 +149,12 @@ def unit_compliance_types(sheet_name: str, applicability: Any, name: str, rule_r
     # for a Mines trigger.
     if sheet_name == "SHOPS":
         return ["Shops & Establishments"]
-    value = clean(applicability).upper()
     if "BOCW" in value:
         return ["BOCW"]
     if re.search(r"\bMINES?\b", value) or re.search(r"\bMINES?\b", text):
         return ["Mines"]
-    # ALL COVERED and other Central establishment rules are universal within
-    # their entity/threshold criteria rather than tied to a UI checkbox.
+    # Other Central establishment rules remain universal within their
+    # entity/threshold criteria unless they have a specific controlled tag.
     return []
 
 

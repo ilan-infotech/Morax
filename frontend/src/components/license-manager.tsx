@@ -13,7 +13,7 @@ const canConfigure = (u: User) => u.platform_role === "MORAX_ADMIN" || u.roles.i
 
 function Editor({ entities, types, record, onClose, reload }: { entities: Entity[]; types: LicenseType[]; record?: LicenseRecord; onClose: () => void; reload: () => void }) {
   const initialEntity = record ? entities.find((e) => e.id === record.entity_id) : entities[0];
-  const [data, setData] = useState({ entity_type: record?.entity_type ?? initialEntity?.entity_type ?? "UNIT", entity_id: record?.entity_id ?? initialEntity?.id ?? "", license_type_id: record?.license_type_id ?? "", license_name: record?.license_name ?? "", license_number: record?.license_number ?? "", issuing_department: record?.issuing_department ?? "", issuing_authority: "", valid_from: record?.valid_from?.slice(0, 10) ?? new Date().toISOString().slice(0, 10), valid_until: record?.valid_until?.slice(0, 10) ?? "", never_expires: record?.never_expires ?? false, renewal_required: record?.renewal_required ?? true, renewal_frequency: "ANNUAL", reminder_days: 30, remarks: record?.remarks ?? "" });
+  const [data, setData] = useState({ entity_type: record?.entity_type ?? initialEntity?.entity_type ?? "UNIT", entity_id: record?.entity_id ?? initialEntity?.id ?? "", license_type_id: record?.license_type_id ?? "", license_name: record?.license_name ?? "", license_number: record?.license_number ?? "", issuing_department: record?.issuing_department ?? "", issuing_authority: record?.issuing_authority ?? "", valid_from: record?.valid_from?.slice(0, 10) ?? new Date().toISOString().slice(0, 10), valid_until: record?.valid_until?.slice(0, 10) ?? "", never_expires: record?.never_expires ?? false, renewal_required: record?.renewal_required ?? true, renewal_frequency: record?.renewal_frequency ?? "ANNUAL", reminder_days: record?.reminder_days ?? 30, remarks: record?.remarks ?? "" });
   const [saving, setSaving] = useState(false);
   const entityChoices = entities.filter((e) => e.entity_type === data.entity_type);
   const typeChoices = types.filter((t) => t.applicable_entity_type === "ALL" || t.applicable_entity_type === data.entity_type);
@@ -21,10 +21,10 @@ function Editor({ entities, types, record, onClose, reload }: { entities: Entity
   const save = async () => {
     if (!data.entity_id || !data.license_type_id || !data.license_name || !data.valid_from || (!data.never_expires && !data.valid_until)) return toast.warning("Complete all mandatory fields before saving the license.");
     setSaving(true);
-    try { if (record) await morax.updateLicense(record.id, record.row_version, data); else await morax.createLicense(data); toast.success(record ? "License updated." : "License added."); reload(); onClose(); } catch (error) { toast.error(error instanceof Error ? error.message : "Unable to save the license."); } finally { setSaving(false); }
+    try { if (record) await morax.updateLicense(record.id, record.row_version, data); else await morax.createLicense(data); await reload(); toast.success(record ? "License updated." : "License added."); onClose(); } catch (error) { toast.error(error instanceof Error ? error.message : "Unable to save the license."); } finally { setSaving(false); }
   };
   return <div className="dialog-backdrop"><section className="license-dialog" role="dialog" aria-modal="true" aria-label={record ? "Edit license" : "Add license"}>
-    <header><div><p>LICENSE MANAGEMENT</p><h2>{record ? "Edit License" : "Add License"}</h2></div><button className="icon-button" type="button" onClick={onClose}><X size={18} /></button></header>
+    <header><div><p>LICENSE MANAGEMENT</p><h2>{record ? "Edit License" : "Add License"}</h2></div><button className="icon-button" type="button" disabled={saving} onClick={onClose}><X size={18} /></button></header>
     <div className="license-dialog-body">
       <div className="license-form-grid">
         <label><span className="license-field-label">Entity type</span><select value={data.entity_type} onChange={(e) => { const entityType = e.target.value as Entity["entity_type"]; setData((current) => ({ ...current, entity_type: entityType, entity_id: entities.find((x) => x.entity_type === entityType)?.id ?? "", license_type_id: "" })); }}><option value="UNIT">Unit</option><option value="CONTRACTOR">Contractor</option></select></label>
@@ -37,6 +37,7 @@ function Editor({ entities, types, record, onClose, reload }: { entities: Entity
           <label><span className="license-field-label">License type <span className="license-required" aria-hidden="true">*</span></span><select required value={data.license_type_id} onChange={(e) => set("license_type_id", e.target.value)}><option value="">Select License Type</option>{typeChoices.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</select></label>
           <label><span className="license-field-label">License number</span><input value={data.license_number} onChange={(e) => set("license_number", e.target.value)} /></label>
           <label><span className="license-field-label">Issuing department</span><input value={data.issuing_department} onChange={(e) => set("issuing_department", e.target.value)} /></label>
+          <label><span className="license-field-label">Issuing authority</span><input value={data.issuing_authority} onChange={(e) => set("issuing_authority", e.target.value)} /></label>
           <label><span className="license-field-label">Valid from <span className="license-required" aria-hidden="true">*</span></span><input required type="date" value={data.valid_from} onChange={(e) => set("valid_from", e.target.value)} /></label>
           <label><span className="license-field-label">Valid until {!data.never_expires && <span className="license-required" aria-hidden="true">*</span>}</span><input required={!data.never_expires} type="date" disabled={data.never_expires} value={data.valid_until} onChange={(e) => set("valid_until", e.target.value)} /></label>
         </div>
@@ -47,7 +48,7 @@ function Editor({ entities, types, record, onClose, reload }: { entities: Entity
         </div>
         <label><span className="license-field-label">Remarks</span><textarea value={data.remarks} onChange={(e) => set("remarks", e.target.value)} /></label>
       </>}
-    </div><footer><button className="button-secondary" type="button" onClick={onClose}>Cancel</button><button type="button" disabled={saving || !data.entity_id} onClick={() => void save()}>{saving ? "Saving…" : "Save License"}</button></footer>
+    </div><footer><button className="button-secondary" type="button" disabled={saving} onClick={onClose}>Cancel</button><button type="button" disabled={saving || !data.entity_id} onClick={() => void save()}>{saving ? "Saving…" : "Save License"}</button></footer>
   </section></div>;
 }
 
